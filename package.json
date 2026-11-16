@@ -29,6 +29,7 @@
     "manifestVersion": 1
   },
   "scripts": {
+    "prototype:panel": "open panel/prototype-v2.html",
     "test": "node --test \"test/*.test.js\""
   },
   "engines": {
