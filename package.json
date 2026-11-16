@@ -6,8 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Ghost233/DSH-Workflow.git",
-    "directory": "hub-bot-plugin"
+    "url": "git+https://github.com/Ghost233/GhostDSHHubBot.git"
   },
   "type": "module",
   "main": "src/index.js",
