@@ -36,12 +36,12 @@ export function getHub() {
 
 /** store + registry + router wired together; sessions is the narrow port from src/router.js. */
 export class Hub {
-  constructor({ store, config, sessions, onSystemProblem }) {
+  constructor({ store, config, sessions, onSystemProblem, placer }) {
     this.store = store
     this.config = config
     this.sessions = sessions
     this.registry = new OwnerRegistry(store, { scratchRoot: join(config.stateDir, 'scratch') })
-    this.router = new Router({ store, registry: this.registry, sessions, config, onSystemProblem })
+    this.router = new Router({ store, registry: this.registry, sessions, config, onSystemProblem, placer })
     // One TaskBoard over the same store; Router already drives tickets through it, owner-tools reuse it.
     this.tasks = this.router.tasks
   }

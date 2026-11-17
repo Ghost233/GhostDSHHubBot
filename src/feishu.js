@@ -61,7 +61,7 @@ export class FeishuSource {
    *   lark?: object, now?: () => string }} deps - lark is the SDK surface ({ registerApp, Client, WSClient,
    *   EventDispatcher }) or a test fake; when absent, connect()/register() load the real SDK lazily.
    */
-  constructor({ store, registry, sessions, config, chiefConfig, logger, lark, now }) {
+  constructor({ store, registry, sessions, config, chiefConfig, logger, lark, now, placer }) {
     this.store = store
     this.registry = registry
     this.sessions = sessions
@@ -71,6 +71,7 @@ export class FeishuSource {
     this.lark = lark ?? null
     this.now = now ?? (() => new Date().toISOString())
     this.lastQr = null
+    this.placer = placer ?? null // GUI 工作区归位 (#52)：chief 会话创建后挂进专属工作区
     this.credentialState = 'missing'
     this.wsState = 'off'
     this.client = null
@@ -342,7 +343,12 @@ export class FeishuSource {
     const chief = this.registry.get('chief')
     if (!chief) throw new Error('hub-bot feishu: the chief owner row is missing from the registry')
     if (!chief.sessionId) {
-      const created = await this.sessions.create({ cwd: chief.cwd, agentPreset: 'hub-bot-router' })
+      // GUI 工作区 (#52): 出生即归位 chief 专属工作区（cwd 自动 = 工作区 path，AGENTS.md 经 .git 向上查找不受影响）；
+      // placer 不可用 → 回退 cwd 创建。
+      const ws = this.placer ? await this.placer.chiefWorkspace() : null
+      const created = await this.sessions.create(ws
+        ? { workspaceId: ws.workspaceId, agentPreset: 'hub-bot-router' }
+        : { cwd: chief.cwd, agentPreset: 'hub-bot-router' })
       this.registry.bindSession(chief.id, created.sessionId)
       chief.sessionId = created.sessionId // registry 实现可换行而非原地改——本方法内以返回值为准
     }

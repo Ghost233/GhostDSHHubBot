@@ -57,7 +57,7 @@ export class Router {
   /** #72 并发安全： per-owner promise chains — see the constructor note. */
   #ownerChains = new Map()
 
-  constructor({ store, registry, sessions, tasks, runner, config, now, ids, onSystemProblem }) {
+  constructor({ store, registry, sessions, tasks, runner, config, now, ids, onSystemProblem, placer }) {
     this.store = store
     this.registry = registry
     this.sessions = sessions
@@ -70,6 +70,9 @@ export class Router {
     // plugin root after construction; invoked after every router-initiated done/failed transition. Terminal
     // transitions that bypass the Router (owner-tools report-failure, channel 终止) are the Recycler sweep's job.
     this.onTicketTerminal = null
+    // GUI 工作区归位 (#52): optional WorkspacePlacer; new owner/chief Sessions get registered into their
+    // workspace right after creation. null (旧版 DSH 无该服务) 时静默跳过——展示层增强，不阻塞路由。
+    this.placer = placer ?? null
     // #72 并发安全: per-owner promise chains serialize every routeToOwner (all entries — L1 tool, devApi,
     // 飞书, GitHub) and every promotion pass for that owner, so read-check-write sequences (slot counting)
     // never interleave. SQLite writes themselves are synchronous (node:sqlite) — the single-writer
@@ -269,11 +272,16 @@ export class Router {
   /** Lazily binds an owner Session: create only when the registry names none. */
   async #ensureSession(owner) {
     if (owner.sessionId) return { owner, sessionId: owner.sessionId, created: false }
-    const created = await this.sessions.create({
-      cwd: owner.cwd,
-      agentPreset: 'hub-bot-owner',
-      title: 'hub-bot owner: ' + (owner.workspace ?? owner.cwd),
-    })
+    // GUI 工作区 (#52): 出生即归位——create({ workspaceId }) 是唯一让会话进工作区的路径（cwd 自动 =
+    // 工作区 path：owner 仓库工作区 path 本就等于 owner.cwd；chief 专属工作区落在 homeRepo/.hub-bot/chief）。
+    // placer 不可用或失败 → null → 回退 cwd 创建，主链路不受展示层影响。
+    const ws = this.placer
+      ? await (owner.role === 'chief' ? this.placer.chiefWorkspace() : this.placer.ownerWorkspace(owner))
+      : null
+    const preset = owner.role === 'chief' ? 'hub-bot-router' : 'hub-bot-owner'
+    const created = await this.sessions.create(ws
+      ? { workspaceId: ws.workspaceId, agentPreset: preset }
+      : { cwd: owner.cwd, agentPreset: preset })
     const sessionId = created.sessionId ?? created.session?.id
     if (!sessionId) throw new RouterError('session-create-empty', 'owner Session creation returned no sessionId')
     const bound = this.registry.bindSession(owner.id, sessionId)

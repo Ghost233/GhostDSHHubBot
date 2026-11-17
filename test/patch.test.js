@@ -15,7 +15,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { runtimeAnchor, runtimeRequire } from '../../scripts/test-runtime.mjs'
+import { runtimeAnchor, runtimeRequire } from '../scripts/test-runtime.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const SKIP_REASON = 'no usable DSH test runtime (anchor ' + runtimeAnchor + '); set DSH_TEST_RUNTIME_ROOT or check out deepseek-harness/ with its dependencies'

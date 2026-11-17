@@ -34,6 +34,7 @@ import { Hub, setHub } from './hub.js'
 import { FeishuSource } from './feishu.js'
 import { GitHubSource } from './github.js'
 import { Recycler } from './recycle.js'
+import { WorkspacePlacer } from './workspaces.js'
 
 export const name = 'hub-bot'
 export const inject = ['sessionController', 'sessionPersistence', 'webServer']
@@ -107,6 +108,11 @@ function tokenMatches(presented, expected) {
 /** The preset one owner role runs. */
 const presetForRole = role => role === 'chief' ? 'hub-bot-router' : 'hub-bot-owner'
 
+/** Dynamic service probe (#52): missing on older DSH → undefined (插件照常加载)，throw 同样吞掉。 */
+const safeGetService = (ctx, serviceName) => {
+  try { return typeof ctx.get === 'function' ? ctx.get(serviceName) : undefined } catch { return undefined }
+}
+
 /**
  * @param {import('@deepseek-ai/cordis').Context} ctx - cordis context with the injected DSH services.
  * @param {unknown} rawConfig - plugin configuration; stateDir and homeRepo are required absolute paths.
@@ -150,12 +156,15 @@ export function apply(ctx, rawConfig) {
       return { sessionId: value.sessionId ?? value.session?.id }
     },
   }
-  const hub = new Hub({ store, config, sessions, onSystemProblem: p => ctx.logger.warn('hub-bot system problem: %s (ticket %s, row %s)', p.reason, p.ticketId, p.rowId) })
+  // GUI 工作区 (#52): ctx.get 动态探测（不放 inject 声明——旧版 DSH 无该服务时插件仍须可加载）。
+  // 会话只能「出生即归位」（create({ workspaceId })）——已创建会话无任何归位 API（cwd 严格校验）。
+  const placer = new WorkspacePlacer({ workspaceController: safeGetService(ctx, 'workspaceController'), homeRepo: config.homeRepo, logger: ctx.logger })
+  const hub = new Hub({ store, config, sessions, onSystemProblem: p => ctx.logger.warn('hub-bot system problem: %s (ticket %s, row %s)', p.reason, p.ticketId, p.rowId), placer })
   const chief = hub.registry.ensureChief({ cwd: config.homeRepo, workspace: basename(config.homeRepo) })
   setHub(hub)
   // 飞书入口 (#68): OFF unless config.feishu.enabled. With credentials present the WSClient long connection
   // starts at boot; the same source scans recorded feishu reply intents on the 1s tick (阶段 2 留的通道).
-  const feishu = new FeishuSource({ store, registry: hub.registry, sessions, config: config.feishu, chiefConfig: config.chief, logger: ctx.logger })
+  const feishu = new FeishuSource({ store, registry: hub.registry, sessions, config: config.feishu, chiefConfig: config.chief, logger: ctx.logger, placer })
   if (config.feishu.enabled && feishu.credentialState === 'ok') {
     void feishu.connect().catch(error => ctx.logger.warn('hub-bot feishu connect failed: %s (凭据可能失效 — 面板提示重新扫码)', error?.message ?? error))
   }
@@ -174,6 +183,14 @@ export function apply(ctx, rawConfig) {
   hub.router.onTicketTerminal = ticketId => recycler.maybeRecycleForTicket(ticketId)
   // #72 AC1 自动恢复：working 票最旧优先自动补投恢复注入（过执行槽闸门），无人干预即可继续干活
   void hub.router.markRestart().catch(error => ctx.logger.warn('hub-bot restart recovery failed: %s', error?.message ?? error))
+  // 工作区预热 (#52): 确保 chief 专属工作区与已注册 owner 的仓库工作区存在（幂等）。
+  // 已绑定的存量会话无法 retro-fit（无归位 API），等自然重建时自动归位。
+  void (async () => {
+    await placer.chiefWorkspace()
+    for (const owner of hub.registry.list()) {
+      if (owner.role !== 'chief') await placer.ownerWorkspace(owner)
+    }
+  })().catch(error => ctx.logger.warn('hub-bot workspace warmup failed (non-fatal): %s', error?.message ?? error))
   void hub.router.tick().catch(error => ctx.logger.warn('hub-bot delivery resume failed: %s', error?.message ?? error))
   const deliveryTimer = setInterval(() => {
     void hub.router.tick().catch(error => ctx.logger.warn('hub-bot delivery tick failed: %s', error?.message ?? error))
@@ -232,7 +249,11 @@ export function apply(ctx, rawConfig) {
     if (ownerId !== undefined) {
       const owner = hub.registry.get(ownerId)
       if (!owner) throw new HttpError(404, 'unknown owner "' + ownerId + '"')
-      const value = await sessions.create({ cwd: owner.cwd, agentPreset: presetForRole(owner.role) })
+      // 出生即归位 (#52)：有 workspaceId 则出生就在工作区；placer 不可用回退 cwd 创建。
+      const ws = owner.role === 'chief' ? await placer.chiefWorkspace() : await placer.ownerWorkspace(owner)
+      const value = await sessions.create(ws
+        ? { workspaceId: ws.workspaceId, agentPreset: presetForRole(owner.role) }
+        : { cwd: owner.cwd, agentPreset: presetForRole(owner.role) })
       hub.registry.bindSession(owner.id, value.sessionId)
       return { ...value, ownerId: owner.id }
     }
