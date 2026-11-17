@@ -19,38 +19,38 @@
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 
-/** chief 专属工作区的固定标题（用户可在 GUI 自行改名——只在新建时命名，此后尊重用户选择）。 */
-export const CHIEF_WORKSPACE_TITLE = 'Hub Bot 中枢'
-
-/** chief 专属工作区在 homeRepo 内的相对位置。 */
+/** chief 专属工作区在 homeRepo 内的默认相对位置（workspaces.chiefPath 可覆盖为任意绝对路径）。 */
 export const CHIEF_WORKSPACE_DIR = '.hub-bot/chief'
 
 export class WorkspacePlacer {
   /**
    * @param {object} deps
    * @param {object|null|undefined} deps.workspaceController - ctx.get('workspaceController')；undefined 时全部返回 null。
-   * @param {string} deps.homeRepo - Home Repo 绝对路径（chief 工作区落它的子目录）。
+   * @param {string} deps.homeRepo - Home Repo 绝对路径（chief 工作区默认落它的子目录）。
+   * @param {{ enabled?: boolean, chiefPath?: string|null, chiefTitle?: string }} [deps.workspaces] - 工作区配置段。
    * @param {{ warn: (...args: any[]) => void }} deps.logger
    * @param {(path: string) => void} [deps.mkdir] - 测试替身；默认 mkdirSync recursive。
    */
-  constructor({ workspaceController, homeRepo, logger, mkdir }) {
+  constructor({ workspaceController, homeRepo, workspaces, logger, mkdir }) {
     this.ws = workspaceController ?? null
     this.homeRepo = homeRepo
+    // workspaces.enabled=false 时整体关闭归位（全部返回 null → 回退 cwd 创建）。
+    this.cfg = workspaces ?? { enabled: true, chiefPath: null, chiefTitle: 'Hub Bot 中枢' }
     this.logger = logger
     this.mkdir = mkdir ?? (p => mkdirSync(p, { recursive: true }))
   }
 
-  get available() { return this.ws != null }
+  get available() { return this.ws != null && this.cfg.enabled !== false }
 
   /** chief 专属工作区：返回 { workspaceId, path }；不可用/失败 → null（调用方回退 cwd 创建）。 */
   async chiefWorkspace() {
     if (!this.available) return null
-    const path = join(this.homeRepo, CHIEF_WORKSPACE_DIR)
+    const path = this.cfg.chiefPath ?? join(this.homeRepo, CHIEF_WORKSPACE_DIR)
     try { this.mkdir(path) } catch (error) {
       this.logger.warn('hub-bot workspace: chief workspace dir mkdir failed: %s', error instanceof Error ? error.message : error)
       return null
     }
-    return await this.#ensure(path, CHIEF_WORKSPACE_TITLE)
+    return await this.#ensure(path, this.cfg.chiefTitle ?? 'Hub Bot 中枢')
   }
 
   /** owner 仓库工作区（path = owner.cwd）；transient/scratch 与失败 → null。 */

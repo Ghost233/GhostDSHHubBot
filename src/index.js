@@ -24,6 +24,7 @@ import { createHash, timingSafeEqual, randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import z from '@deepseek-ai/schemastery'
 import { resolveConfig } from './config.js'
 import {
   SETTINGS_FILE, applySettingsOverlay, applySettingsPatch, loadSettingsOverlay, mergeSettingsOverlay,
@@ -38,6 +39,54 @@ import { WorkspacePlacer } from './workspaces.js'
 
 export const name = 'hub-bot'
 export const inject = ['sessionController', 'sessionPersistence', 'webServer']
+
+/**
+ * cordis 配置 schema——DSH 插件管理界面据它渲染配置表单（没有这个导出，设置界面什么都不显示）。
+ * 刻意的「声明式镜像」：schema 只负责 GUI 表单与形状校验，真正的校验/默认值真源仍是
+ * src/config.js 的 resolveConfig（严格拒绝未知键）。两边必须同步演进。
+ * 所有键不带 default —— 避免 cordis 把默认值回填进 patch 配置，改变 resolveConfig 的语义。
+ */
+export const Config = z.object({
+  stateDir: z.string().description('插件状态目录（绝对路径）——任务票/触发器/负责人注册表的落盘位置。'),
+  homeRepo: z.string().description('Home Repo 绝对路径——L1 总负责人的管辖根。'),
+  workspaces: z.object({
+    enabled: z.boolean().description('GUI 工作区归位总开关（关闭后负责人会话回落未分组）。'),
+    chiefPath: z.string().description('L1 公共工作区目录（绝对路径；留空 = 默认 <homeRepo>/.hub-bot/chief）。警告：指定到 homeRepo 树外会让 chief 会话失去仓库 AGENTS.md 上下文。'),
+    chiefTitle: z.string().description('L1 工作区标题（默认「Hub Bot 中枢」；你手动改过的名字不会被覆盖）。'),
+  }).description('GUI 工作区归位 (#52)：负责人会话出生即落进工作区。'),
+  feishu: z.object({
+    enabled: z.boolean().description('飞书入口开关。'),
+    appId: z.string().description('飞书应用 App ID（一般用面板绑定流程自动写入，此为人工降级通道）。'),
+    appSecret: z.string().description('飞书应用 App Secret（同上，人工降级通道）。'),
+    botOpenId: z.string().description('机器人自身 open_id（回环防护用，通常自动解析）。'),
+  }).description('飞书渠道（设备流绑定见面板）。'),
+  github: z.object({
+    enabled: z.boolean().description('GitHub 监听开关（新 Issue/@mention → 自动建票）。'),
+    intervalMs: z.number().description('轮询间隔毫秒，最小 30000（30s）。'),
+    mentionHandle: z.string().description('响应的 @handle，如 @hub-bot。'),
+    loginAllowlist: z.array(z.string()).description('GitHub 登录名白名单（默认空 = 启动时解析为本人）。'),
+  }).description('GitHub 渠道（监听范围跟随负责人注册表）。'),
+  chief: z.object({
+    model: z.object({
+      provider: z.string().description('模型供应商 id。'),
+      model: z.string().description('模型 id。'),
+      reasoningEffort: z.string().description('推理档位（可选）。'),
+    }).description('总管固定模型；整个 chief 段省略 = 跟随部署默认。'),
+  }).description('L1 总管设置（模型也可在面板热改）。'),
+  concurrency: z.object({
+    slotsPerOwner: z.number().description('同 owner 并发 working 任务上限（默认 3）。'),
+  }).description('执行槽 (#72)。'),
+  reporting: z.object({
+    auto: z.boolean().description('定时汇总自动汇报开关（默认关）。'),
+    intervalMs: z.number().description('汇总间隔毫秒（默认 60000）。'),
+  }).description('定时汇总 (#67)。'),
+  security: z.object({
+    dangerousPatterns: z.array(z.string()).description('危险命令黑名单整表（显式配置 = 整表替换默认清单）。'),
+  }).description('注入安全 (#73)。'),
+  devApi: z.object({
+    token: z.string().description('管理 API token——开启 /hub-bot/api 与面板；为空则整个 API 不注册。'),
+  }).description('管理 API 与面板（loopback + token）。'),
+})
 
 /** The decoration-probe tool registered on a Session by the /decorate route. */
 export const PING_TOOL = {
@@ -158,7 +207,7 @@ export function apply(ctx, rawConfig) {
   }
   // GUI 工作区 (#52): ctx.get 动态探测（不放 inject 声明——旧版 DSH 无该服务时插件仍须可加载）。
   // 会话只能「出生即归位」（create({ workspaceId })）——已创建会话无任何归位 API（cwd 严格校验）。
-  const placer = new WorkspacePlacer({ workspaceController: safeGetService(ctx, 'workspaceController'), homeRepo: config.homeRepo, logger: ctx.logger })
+  const placer = new WorkspacePlacer({ workspaceController: safeGetService(ctx, 'workspaceController'), homeRepo: config.homeRepo, workspaces: config.workspaces, logger: ctx.logger })
   const hub = new Hub({ store, config, sessions, onSystemProblem: p => ctx.logger.warn('hub-bot system problem: %s (ticket %s, row %s)', p.reason, p.ticketId, p.rowId), placer })
   const chief = hub.registry.ensureChief({ cwd: config.homeRepo, workspace: basename(config.homeRepo) })
   setHub(hub)

@@ -13,7 +13,7 @@ import { isAbsolute } from 'node:path'
 import { DEFAULT_DANGEROUS_PATTERNS, validateDangerousPatterns } from './security.js'
 
 /** The configuration keys this plugin understands. Anything else is rejected so typos cannot pass silently. */
-const KNOWN_KEYS = new Set(['stateDir', 'homeRepo', 'devApi', 'reporting', 'feishu', 'github', 'concurrency', 'security', 'chief'])
+const KNOWN_KEYS = new Set(['stateDir', 'homeRepo', 'devApi', 'reporting', 'feishu', 'github', 'concurrency', 'security', 'chief', 'workspaces'])
 
 /** The keys the scheduled auto-summary understands (#67 定时汇总自动汇报 — OFF by default). */
 const KNOWN_REPORTING_KEYS = new Set(['auto', 'intervalMs'])
@@ -37,12 +37,18 @@ const DEFAULT_SLOTS_PER_OWNER = 3
 /** The keys the security section (spec「Policy」危险命令黑名单) understands. */
 const KNOWN_SECURITY_KEYS = new Set(['dangerousPatterns'])
 
+/** The keys the workspaces section (#52 GUI 工作区归位) understands. */
+const KNOWN_WORKSPACES_KEYS = new Set(['enabled', 'chiefPath', 'chiefTitle'])
+const DEFAULT_CHIEF_WORKSPACE_TITLE = 'Hub Bot 中枢'
+
 /** The keys the chief section understands — the L1 总管's declared working model (面板「总管模型」). */
 const KNOWN_CHIEF_KEYS = new Set(['model'])
 
 /** Validates one chief.model value: null = follow the deployment default; otherwise {provider, model, reasoningEffort?}. */
 export function validateChiefModel(value, path, ErrorCtor) {
+  // cordis Config schema 会把缺省段回填为空对象——{} 视同 null（跟随部署默认）。
   if (value === null || value === undefined) return null
+  if (typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 0) return null
   if (typeof value !== 'object' || Array.isArray(value)) throw new ErrorCtor(path + '.model must be null or an object {provider, model, reasoningEffort?}')
   const { provider, model, reasoningEffort } = value
   if (typeof provider !== 'string' || !provider.trim()) throw new ErrorCtor(path + '.model.provider must be a non-empty string')
@@ -93,7 +99,8 @@ export function resolveConfig(config) {
   if (typeof homeRepo !== 'string') throw new ConfigError('hub-bot config.homeRepo must be a string')
   if (!isAbsolute(homeRepo)) throw new ConfigError(`hub-bot config.homeRepo must be absolute, got "${homeRepo}"`)
   const resolved = { stateDir, homeRepo }
-  if (raw.devApi !== undefined) {
+  // devApi 空对象 = 未配置（cordis Config schema 会把缺省段回填为 {}——视为没写，API 不启用）。
+  if (raw.devApi !== undefined && !(typeof raw.devApi === 'object' && raw.devApi !== null && !Array.isArray(raw.devApi) && Object.keys(raw.devApi).length === 0)) {
     const devApi = raw.devApi
     if (typeof devApi !== 'object' || devApi === null || Array.isArray(devApi)) {
       throw new ConfigError('hub-bot config.devApi must be an object with a token')
@@ -218,7 +225,9 @@ export function resolveConfig(config) {
     for (const key of Object.keys(rawSecurity)) {
       if (!KNOWN_SECURITY_KEYS.has(key)) throw new ConfigError('hub-bot does not know config.security key ["' + key + '"]')
     }
-    if (rawSecurity.dangerousPatterns !== undefined) {
+    // 空数组 = cordis Config schema 的缺省回填，视同未配置（保留默认黑名单）——绝不允许 schema 把
+    // 危险命令黑名单静默清空。显式配置非空表才是「整表替换」。
+    if (rawSecurity.dangerousPatterns !== undefined && rawSecurity.dangerousPatterns.length > 0) {
       security.dangerousPatterns = validateDangerousPatterns(rawSecurity.dangerousPatterns, 'hub-bot config.security', ConfigError)
     }
   }
@@ -234,5 +243,32 @@ export function resolveConfig(config) {
     if (rawChief.model !== undefined) chief.model = validateChiefModel(rawChief.model, 'hub-bot config.chief', ConfigError)
   }
   resolved.chief = chief
+  // 工作区归位 (#52): chief 专属工作区的落点。chiefPath 为空 → 默认 homeRepo/.hub-bot/chief；
+  // 用户可指定任意绝对路径作「公共工作区」。警告：路径在 homeRepo 树外时 AGENTS.md 向上查找失效，
+  // chief 会话将失去仓库指令上下文（设置界面需注明）。
+  const workspaces = { enabled: true, chiefPath: null, chiefTitle: DEFAULT_CHIEF_WORKSPACE_TITLE }
+  if (raw.workspaces !== undefined) {
+    const rawWs = raw.workspaces
+    if (typeof rawWs !== 'object' || rawWs === null || Array.isArray(rawWs)) {
+      throw new ConfigError('hub-bot config.workspaces must be an object { enabled?, chiefPath?, chiefTitle? }')
+    }
+    for (const key of Object.keys(rawWs)) {
+      if (!KNOWN_WORKSPACES_KEYS.has(key)) throw new ConfigError('hub-bot does not know config.workspaces key ["' + key + '"]')
+    }
+    if (rawWs.enabled !== undefined) {
+      if (typeof rawWs.enabled !== 'boolean') throw new ConfigError('hub-bot config.workspaces.enabled must be a boolean')
+      workspaces.enabled = rawWs.enabled
+    }
+    if (rawWs.chiefPath !== undefined && rawWs.chiefPath !== null && rawWs.chiefPath !== '') {
+      if (typeof rawWs.chiefPath !== 'string') throw new ConfigError('hub-bot config.workspaces.chiefPath must be a string')
+      if (!isAbsolute(rawWs.chiefPath)) throw new ConfigError('hub-bot config.workspaces.chiefPath must be absolute, got "' + rawWs.chiefPath + '"')
+      workspaces.chiefPath = rawWs.chiefPath
+    }
+    if (rawWs.chiefTitle !== undefined) {
+      if (typeof rawWs.chiefTitle !== 'string' || !rawWs.chiefTitle.trim()) throw new ConfigError('hub-bot config.workspaces.chiefTitle must be a non-empty string')
+      workspaces.chiefTitle = rawWs.chiefTitle.trim()
+    }
+  }
+  resolved.workspaces = workspaces
   return resolved
 }

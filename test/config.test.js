@@ -8,7 +8,7 @@ import { DEFAULT_DANGEROUS_PATTERNS } from '../src/security.js'
 const valid = () => ({ stateDir: '/tmp/hub-bot-state', homeRepo: '/Volumes/home' })
 
 test('accepts an absolute stateDir and homeRepo', () => {
-  assert.deepEqual(resolveConfig(valid()), { stateDir: '/tmp/hub-bot-state', homeRepo: '/Volumes/home', reporting: { auto: false, intervalMs: 60000 }, feishu: { enabled: false }, github: { enabled: false, intervalMs: 300000, loginAllowlist: [] }, concurrency: { slotsPerOwner: 3 }, security: { dangerousPatterns: [...DEFAULT_DANGEROUS_PATTERNS] }, chief: { model: null } })
+  assert.deepEqual(resolveConfig(valid()), { stateDir: '/tmp/hub-bot-state', homeRepo: '/Volumes/home', reporting: { auto: false, intervalMs: 60000 }, feishu: { enabled: false }, github: { enabled: false, intervalMs: 300000, loginAllowlist: [] }, concurrency: { slotsPerOwner: 3 }, security: { dangerousPatterns: [...DEFAULT_DANGEROUS_PATTERNS] }, chief: { model: null }, workspaces: { enabled: true, chiefPath: null, chiefTitle: 'Hub Bot 中枢' } })
 })
 
 test('reporting defaults to OFF (无自动汇报) and parses explicit overrides', () => {
@@ -70,7 +70,8 @@ test('accepts devApi with a token', () => {
 })
 
 test('rejects devApi without a usable token', () => {
-  assert.throws(() => resolveConfig({ ...valid(), devApi: {} }), /devApi.token is required/)
+  // 空对象是 cordis Config schema 的缺省回填 → 视为未配置（API 不启用），不报错。
+  assert.equal(resolveConfig({ ...valid(), devApi: {} }).devApi, undefined)
   assert.throws(() => resolveConfig({ ...valid(), devApi: { token: '' } }), ConfigError)
   assert.throws(() => resolveConfig({ ...valid(), devApi: { token: 42 } }), ConfigError)
   assert.throws(() => resolveConfig({ ...valid(), devApi: true }), ConfigError)
@@ -79,4 +80,20 @@ test('rejects devApi without a usable token', () => {
 
 test('rejects unknown keys inside devApi', () => {
   assert.throws(() => resolveConfig({ ...valid(), devApi: { token: 'x', port: 3199 } }), /does not know config.devApi key/)
+})
+
+test('cordis schema backfill tolerance: empty objects/arrays keep safe defaults', () => {
+  const resolved = resolveConfig({ ...valid(), devApi: {}, chief: { model: {} }, security: { dangerousPatterns: [] }, workspaces: {} })
+  assert.equal(resolved.devApi, undefined)
+  assert.equal(resolved.chief.model, null)
+  assert.deepEqual(resolved.security.dangerousPatterns, [...DEFAULT_DANGEROUS_PATTERNS]) // 绝不被回填清空
+  assert.deepEqual(resolved.workspaces, { enabled: true, chiefPath: null, chiefTitle: 'Hub Bot 中枢' })
+})
+
+test('workspaces section: custom chiefPath/chiefTitle, strict validation', () => {
+  const r = resolveConfig({ ...valid(), workspaces: { chiefPath: '/pub/ws', chiefTitle: '我的中枢', enabled: false } })
+  assert.deepEqual(r.workspaces, { enabled: false, chiefPath: '/pub/ws', chiefTitle: '我的中枢' })
+  assert.throws(() => resolveConfig({ ...valid(), workspaces: { chiefPath: 'relative/path' } }), ConfigError)
+  assert.throws(() => resolveConfig({ ...valid(), workspaces: { chiefTitle: '' } }), ConfigError)
+  assert.throws(() => resolveConfig({ ...valid(), workspaces: { nope: 1 } }), ConfigError)
 })

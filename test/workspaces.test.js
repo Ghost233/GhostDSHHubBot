@@ -4,7 +4,9 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { WorkspacePlacer, CHIEF_WORKSPACE_TITLE, CHIEF_WORKSPACE_DIR } from '../src/workspaces.js'
+import { WorkspacePlacer, CHIEF_WORKSPACE_DIR } from '../src/workspaces.js'
+
+const CHIEF_WORKSPACE_TITLE = 'Hub Bot 中枢' // config.js 默认值的镜像
 
 const silent = { warn: () => {} }
 const memoryStore = () => {
