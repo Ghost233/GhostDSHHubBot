@@ -199,6 +199,25 @@ test('deliverReplies leaves failures recorded with an attempt counter; five fail
   } finally { cleanup() }
 })
 
+test('ws metrics persist in kv and surface in status (连接质量)', () => {
+  const f = fixture()
+  try {
+    assert.deepEqual(f.source.status().metrics, { reconnects: 0, lastConnectedAt: null, lastErrorAt: null, lastError: null }, '初始零值')
+    // 钩子记账路径在私有 connect 流程里（真实 ws 才能触发），这里验证持久化 + 投影契约：
+    // kv 里预置指标 → 重建的源（模拟重启）必须在 status() 里原样浮现
+    f.store.set('feishu.wsMetrics', { reconnects: 3, lastConnectedAt: '2026-11-15T01:00:00.000Z', lastErrorAt: '2026-11-15T00:30:00.000Z', lastError: 'ws closed' })
+    const reloaded = new FeishuSource({
+      store: f.store, registry: f.registry, sessions: {},
+      config: {}, logger: { info() {}, warn() {} }, lark: f.fakeLark,
+      now: () => '2026-11-15T02:00:00.000Z',
+    })
+    const st = reloaded.status()
+    assert.equal(st.metrics.reconnects, 3, '重启后重连计数还在')
+    assert.equal(st.metrics.lastConnectedAt, '2026-11-15T01:00:00.000Z')
+    assert.equal(st.metrics.lastError, 'ws closed')
+  } finally { f.cleanup() }
+})
+
 test('credentials persist with mode 0600 and reload; status reports missing/ok', async () => {
   const { source, store, cleanup } = fixture()
   try {

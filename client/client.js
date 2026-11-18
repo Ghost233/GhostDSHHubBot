@@ -225,6 +225,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       replyRecorded: '已注入会话',
       replyPending: '投递中',
       replyFailed: '回复投递失败',
+      feishuMetricsTitle: '连接质量：',
+      feishuMetricsReconnects: '重连 {count} 次',
+      feishuMetricsLastConnected: '最近连接',
+      feishuMetricsLastError: '最近错误',
       emptyOwners: '还没有负责人——飞书或 GitHub 来消息后会自动创建',
       tlCreated: '创建',
       tlAssign: '分派会话',
@@ -348,6 +352,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       replyRecorded: 'injected',
       replyPending: 'delivering',
       replyFailed: 'reply delivery failed',
+      feishuMetricsTitle: 'Connection:',
+      feishuMetricsReconnects: '{count} reconnects',
+      feishuMetricsLastConnected: 'last connected',
+      feishuMetricsLastError: 'last error',
       emptyOwners: 'No owners yet — one is created automatically when a feishu or GitHub message arrives',
       tlCreated: 'Created',
       tlAssign: 'Assigned',
@@ -648,6 +656,17 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               h('span', { style: { fontSize: '12px', opacity: 0.65 } }, 'App ID：' + (fs.bot.appIdMasked || '—')),
               fs.bot.boundAt ? h('span', { style: { fontSize: '12px', opacity: 0.65 } }, t('feishuBoundAt') + ' ' + relTime(t, fs.bot.boundAt)) : null,
               stagePill(fs.bot.connected ? 'done' : 'failed', fs.bot.connected ? t('feishuWsOk') : t('feishuWsDown'))));
+            // 连接质量（host 侧持久化的 ws 生命周期记账）: 有记录才渲染
+            var mt = fs.metrics || {};
+            var mtParts = [];
+            if (mt.reconnects > 0) mtParts.push(fill(t('feishuMetricsReconnects'), mt.reconnects));
+            if (mt.lastConnectedAt) mtParts.push(t('feishuMetricsLastConnected') + ' ' + relTime(t, mt.lastConnectedAt));
+            if (mt.lastErrorAt) mtParts.push(t('feishuMetricsLastError') + ' ' + relTime(t, mt.lastErrorAt));
+            if (mtParts.length > 0) {
+              rows.push(h('div', { key: 'mt', style: { marginTop: '6px', fontSize: '12px', opacity: 0.65, display: 'flex', gap: '12px', flexWrap: 'wrap' }, title: mt.lastError || '' },
+                h('span', { style: { fontWeight: 600 } }, t('feishuMetricsTitle')),
+                mtParts.map(function (part, i) { return h('span', { key: i }, part); })));
+            }
           } else {
             if (invalid) rows.push(h('p', { key: 'inv', style: { fontSize: '13px', color: TONES.red.fg, margin: '0 0 4px' } }, t('feishuInvalid')));
             else rows.push(h('p', { key: 'nb', style: { fontSize: '13px', opacity: 0.75, margin: '0 0 4px' } }, t('feishuNotBound')));

@@ -74,6 +74,8 @@ export class FeishuSource {
     this.placer = placer ?? null // GUI 工作区归位 (#52)：chief 会话创建后挂进专属工作区
     this.credentialState = 'missing'
     this.wsState = 'off'
+    // 连接质量指标（kv 持久化，重启不丢）: 重连计数 / 最近连接 / 最近错误——面板「连接质量」行的数据源。
+    this.wsMetrics = this.store.get('feishu.wsMetrics') ?? { reconnects: 0, lastConnectedAt: null, lastErrorAt: null, lastError: null }
     this.client = null
     this.ws = null
     this.#reloadCredentials()
@@ -123,6 +125,10 @@ export class FeishuSource {
    * The panel-facing bot-management view: one bot only (唯一总 bot). credentialState drives the three states —
    * missing (预告将创建的 bot + 权限清单 + 二维码), ok (bot 名片 + 连接, 二维码收起), invalid (提示重新扫码).
    */
+  #saveWsMetrics() {
+    try { this.store.set('feishu.wsMetrics', this.wsMetrics) } catch { /* 指标丢了不致命 */ }
+  }
+
   status() {
     const bound = this.credentialState === 'ok' && this.credentials
     const appId = bound ? this.credentials.appId : null
@@ -141,6 +147,7 @@ export class FeishuSource {
         connected: (this.ws?.getConnectionStatus?.().state ?? this.wsState) === 'connected',
       } : undefined,
       botOpenId: this.config.botOpenId ?? undefined,
+      metrics: { ...this.wsMetrics },
     }
   }
 
@@ -222,10 +229,10 @@ export class FeishuSource {
     this.ws = new WSClient({
       appId: this.credentials.appId,
       appSecret: this.credentials.appSecret,
-      onReady: () => { this.wsState = 'connected' },
+      onReady: () => { this.wsState = 'connected'; this.wsMetrics.lastConnectedAt = this.now(); this.#saveWsMetrics() },
       onReconnecting: () => { this.wsState = 'reconnecting'; this.logger.warn('hub-bot feishu: ws reconnecting…') },
-      onReconnected: () => { this.wsState = 'connected'; this.logger.info('hub-bot feishu: ws reconnected') },
-      onError: error => { this.logger.warn('hub-bot feishu: ws error: %s', error?.message ?? error) },
+      onReconnected: () => { this.wsState = 'connected'; this.wsMetrics.reconnects += 1; this.wsMetrics.lastConnectedAt = this.now(); this.#saveWsMetrics(); this.logger.info('hub-bot feishu: ws reconnected') },
+      onError: error => { this.wsMetrics.lastErrorAt = this.now(); this.wsMetrics.lastError = String(error?.message ?? error).slice(0, 200); this.#saveWsMetrics(); this.logger.warn('hub-bot feishu: ws error: %s', error?.message ?? error) },
     })
     const dispatcher = new EventDispatcher({}).register({
       'im.message.receive_v1': async data => {
