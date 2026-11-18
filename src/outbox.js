@@ -38,6 +38,24 @@ export function insertOutbox(store, row, now = () => Date.now()) {
 }
 
 /** THE one outbox row updater (双轴审查 P1-2: feishu/github/runner hand-rolled the same UPDATE three times). */
+/**
+ * 死信重投（面板健康警告条的操作闭环）: failed 行回到原投递通道（originState），
+ * attempts 清零、退避清空——下一轮 tick 重新尝试。返回重投的行数。
+ * 旧死信（v0.4.1 前，无 originState）默认回 'queued'——主循环能处理绝大多数行。
+ */
+export function retryOutboxRows(store, ids = null) {
+  const rows = store.db.prepare('SELECT id, value FROM outbox').all()
+    .map(r => JSON.parse(String(r.value)))
+    .filter(row => row.state === 'failed' && (ids === null || ids.includes(row.id)))
+  let retried = 0
+  for (const row of rows) {
+    const { originState, ...rest } = row
+    updateOutboxRow(store, { ...rest, state: originState ?? 'queued', attempts: 0, nextRetryAt: null, lastError: null })
+    retried++
+  }
+  return retried
+}
+
 export function updateOutboxRow(store, row) {
   store.db.prepare('UPDATE outbox SET value = ? WHERE id = ?').run(JSON.stringify(row), row.id)
 }
@@ -95,7 +113,9 @@ async function deliverRecordedRepliesPass({ store, logger, now, channel, prefix,
       const attempts = (row.attempts ?? 0) + 1
       logger.warn('hub-bot %s: reply to %s failed (%s)', channel, row.to, error?.message ?? error)
       if (attempts >= maxAttempts) {
-        updateOutboxRow(store, { ...row, state: 'failed', attempts, lastError: String(error?.message ?? error) })
+        // 死信（failed）: 记下原 state（originState）——面板「重投」时好回到正确的投递通道
+        // （queued 走主循环 / recorded 走回投扫描），不用猜。
+        updateOutboxRow(store, { ...row, state: 'failed', originState: row.state, attempts, lastError: String(error?.message ?? error) })
         insertOutbox(store, {
           ticketId: row.ticketId ?? null, kind: 'system-problem', to: 'chief',
           body: channel + ' reply ' + row.id + ' failed ' + attempts + ' times in a row (' + row.to + ')', state: 'recorded',

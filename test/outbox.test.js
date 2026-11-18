@@ -10,7 +10,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Store } from '../src/store.js'
-import { OutboxRunner } from '../src/outbox.js'
+import { OutboxRunner, retryOutboxRows, insertOutbox } from '../src/outbox.js'
 
 function fixture(opts = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'hub-bot-outbox-'))
@@ -301,4 +301,50 @@ test('#74 P1-A: the guard is per channel — another channel proceeds while one 
     assert.notEqual(other.skipped, 'in-flight', 'a different channel is not blocked')
     assert.equal(sends, 1)
   } finally { fx.cleanup() }
+})
+
+
+test('retryOutboxRows: failed rows return to their origin channel with attempts cleared (turn 110)', async () => {
+  const { store, cleanup } = fixture()
+  try {
+    insertOutbox(store, { ticketId: 't1', kind: 'reply', to: 'feishu:chat:x', body: 'a', state: 'queued' })
+    insertOutbox(store, { ticketId: 't1', kind: 'reply', to: 'feishu:chat:x', body: 'b', state: 'recorded' })
+    const rows = store.db.prepare('SELECT value FROM outbox').all().map(r => JSON.parse(String(r.value)))
+    // 手工推成 failed（模拟 maxAttempts 耗尽）
+    for (const row of rows) {
+      store.db.prepare('UPDATE outbox SET value = ? WHERE id = ?').run(
+        JSON.stringify({ ...row, state: 'failed', originState: row.state, attempts: 3, lastError: 'boom', nextRetryAt: 999 }), row.id)
+    }
+    const retried = retryOutboxRows(store, null)
+    assert.equal(retried, 2)
+    const after = store.db.prepare('SELECT value FROM outbox').all().map(r => JSON.parse(String(r.value)))
+    assert.deepEqual(after.map(r => r.state).sort(), ['queued', 'recorded'], '各回原通道')
+    for (const row of after) {
+      assert.equal(row.attempts, 0)
+      assert.equal(row.nextRetryAt, null)
+      assert.equal(row.lastError, null)
+      assert.equal(row.originState, undefined, 'originState 用完即弃')
+    }
+  } finally { cleanup() }
+})
+
+test('retryOutboxRows: targeted retry only touches the named row; legacy failed rows fall back to queued', async () => {
+  const { store, cleanup } = fixture()
+  try {
+    insertOutbox(store, { ticketId: 't1', kind: 'reply', to: 'a', body: '1', state: 'queued' })
+    insertOutbox(store, { ticketId: 't1', kind: 'reply', to: 'b', body: '2', state: 'queued' })
+    const rows = store.db.prepare('SELECT id, value FROM outbox').all().map(r => ({ id: r.id, ...JSON.parse(String(r.value)) }))
+    for (const row of rows) {
+      // 旧格式死信: 无 originState
+      store.db.prepare('UPDATE outbox SET value = ? WHERE id = ?').run(
+        JSON.stringify({ ...row, state: 'failed', attempts: 3, lastError: 'x' }), row.id)
+    }
+    const retried = retryOutboxRows(store, [rows[0].id])
+    assert.equal(retried, 1)
+    const after = store.db.prepare('SELECT id, value FROM outbox').all().map(r => ({ id: r.id, ...JSON.parse(String(r.value)) }))
+    const first = after.find(r => r.id === rows[0].id)
+    const second = after.find(r => r.id === rows[1].id)
+    assert.equal(first.state, 'queued', '旧死信回落 queued')
+    assert.equal(second.state, 'failed', '未点名的不动')
+  } finally { cleanup() }
 })

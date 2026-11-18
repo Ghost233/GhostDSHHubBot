@@ -20,6 +20,7 @@ const makeService = (overrides = {}) => {
     resolveTicket: async req => ({ resolved: req }),
     listWorkspaces: async () => [],
     startFeishuRegister: async () => ({ started: true }),
+    retryOutbox: async req => ({ retried: req.all === true ? 3 : 1 }),
     ...overrides,
   }
   const ctx = new Context()
@@ -177,4 +178,22 @@ test('startFeishuRegister is discoverable and delegates', async () => {
   const result = await service.startFeishuRegister()
   assert.deepEqual(result, { started: true })
   assert.equal(called, 1)
+})
+
+
+test('retryOutbox is discoverable and delegates (turn 110)', async () => {
+  const { service } = makeService()
+  const methods = remoteMethods(service).map(m => m.method)
+  assert.ok(methods.includes('retryOutbox'), 'retryOutbox discoverable')
+  assert.deepEqual(await service.retryOutbox({ all: true }), { retried: 3 })
+  assert.deepEqual(await service.retryOutbox({ id: 'out-1' }), { retried: 1 })
+})
+
+test('retryOutbox maps a missing dead letter to RemoteError outbox/invalid', async () => {
+  const failing = async () => { const e = new Error('no failed outbox row "out-x"'); e.statusCode = 404; throw e }
+  const { service } = makeService({ retryOutbox: failing })
+  await assert.rejects(() => service.retryOutbox({ id: 'out-x' }), err => {
+    assert.equal(err.code, 'outbox/invalid')
+    return true
+  })
 })

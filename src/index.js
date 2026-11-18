@@ -31,6 +31,7 @@ import {
   SETTINGS_FILE, applySettingsOverlay, applySettingsPatch, loadSettingsOverlay, mergeSettingsOverlay,
   saveSettingsOverlay, buildOverview, buildSettingsView,
 } from './panel.js'
+import { retryOutboxRows } from './outbox.js'
 import { Store, SCHEMA_VERSION } from './store.js'
 import { Hub, setHub } from './hub.js'
 import { FeishuSource } from './feishu.js'
@@ -353,6 +354,7 @@ export function apply(ctx, rawConfig) {
     resolveTicket: forwardDep('resolveTicket'),
     startFeishuRegister: forwardDep('startFeishuRegister'),
     listWorkspaces: forwardDep('listWorkspaces'),
+    retryOutbox: forwardDep('retryOutbox'),
   })
   // 填充真实实现——转发层延迟解引用；devApi 未配置时管理面方法本就不该可用（行为与现状一致）。
   Object.assign(serviceDeps, {
@@ -361,6 +363,7 @@ export function apply(ctx, rawConfig) {
     listOwners: () => hub.registry.list(),
     modelCatalog: () => sessions.modelCatalog(),
     // 关联式归位选择器（turn 108）: DSH 工作区枚举。registry 服务缺席（老 DSH）→ 空数组，选择器降级为「自动」。
+    retryOutbox: body => retryOutbox(body),
     listWorkspaces: () => (safeGetService(ctx, 'workspaceRegistry')?.list?.() ?? []).map(w => ({ workspaceId: String(w.id), title: w.title ?? null, path: w.path ?? null, sessionIds: Array.isArray(w.sessionIds) ? [...w.sessionIds] : [] })),
     overview: async () => buildOverview({ store, registry: hub.registry, health: await buildHealth() }),
     resolveTicket: request => resolveTicket(request),
@@ -544,6 +547,15 @@ export function apply(ctx, rawConfig) {
     })
   }
 
+  // 死信重投（健康警告条的操作闭环 turn 110）: {id} 单条 / {all:true} 全部。
+  const retryOutbox = body => {
+    if (body?.all === true) return { retried: retryOutboxRows(store, null) }
+    const id = requireString(body, 'id')
+    const retried = retryOutboxRows(store, [id])
+    if (retried === 0) throw new HttpError(404, 'no failed outbox row "' + id + '"')
+    return { retried }
+  }
+
   const unregister = ctx.webServer.register({
     kind: 'prefix',
     path: '/hub-bot',
@@ -655,6 +667,8 @@ export function apply(ctx, rawConfig) {
           json(res, 200, await applySettings(req))
         } else if (route === 'tickets/resolve' && method === 'POST') {
           json(res, 200, await resolveTicket(await readBody(req)))
+        } else if (route === 'outbox/retry' && method === 'POST') {
+          json(res, 200, retryOutbox(await readBody(req)))
         } else {
           throw new HttpError(404, 'Unknown operation: ' + method + ' ' + route)
         }

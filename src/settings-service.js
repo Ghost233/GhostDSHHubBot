@@ -91,6 +91,16 @@ export class HubBotSettingsService extends TypertRemoteService {
     return (rows ?? []).map(w => ({ workspaceId: w.workspaceId ?? null, title: w.title ?? null, path: w.path ?? null }))
   }
 
+  /** 死信重投: {id} 单条 / {all:true} 全部；返回 {retried}。无匹配死信 → 404 语义。 */
+  async retryOutbox(request) {
+    try {
+      return await this.deps.retryOutbox(request ?? {})
+    } catch (error) {
+      if (error?.statusCode === 404 || error?.statusCode === 400) throw new RemoteError('outbox/invalid', error?.message ?? 'invalid retry request')
+      throw error
+    }
+  }
+
   async modelCatalog() {
     const value = await this.deps.modelCatalog()
     return value === undefined ? null : JSON.parse(JSON.stringify(value))
@@ -131,6 +141,7 @@ markRemote(HubBotSettingsService, 'update', {})
 markRemote(HubBotSettingsService, 'listOwners', {})
 markRemote(HubBotSettingsService, 'modelCatalog', {})
 markRemote(HubBotSettingsService, 'listWorkspaces', {})
+markRemote(HubBotSettingsService, 'retryOutbox', {})
 markRemote(HubBotSettingsService, 'overview', {})
 markRemote(HubBotSettingsService, 'resolveTicket', {})
 markRemote(HubBotSettingsService, 'startFeishuRegister', {})

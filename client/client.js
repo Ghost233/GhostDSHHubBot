@@ -64,6 +64,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           parameters: [],
           result: anyCodec('dsh-hub-bot#json-result'),
         },
+        'hubBotSettings/retryOutbox': {
+          service: 'hubBotSettings',
+          description: 'Retry failed (dead-letter) outbox deliveries: {id} for one row, {all:true} for all.',
+          invocation: { kind: 'direct' },
+          parameters: [],
+          result: anyCodec('dsh-hub-bot#json-result'),
+        },
         'hubBotSettings/modelCatalog': {
           service: 'hubBotSettings',
           description: 'Model catalog for the chief-model picker.',
@@ -192,6 +199,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       droppedLabel: '未受理',
       healthDetailRetry: '重试中',
       healthDetailDead: '投递失败（死信）',
+      retryOne: '重投',
+      retryAll: '全部重投',
       healthDetailNext: '下次重试',
       healthDetailLast: '最近错误',
       detailAuth: '授权',
@@ -288,6 +297,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       droppedLabel: 'dropped',
       healthDetailRetry: 'retrying',
       healthDetailDead: 'failed deliveries (dead letters)',
+      retryOne: 'Retry',
+      retryAll: 'Retry all',
       healthDetailNext: 'next retry',
       healthDetailLast: 'last error',
       detailAuth: 'Authorized',
@@ -632,6 +643,17 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             }).catch(function (e) { setError(e && e.message ? e.message : String(e)); });
           };
           React.useEffect(load, []);
+          // 死信重投（健康警告条操作闭环）: 单条或全部，成功后整体刷新（overview 在 load 里）。
+          var retryOutbox = function (idOrNull) {
+            var req = idOrNull === null ? { all: true } : { id: idOrNull };
+            scoped.remote.hubBotSettings.retryOutbox(req)
+              .then(function () { load(); })
+              .catch(function (e) { setError(e && e.message ? e.message : String(e)); });
+          };
+          var retryBtnStyle = {
+            font: 'inherit', fontSize: '11px', padding: '2px 8px', borderRadius: '5px', cursor: 'pointer',
+            border: '1px solid rgba(230,160,40,0.5)', background: 'transparent', color: 'inherit', opacity: 0.9,
+          };
           var refreshView = function () {
             scoped.remote.hubBotSettings.read()
               .then(function (raw) { setView(unwrap(raw)); })
@@ -766,9 +788,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               (overview.health && overview.health.outbox && (overview.health.outbox.failedList || []).length > 0)
                 ? h('details', { style: { marginTop: '4px' } },
                     h('summary', { style: { cursor: 'pointer', opacity: 0.85 } }, t('healthDetailDead') + ' · ' + overview.health.outbox.failedList.length),
+                    h('div', { style: { marginTop: '4px' } },
+                      h('button', { style: retryBtnStyle, onClick: function (ev) { ev.preventDefault(); retryOutbox(null); } }, t('retryAll'))),
                     overview.health.outbox.failedList.map(function (r0) {
                       return h('div', { key: r0.id, style: { marginTop: '6px', padding: '6px 8px', background: 'rgba(0,0,0,0.18)', borderRadius: '6px', fontSize: '12px' } },
-                        h('div', null, (r0.to || '') + ' — ' + (r0.ticketId || '—') + ' · ' + r0.attempts + ' 次尝试'),
+                        h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px' } },
+                          h('span', null, (r0.to || '') + ' — ' + (r0.ticketId || '—') + ' · ' + r0.attempts + ' 次尝试'),
+                          h('button', { style: retryBtnStyle, onClick: function () { retryOutbox(r0.id); } }, t('retryOne'))),
                         r0.lastError ? h('div', { style: { opacity: 0.75, marginTop: '2px', wordBreak: 'break-all' } }, t('healthDetailLast') + ': ' + String(r0.lastError).slice(0, 140)) : null);
                     })) : null) : null,
             h('div', { style: sectionStyle },
