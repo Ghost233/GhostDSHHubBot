@@ -310,7 +310,13 @@ export function apply(ctx, rawConfig) {
 
   // GUI 设置面板的数据通路（client/ 半侧）：与 HTTP 面板共用同一条 settingsView/applySettingsCore。
   // 独立于 devApi——管理 API 关掉时 GUI 设置页照常工作。
-  new HubBotSettingsService(ctx, { settingsView, applySettings: applySettingsCore })
+  new HubBotSettingsService(ctx, {
+    settingsView,
+    applySettings: applySettingsCore,
+    // GUI 面板的只读投影：owner 注册表与模型目录（模型选择器用）。
+    listOwners: () => hub.registry.list(),
+    modelCatalog: () => sessions.modelCatalog(),
+  })
 
   if (!config.devApi) return
   const token = config.devApi.token

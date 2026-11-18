@@ -50,6 +50,20 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           }],
           result: anyCodec('dsh-hub-bot#json-result'),
         },
+        'hubBotSettings/listOwners': {
+          service: 'hubBotSettings',
+          description: 'List owner registry rows (GUI panel projection).',
+          invocation: { kind: 'direct' },
+          parameters: [],
+          result: anyCodec('dsh-hub-bot#json-result'),
+        },
+        'hubBotSettings/modelCatalog': {
+          service: 'hubBotSettings',
+          description: 'Model catalog for the chief-model picker.',
+          invocation: { kind: 'direct' },
+          parameters: [],
+          result: anyCodec('dsh-hub-bot#json-result'),
+        },
       },
     }, zodLib.z);
 
@@ -71,6 +85,32 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       loading: '正在读取…',
       loadFailed: '读取失败',
       retry: '重试',
+      statusSection: '状态',
+      feishuCard: '飞书',
+      githubCard: 'GitHub 监听',
+      ownersCard: '负责人',
+      connected: '已连接',
+      notConnected: '未连接',
+      disabled: '未启用',
+      watching: '监听 {count} 个仓库',
+      ownersSection: '负责人',
+      colRole: '角色',
+      colKind: '类型',
+      colDir: '目录',
+      colSession: '会话',
+      roleChief: '总管',
+      roleOwner: '负责人',
+      kindRepo: '仓库',
+      kindTemp: '临时',
+      sessionBound: '已绑定',
+      sessionNone: '未创建',
+      modelApply: '应用',
+      modelApplying: '应用中…',
+      modelApplied: '模型已生效',
+      modelFailed: '模型设置失败',
+      catalogUnavailable: '模型目录不可用',
+      refresh: '刷新',
+      modelPickerHint: '修改立即生效；「跟随部署默认」使用当前 DSH 配置的默认模型。',
     };
     var en = {
       title: 'Hub Bot',
@@ -90,8 +130,40 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       loading: 'Loading…',
       loadFailed: 'Load failed',
       retry: 'Retry',
+      statusSection: 'Status',
+      feishuCard: 'Feishu',
+      githubCard: 'GitHub watch',
+      ownersCard: 'Owners',
+      connected: 'Connected',
+      notConnected: 'Not connected',
+      disabled: 'Disabled',
+      watching: 'Watching {count} repos',
+      ownersSection: 'Owners',
+      colRole: 'Role',
+      colKind: 'Kind',
+      colDir: 'Directory',
+      colSession: 'Session',
+      roleChief: 'Chief',
+      roleOwner: 'Owner',
+      kindRepo: 'Repo',
+      kindTemp: 'Temp',
+      sessionBound: 'Bound',
+      sessionNone: 'Not created',
+      modelApply: 'Apply',
+      modelApplying: 'Applying…',
+      modelApplied: 'Model applied',
+      modelFailed: 'Failed to apply model',
+      catalogUnavailable: 'Model catalog unavailable',
+      refresh: 'Refresh',
+      modelPickerHint: 'Takes effect immediately; "Follows the deployment default" uses the DSH default model.',
     };
     var NS = 'dsh-hub-bot.settings';
+
+    // 防御性拆包：remote 结果可能带 {ok:true,value} envelope（官方 stub 在生成代码里拆，
+    // 我们的手写 contribution 没有那层），裸对象则原样通过。
+    function unwrap(x) {
+      return x && typeof x === 'object' && x.ok === true && 'value' in x ? x.value : x;
+    }
 
     var fieldStyle = { display: 'flex', flexDirection: 'column', gap: '4px', marginBottom: '12px' };
     var labelStyle = { fontSize: '12px', opacity: 0.75 };
@@ -120,7 +192,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
 
       var load = function () {
         setError(null);
-        ctx.remote.hubBotSettings.read().then(function (v) {
+        ctx.remote.hubBotSettings.read().then(function (raw) {
+          var v = unwrap(raw);
           setView(v);
           setForm({
             enabled: v.workspaces ? v.workspaces.enabled !== false : true,
@@ -146,7 +219,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             chiefPath: form.chiefPath.trim(),
             chiefTitle: form.chiefTitle.trim() || 'Hub Bot 中枢',
           },
-        }).then(function (v) { setView(v); setSaved(true); })
+        }).then(function (v) { setView(unwrap(v)); setSaved(true); })
           .catch(function (e) { setError(e && e.message ? e.message : String(e)); })
           .finally(function () { setBusy(false); });
       };
@@ -230,11 +303,135 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             h('line', { x1: 9.9, y1: 14.3, x2: 6.5, y2: 16.5 }),
             h('line', { x1: 14.1, y1: 14.3, x2: 17.5, y2: 16.5 }));
         }
+        // 面板整页：状态卡片 + 模型选择 + owners 表 + 设置表单（原 Web 面板的收编）。
+        var cardRowStyle = { display: 'flex', gap: '12px', flexWrap: 'wrap', marginBottom: '20px' };
+        var cardStyle = {
+          flex: '1 1 160px', padding: '12px 14px', borderRadius: '8px',
+          border: '1px solid var(--dsh-border, rgba(127,127,127,0.3))',
+        };
+        var cardTitleStyle = { fontSize: '12px', opacity: 0.7, marginBottom: '6px' };
+        var cardValueStyle = { fontSize: '14px', fontWeight: 600 };
+        var tableStyle = { width: '100%', borderCollapse: 'collapse', fontSize: '13px' };
+        var thStyle = { textAlign: 'left', padding: '6px 8px', opacity: 0.65, fontSize: '12px', borderBottom: '1px solid var(--dsh-border, rgba(127,127,127,0.3))' };
+        var tdStyle = { padding: '6px 8px', borderBottom: '1px solid var(--dsh-border, rgba(127,127,127,0.15))', verticalAlign: 'top' };
+
+        function shortPath(p) {
+          if (!p) return '—';
+          var parts = String(p).split('/');
+          return parts.length > 3 ? '…/' + parts.slice(-2).join('/') : p;
+        }
+        function fill(template, count) {
+          return String(template).replace('{count}', String(count));
+        }
+
         function HubBotPanelPage() {
           var t = scoped.locale.bind(NS);
+          var vs = React.useState(null); var view = vs[0]; var setView = vs[1];
+          var os = React.useState(null); var owners = os[0]; var setOwners = os[1];
+          var cs = React.useState(null); var catalog = cs[0]; var setCatalog = cs[1];
+          var es = React.useState(null); var error = es[0]; var setError = es[1];
+          var ms = React.useState(''); var modelChoice = ms[0]; var setModelChoice = ms[1];
+          var bs = React.useState(false); var modelBusy = bs[0]; var setModelBusy = bs[1];
+          var ds = React.useState(false); var modelDone = ds[0]; var setModelDone = ds[1];
+
+          var load = function () {
+            setError(null);
+            Promise.all([
+              scoped.remote.hubBotSettings.read(),
+              scoped.remote.hubBotSettings.listOwners(),
+              scoped.remote.hubBotSettings.modelCatalog(),
+            ]).then(function (r) {
+              var v = unwrap(r[0]); var ow = unwrap(r[1]); var cat = unwrap(r[2]);
+              setView(v); setOwners(Array.isArray(ow) ? ow : []); setCatalog(cat);
+              var m = v.chief && v.chief.model;
+              setModelChoice(m ? m.provider + '/' + m.model : '');
+            }).catch(function (e) { setError(e && e.message ? e.message : String(e)); });
+          };
+          React.useEffect(load, []);
+
+          var saveModel = function () {
+            setModelBusy(true); setModelDone(false); setError(null);
+            var patch;
+            if (modelChoice === '') patch = { chief: { model: null } };
+            else {
+              var i = modelChoice.indexOf('/');
+              patch = { chief: { model: { provider: modelChoice.slice(0, i), model: modelChoice.slice(i + 1) } } };
+            }
+            scoped.remote.hubBotSettings.update(patch)
+              .then(function (v) { setView(unwrap(v)); setModelDone(true); })
+              .catch(function (e) { setError(t('modelFailed') + ': ' + (e && e.message ? e.message : String(e))); })
+              .finally(function () { setModelBusy(false); });
+          };
+
+          if (error && !view) {
+            return h('div', { style: { padding: '20px 24px' } },
+              h('p', null, t('loadFailed') + ': ' + error),
+              h('button', { onClick: load, style: Object.assign({}, inputStyle, { width: 'auto', padding: '6px 16px' }) }, t('retry')));
+          }
+          if (!view || !owners) return h('p', { style: { padding: '20px 24px' } }, t('loading'));
+
+          var feishu = view.feishu || {};
+          var fs = feishu.status || {};
+          var feishuText = !feishu.enabled ? t('disabled')
+            : (fs.wsState === 'connected' || fs.wsState === 'ready') ? t('connected')
+            : (fs.wsState || t('notConnected'));
+          var github = view.github || {};
+          var followed = github.followed || [];
+          var githubText = !github.enabled ? t('disabled') : fill(t('watching'), followed.length);
+
+          var modelOptions = [h('option', { key: '', value: '' }, t('modelFollow'))];
+          if (catalog && catalog.groups) {
+            catalog.groups.forEach(function (g) {
+              modelOptions.push(h('optgroup', { key: g.id, label: g.name || g.id },
+                (g.models || []).map(function (m) {
+                  var val = g.id + '/' + m.id;
+                  var label = (m.name || m.id) + (m.reasoning ? ' · reasoning' : '') + (m.badge ? ' · ' + m.badge : '');
+                  return h('option', { key: val, value: val }, label);
+                })));
+            });
+          }
+
           return h('div', { style: { padding: '20px 24px', overflowY: 'auto', height: '100%', boxSizing: 'border-box' } },
             h('h2', { style: { fontSize: '17px', fontWeight: 600, margin: '0 0 18px' } }, t('title')),
-            h(HubBotRowConfig, { hubBotCtx: scoped }));
+            h('div', { style: cardRowStyle },
+              h('div', { style: cardStyle }, h('div', { style: cardTitleStyle }, t('feishuCard')), h('div', { style: cardValueStyle }, feishuText)),
+              h('div', { style: cardStyle }, h('div', { style: cardTitleStyle }, t('githubCard')), h('div', { style: cardValueStyle }, githubText)),
+              h('div', { style: cardStyle }, h('div', { style: cardTitleStyle }, t('ownersCard')), h('div', { style: cardValueStyle }, String(owners.length)))),
+            h('div', { style: sectionStyle },
+              h('div', { style: sectionTitleStyle }, t('modelSection')),
+              catalog && catalog.groups
+                ? h('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', maxWidth: '560px' } },
+                    h('select', {
+                      style: inputStyle, value: modelChoice, disabled: modelBusy,
+                      onChange: function (ev) { setModelChoice(ev.target.value); setModelDone(false); },
+                    }, modelOptions),
+                    h('button', {
+                      onClick: saveModel, disabled: modelBusy,
+                      style: Object.assign({}, inputStyle, { width: 'auto', cursor: 'pointer', padding: '6px 16px', whiteSpace: 'nowrap' }),
+                    }, modelBusy ? t('modelApplying') : t('modelApply')),
+                    modelDone ? h('span', { style: { fontSize: '12px', opacity: 0.7, whiteSpace: 'nowrap' } }, t('modelApplied')) : null)
+                : h('div', { style: warnStyle }, t('catalogUnavailable')),
+              h('div', { style: warnStyle }, t('modelPickerHint'))),
+            h('div', { style: sectionStyle },
+              h('div', { style: sectionTitleStyle }, t('ownersSection')),
+              h('table', { style: tableStyle },
+                h('thead', null, h('tr', null,
+                  h('th', { style: thStyle }, 'ID'),
+                  h('th', { style: thStyle }, t('colRole')),
+                  h('th', { style: thStyle }, t('colKind')),
+                  h('th', { style: thStyle }, t('colDir')),
+                  h('th', { style: thStyle }, t('colSession')))),
+                h('tbody', null, owners.map(function (o) {
+                  var dir = o.cwd || o.workspace || '';
+                  return h('tr', { key: o.id },
+                    h('td', { style: tdStyle }, o.id),
+                    h('td', { style: tdStyle }, o.role === 'chief' ? t('roleChief') : t('roleOwner')),
+                    h('td', { style: tdStyle }, o.kind === 'temp' ? t('kindTemp') : t('kindRepo')),
+                    h('td', { style: Object.assign({}, tdStyle, { opacity: 0.8 }), title: dir }, shortPath(dir)),
+                    h('td', { style: tdStyle }, o.sessionId ? t('sessionBound') : t('sessionNone')));
+                })))),
+            h(HubBotRowConfig, { hubBotCtx: scoped }),
+            error ? h('div', { style: { fontSize: '12px', color: 'var(--dsh-danger, #d66)', marginTop: '8px' } }, error) : null);
         }
         scoped.effect(function () {
           return scoped.slots.inject('sidebar.panellist', function () {

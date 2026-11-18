@@ -31,7 +31,7 @@ function markRemote(cls, methodName, options) {
 export class HubBotSettingsService extends TypertRemoteService {
   /**
    * @param {import('cordis').Context} ctx
-   * @param {{ settingsView: () => Promise<object>, applySettings: (patch: object) => Promise<object> }} deps
+   * @param {{ settingsView: () => Promise<object>, applySettings: (patch: object) => Promise<object>, listOwners: () => object[] | Promise<object[]>, modelCatalog: () => Promise<object> }} deps
    */
   constructor(ctx, deps) {
     super(ctx, 'hubBotSettings')
@@ -54,7 +54,29 @@ export class HubBotSettingsService extends TypertRemoteService {
       throw error
     }
   }
+
+  /** Owner registry rows projected for the GUI panel (read-only, plain JSON). */
+  async listOwners() {
+    const rows = await this.deps.listOwners()
+    return rows.map(row => ({
+      id: row.id,
+      role: row.role ?? null,
+      kind: row.kind ?? null,
+      workspace: row.workspace ?? null,
+      cwd: row.cwd ?? null,
+      sessionId: row.sessionId ?? null,
+      status: row.status ?? null,
+      createdAt: row.createdAt ?? null,
+    }))
+  }
+
+  /** Model catalog passthrough for the chief-model picker (read-only). */
+  async modelCatalog() {
+    return await this.deps.modelCatalog()
+  }
 }
 
 markRemote(HubBotSettingsService, 'read', {})
 markRemote(HubBotSettingsService, 'update', {})
+markRemote(HubBotSettingsService, 'listOwners', {})
+markRemote(HubBotSettingsService, 'modelCatalog', {})

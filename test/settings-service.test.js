@@ -14,6 +14,8 @@ const makeService = (overrides = {}) => {
   const deps = {
     settingsView: async () => ({ workspaces: { enabled: true } }),
     applySettings: async patch => { calls.push(patch); return { applied: patch } },
+    listOwners: () => [],
+    modelCatalog: async () => ({ groups: [] }),
     ...overrides,
   }
   const ctx = new Context()
@@ -26,6 +28,8 @@ test('exposes read and update as discoverable Remote methods', () => {
   const names = remoteMethods(service).map(m => m.method)
   assert.ok(names.includes('read'), 'read must be Remote-marked')
   assert.ok(names.includes('update'), 'update must be Remote-marked')
+  assert.ok(names.includes('listOwners'), 'listOwners must be Remote-marked')
+  assert.ok(names.includes('modelCatalog'), 'modelCatalog must be Remote-marked')
 })
 
 test('registers itself under the hubBotSettings service key', async () => {
@@ -77,4 +81,24 @@ test('unexpected errors propagate unchanged', async () => {
   const boom = new Error('disk on fire')
   const { service } = makeService({ applySettings: async () => { throw boom } })
   await assert.rejects(() => service.update({}), error => error === boom)
+})
+
+test('listOwners projects registry rows to plain JSON', async () => {
+  const rows = [{
+    id: 'chief', role: 'chief', kind: 'repo', workspace: 'Ghost233HomeRepo',
+    cwd: '/Volumes/x/Ghost233HomeRepo', sessionId: 'session-1', status: 'bound',
+    createdAt: '2026-11-18T00:00:00.000Z', extra: 'not-projected',
+  }]
+  const { service } = makeService({ listOwners: () => rows })
+  assert.deepEqual(await service.listOwners(), [{
+    id: 'chief', role: 'chief', kind: 'repo', workspace: 'Ghost233HomeRepo',
+    cwd: '/Volumes/x/Ghost233HomeRepo', sessionId: 'session-1', status: 'bound',
+    createdAt: '2026-11-18T00:00:00.000Z',
+  }])
+})
+
+test('modelCatalog passes the catalog through untouched', async () => {
+  const catalog = { default: null, groups: [{ id: 'p1', name: 'P1', models: [{ id: 'm1' }] }] }
+  const { service } = makeService({ modelCatalog: async () => catalog })
+  assert.deepEqual(await service.modelCatalog(), catalog)
 })
