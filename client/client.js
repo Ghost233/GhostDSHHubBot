@@ -1,6 +1,13 @@
 // hub-bot 的 client 半侧：在插件管理器里给「dsh-hub-bot → hub-bot 行」的配置按钮提供表单页。
 // 数据通路：ctx.remote.hubBotSettings.read()/update(patch)（host 侧 Remote 服务，与 HTTP 面板同核心）。
-// 手写 __ModuleLoader__ 格式（与官方 client 包的构建产物同构）；只用 react，保持零构建。
+// 手写 __ModuleLoader__ 格式（与官方 client 包的构建产物同构）；只用 react + zod（共享模块），保持零构建。
+//
+// Remote 接入（v0.1.6 修正）：
+// - exports.inject 是 cordis 服务 key（['slots','locale','remote']），不是包名——包级加载拓扑在 package.json 的 dsh.client.inject 声明。
+//   （v0.1.4 把包名写进 exports.inject，fiber 永远等不到同名服务，插件永久 pending 的教训。）
+// - 自有 Remote namespace 必须客户端 $mount：dsh-api-remotes 只预挂载官方静态清单，
+//   插件自己的命名空间要靠 ctx.remote.$mount(contribution)（dsh-cua 的模式）。
+//   contribution 是 RemoteInfo（下方内联类与官方 codegen 产物同构，来自 dsh-cua client.js）。
 window.__ModuleLoader__.load({
   id: 'dsh-hub-bot',
   factory: function (require) {
@@ -8,7 +15,43 @@ window.__ModuleLoader__.load({
     var exports = module.exports;
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' });
     var React = require('react');
+    var zodLib = require('zod');
     var h = React.createElement;
+
+    // === typert RemoteInfo（内联自 @deepseek-ai/dsh-cua 的 codegen 产物，自包含） ===
+function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var RemoteInfo=class{spec;zod;index;constructor(spec,zod){this.spec=spec;this.zod=zod}get package(){return this.spec.package}get descriptors(){return this.resolve().descriptors}get methods(){return this.resolve().methods}resolve(){if(this.index!==void 0)return this.index;const zod=this.zod;const descriptors=[];const methods=Object.create(null);for(const[endpoint,definition]of Object.entries(this.spec.methods)){const separator=endpoint.indexOf(`/`);const namespace=endpoint.slice(0,separator);const method=endpoint.slice(separator+1);const parameters=definition.parameters.map(parameter=>({...parameter,wire:parameter.wire??parameter.name}));const descriptor={...definition,id:`${this.spec.package}#${endpoint}`,namespace,method,parameters,result:definition.result.description===void 0?definition.result:new ResultValue(definition.result)};if(definition.invocation.kind===`direct`){const inputs=[];methods[endpoint]=Object.assign(descriptor,{input(options){const strict=options?.strict===true;return inputs[strict?1:0]??=new NamedInput(parameters,strict,zod)},invoke(remote,input,signal){const named=input;const values=parameters.map(parameter=>named[parameter.wire]);if(definition.cancellation!==void 0)values.push(signal);const receiver=Reflect.get(remote,namespace);return Reflect.get(receiver,method).apply(receiver,values)}})}descriptors.push(descriptor)}return this.index={descriptors,methods}}};function optional(parameter){return parameter.source===`json`&&parameter.acceptsUndefined===true}var NamedInput=class{parameters;strict;zod;schema;projection;constructor(parameters,strict,zod){this.parameters=parameters;this.strict=strict;this.zod=zod}codec(parameter){return this.strict?parameter.strictCodec:parameter.codec}create=()=>this.schema??=this.zod.strictObject(Object.fromEntries(this.parameters.map(parameter=>{const value=this.codec(parameter).create();return[parameter.wire,optional(parameter)?value.optional():value.nonoptional()]})));get jsonSchema(){return this.project().jsonSchema}get jsonSchemaError(){return this.project().jsonSchemaError}project(){if(this.projection!==void 0)return this.projection;const unavailable=this.parameters.find(parameter=>this.codec(parameter).jsonSchema===void 0);if(unavailable!==void 0)return this.projection={jsonSchemaError:this.codec(unavailable).jsonSchemaError??`No JSON Schema for parameter ${unavailable.wire}`};return this.projection={jsonSchema:{type:`object`,properties:Object.fromEntries(this.parameters.map(parameter=>[parameter.wire,{...this.codec(parameter).jsonSchema,...parameter.description===void 0?{}:{description:parameter.description}}])),required:this.parameters.filter(parameter=>!optional(parameter)).map(parameter=>parameter.wire),additionalProperties:false}}}};var ResultValue=class{spec;projection;constructor(spec){this.spec=spec}get mode(){return this.spec.mode}get typeSymbol(){return this.spec.typeSymbol}get create(){return this.spec.create}get decode(){return this.spec.decode}get encode(){return this.spec.encode}get description(){return this.spec.description}get jsonSchemaError(){return this.spec.jsonSchemaError}get jsonSchema(){if(this.projection===void 0){const schema=this.spec.jsonSchema;this.projection={value:schema===void 0?void 0:{...schema,description:this.spec.description}}}return this.projection.value}};
+
+    // === hub-bot 自有 Remote namespace 的 contribution ===
+    // codec 三道硬校验：$mount 的 requireStrictCodec 要 mode 'strict'；registry 的 validateCodec 要
+    // 非空 typeSymbol 与 create() 工厂；视图/补丁都是自由 JSON，用 z.any() 直通（v0.1.6 曾漏 typeSymbol）。
+    var anyCodec = function (typeSymbol) {
+      return { mode: 'strict', typeSymbol: typeSymbol, create: function () { return zodLib.z.any(); } };
+    };
+    var contribution = createTypertRemoteInfo({
+      package: 'dsh-hub-bot',
+      methods: {
+        'hubBotSettings/read': {
+          service: 'hubBotSettings',
+          description: 'Read the hub-bot settings view.',
+          invocation: { kind: 'direct' },
+          parameters: [],
+          result: anyCodec('dsh-hub-bot#json-result'),
+        },
+        'hubBotSettings/update': {
+          service: 'hubBotSettings',
+          description: 'Apply a settings patch and return the fresh view.',
+          invocation: { kind: 'direct' },
+          parameters: [{
+            name: 'patch',
+            source: 'json',
+            description: 'Settings patch (same shape as the panel HTTP API).',
+            codec: anyCodec('dsh-hub-bot#json-patch'),
+            strictCodec: anyCodec('dsh-hub-bot#json-patch'),
+          }],
+          result: anyCodec('dsh-hub-bot#json-result'),
+        },
+      },
+    }, zodLib.z);
 
     var zh = {
       title: 'Hub Bot 中枢',
@@ -142,22 +185,34 @@ window.__ModuleLoader__.load({
           error ? h('span', { style: { fontSize: '12px', color: 'var(--dsh-danger, #d66)' } }, t('failed') + ': ' + error) : null));
     }
 
-    var inject = ['@deepseek-ai/dsh-client-locale', '@deepseek-ai/dsh-client-ui-plugin-manager', '@deepseek-ai/dsh-api-remotes'];
+    // cordis 服务 key（不是包名）：fiber.inject 的键按服务名等待；包级依赖在 package.json 的 dsh.client.inject 声明。
+    // 本插件用到 ctx.slots / ctx.locale / ctx.remote（v0.1.4 误写成包名导致永久 pending 的教训）。
+    var inject = ['slots', 'locale', 'remote'];
     function apply(ctx) {
-      ctx.effect(function () {
-        return ctx.locale.register(NS, { zh: zh, en: en });
-      }, 'hub-bot: dictionaries');
-      ctx.effect(function () {
-        return ctx.slots.inject('plugins.row.config', function () {
-          return ctx.slots.register({
-            name: 'plugins.row.config',
-            key: 'dsh-hub-bot#hub-bot',
-            order: 0,
-            label: function () { return ctx.locale.bind(NS)('title'); },
-            locale: NS,
-          }, function (ownerProps) { return h(HubBotRowConfig, { hubBotCtx: ctx }); });
+      // 第一段：挂载自有 Remote namespace（dsh-cua 模式）。$mount 内部以 owner ctx 注册 effect，随插件卸载自动清理。
+      ctx.plugin(function (owner) {
+        return owner.remote.$mount(contribution).catch(function (error) {
+          console.error('[hub-bot] remote mount failed', error);
+          throw error;
         });
-      }, 'hub-bot: row config');
+      });
+      // 第二段：namespace 就绪后（服务 key remote.hubBotSettings 出现）再注册字典与配置表单。
+      ctx.inject(['remote.hubBotSettings', 'slots', 'locale'], function (scoped) {
+        scoped.effect(function () {
+          return scoped.locale.register(NS, { zh: zh, en: en });
+        }, 'hub-bot: dictionaries');
+        scoped.effect(function () {
+          return scoped.slots.inject('plugins.row.config', function () {
+            return scoped.slots.register({
+              name: 'plugins.row.config',
+              key: 'dsh-hub-bot#hub-bot',
+              order: 0,
+              label: function () { return scoped.locale.bind(NS)('title'); },
+              locale: NS,
+            }, function (ownerProps) { return h(HubBotRowConfig, { hubBotCtx: scoped }); });
+          });
+        }, 'hub-bot: row config');
+      });
     }
     exports.name = 'hub-bot-client';
     exports.inject = inject;
