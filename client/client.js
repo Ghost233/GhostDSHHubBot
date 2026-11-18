@@ -55,6 +55,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
 
     var zh = {
       title: 'Hub Bot 中枢',
+      panel: 'Hub Bot',
       workspaceSection: '会话工作区归位',
       enabled: '负责人会话出生即落进工作区',
       chiefPath: 'L1 公共工作区目录（绝对路径；留空 = 默认 <homeRepo>/.hub-bot/chief）',
@@ -73,6 +74,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
     };
     var en = {
       title: 'Hub Bot',
+      panel: 'Hub Bot',
       workspaceSection: 'Workspace placement',
       enabled: 'Owner sessions are born inside their workspace',
       chiefPath: 'L1 shared workspace directory (absolute path; empty = default <homeRepo>/.hub-bot/chief)',
@@ -212,6 +214,48 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             }, function (ownerProps) { return h(HubBotRowConfig, { hubBotCtx: scoped }); });
           });
         }, 'hub-bot: row config');
+        // 顶级侧边栏面板：入口图标（sidebar.panellist）+ 页面（main）。
+        // 面板页直接复用设置表单——hub-bot 是日常中枢，不该埋进插件管理器三层。
+        function HubBotPanelIcon(props) {
+          var size = (props && props.size) || 20;
+          return h('svg', {
+            width: size, height: size, viewBox: '0 0 24 24', fill: 'none',
+            stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round',
+          },
+            h('circle', { cx: 12, cy: 12, r: 3.1 }),
+            h('circle', { cx: 12, cy: 3.7, r: 2 }),
+            h('circle', { cx: 4.7, cy: 18.1, r: 2 }),
+            h('circle', { cx: 19.3, cy: 18.1, r: 2 }),
+            h('line', { x1: 12, y1: 5.8, x2: 12, y2: 8.9 }),
+            h('line', { x1: 9.9, y1: 14.3, x2: 6.5, y2: 16.5 }),
+            h('line', { x1: 14.1, y1: 14.3, x2: 17.5, y2: 16.5 }));
+        }
+        function HubBotPanelPage() {
+          var t = scoped.locale.bind(NS);
+          return h('div', { style: { padding: '20px 24px', overflowY: 'auto', height: '100%', boxSizing: 'border-box' } },
+            h('h2', { style: { fontSize: '17px', fontWeight: 600, margin: '0 0 18px' } }, t('title')),
+            h(HubBotRowConfig, { hubBotCtx: scoped }));
+        }
+        scoped.effect(function () {
+          return scoped.slots.inject('sidebar.panellist', function () {
+            return scoped.slots.register({
+              name: 'sidebar.panellist',
+              id: 'hub-bot',
+              order: 100,
+              label: function () { return scoped.locale.bind(NS)('panel'); },
+              locale: NS,
+            }, HubBotPanelIcon);
+          });
+        }, 'hub-bot: sidebar panel');
+        scoped.effect(function () {
+          return scoped.slots.inject('main', function () {
+            return scoped.slots.register({
+              name: 'main',
+              key: 'hub-bot',
+              locale: NS,
+            }, HubBotPanelPage);
+          });
+        }, 'hub-bot: main panel');
       });
     }
     exports.name = 'hub-bot-client';
