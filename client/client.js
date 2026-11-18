@@ -225,6 +225,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       replyRecorded: '已注入会话',
       replyPending: '投递中',
       replyFailed: '回复投递失败',
+      artifactsLabel: '产物目录（负责人工作区）',
       feishuMetricsTitle: '连接质量：',
       feishuMetricsReconnects: '重连 {count} 次',
       feishuMetricsLastConnected: '最近连接',
@@ -352,6 +353,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       replyRecorded: 'injected',
       replyPending: 'delivering',
       replyFailed: 'reply delivery failed',
+      artifactsLabel: 'Artifacts (owner workspace)',
       feishuMetricsTitle: 'Connection:',
       feishuMetricsReconnects: '{count} reconnects',
       feishuMetricsLastConnected: 'last connected',
@@ -861,6 +863,20 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             // 等验收时报告就是要审的内容——直接摆出来，不藏进「详情」。
             if (tk.stage === 'person/review' && tk.report && (tk.report.summary || tk.report.text)) {
               rows.push(h('div', { key: 'rp', style: { marginTop: '6px', fontSize: '13px', color: TONES.blue.fg, whiteSpace: 'pre-wrap' } }, t('reportLabel') + (tk.report.summary || tk.report.text)));
+            }
+            // 结果在哪（三问之一）: 等验收票的产物目录——投影层早已产出 dirListing，这里补上渲染。
+            if (tk.stage === 'person/review' && Array.isArray(tk.dirListing) && tk.dirListing.length > 0) {
+              rows.push(h('div', { key: 'art', style: { marginTop: '8px' } },
+                h('div', { style: { fontSize: '11px', opacity: 0.55, marginBottom: '4px' } }, t('artifactsLabel')),
+                h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px', maxHeight: '88px', overflowY: 'auto' } },
+                  tk.dirListing.map(function (name, i) {
+                    var isDir = name.endsWith('/');
+                    return h('span', { key: i, style: {
+                      fontFamily: 'monospace', fontSize: '11px', padding: '1px 7px', borderRadius: '5px',
+                      background: 'rgba(127,127,127,0.08)', border: '1px solid rgba(127,127,127,0.16)',
+                      color: isDir ? TONES.blue.fg : 'inherit', opacity: isDir ? 1 : 0.8,
+                    } }, name);
+                  }))));
             }
             if (withActions && tk.stage === 'person/confirm') {
               rows.push(h('div', { key: 'act', style: { marginTop: '8px', display: 'flex', gap: '8px' } },
