@@ -292,6 +292,22 @@ export function buildOverview({ store, registry, health, now, listDir }) {
   // 让「刚才飞书那句话进来没有、派给谁了、现在什么状态」一眼可查，不用翻任务流。
   // 关联方向: ticket.triggerId → trigger（trigger 侧没有 ticketId——入站先记 trigger，票面后建）。
   const ticketByTriggerId = new Map(tickets.filter(t => t.trigger?.id).map(t => [t.trigger.id, t]))
+  // 回复投递状态（消息闭环）: 每条入站消息关联的票 → outbox 行。多行取「最差」状态——
+  // failed > held/queued > sent > recorded，让失败永远浮在最上面。
+  const REPLY_PRIORITY = { failed: 0, held: 1, queued: 1, sent: 2, recorded: 3 }
+  const outboxByTicket = new Map()
+  for (const row of readAll('outbox')) {
+    if (!row.ticketId) continue
+    const list = outboxByTicket.get(row.ticketId) ?? []
+    list.push(row)
+    outboxByTicket.set(row.ticketId, list)
+  }
+  const replyStateFor = ticketId => {
+    const rows = outboxByTicket.get(ticketId)
+    if (!rows || rows.length === 0) return null
+    const worst = [...rows].sort((a, b) => (REPLY_PRIORITY[a.state] ?? 9) - (REPLY_PRIORITY[b.state] ?? 9))[0]
+    return { state: worst.state ?? 'queued', id: worst.id, attempts: worst.attempts ?? 0, lastError: worst.lastError ?? null }
+  }
   const recentTriggers = [...triggers.values()]
     .sort((a, b) => String(b.at ?? '').localeCompare(String(a.at ?? '')))
     .slice(0, 12)
@@ -307,6 +323,7 @@ export function buildOverview({ store, registry, health, now, listDir }) {
         ownerLabel: tk?.ownerLabel ?? null,
         stage: tk?.stage ?? null,
         stageText: tk?.stageText ?? null,
+        reply: tk?.id ? replyStateFor(tk.id) : null,
       }
     })
   return {

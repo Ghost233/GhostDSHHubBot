@@ -68,7 +68,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           service: 'hubBotSettings',
           description: 'Retry failed (dead-letter) outbox deliveries: {id} for one row, {all:true} for all.',
           invocation: { kind: 'direct' },
-          parameters: [],
+          parameters: [{
+            name: 'request',
+            source: 'json',
+            description: '{ id } for one row or { all: true } for every dead letter.',
+            codec: anyCodec('dsh-hub-bot#json-request'),
+            strictCodec: anyCodec('dsh-hub-bot#json-request'),
+          }],
           result: anyCodec('dsh-hub-bot#json-result'),
         },
         'hubBotSettings/modelCatalog': {
@@ -215,6 +221,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       verdictCount: '{count} 待裁决',
       activeTicketsLabel: '{count} 活跃票据',
       ownerFilterHint: '点击只看这位负责人的票据',
+      replySent: '已回复',
+      replyRecorded: '已注入会话',
+      replyPending: '投递中',
+      replyFailed: '回复投递失败',
       emptyOwners: '还没有负责人——飞书或 GitHub 来消息后会自动创建',
       tlCreated: '创建',
       tlAssign: '分派会话',
@@ -334,6 +344,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       verdictCount: '{count} to review',
       activeTicketsLabel: '{count} active tickets',
       ownerFilterHint: 'Click to show only this owner’s tickets',
+      replySent: 'replied',
+      replyRecorded: 'injected',
+      replyPending: 'delivering',
+      replyFailed: 'reply delivery failed',
       emptyOwners: 'No owners yet — one is created automatically when a feishu or GitHub message arrives',
       tlCreated: 'Created',
       tlAssign: 'Assigned',
@@ -1005,6 +1019,24 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                       h('span', { style: { flexShrink: 0, fontSize: '11px', padding: '1px 7px', borderRadius: '999px', background: tr.kind === 'feishu' ? 'rgba(70,150,255,0.14)' : 'rgba(150,150,150,0.14)', color: tr.kind === 'feishu' ? '#7db8ff' : 'rgba(200,200,200,0.8)', border: '1px solid ' + (tr.kind === 'feishu' ? 'rgba(70,150,255,0.3)' : 'rgba(150,150,150,0.25)') } }, kindLabel(tr.kind)),
                       h('span', { style: { flexShrink: 0, fontSize: '12px', opacity: 0.55, minWidth: '64px' } }, tr.at ? relTime(t, tr.at) : '—'),
                       h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, tr.message || '—'),
+                      // 回复投递闭环指示： 已回复(绿) / 已注入(灰) / 投递中(琥珀) / 投递失败(红+行内重投)
+                      tr.reply && tr.reply.state === 'sent'
+                        ? h('span', { style: { flexShrink: 0, display: 'inline-flex', alignItems: 'center', fontSize: '11px', color: TONES.green.fg } }, dot('#46bb6d'), t('replySent'))
+                        : null,
+                      tr.reply && tr.reply.state === 'recorded'
+                        ? h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.5 } }, t('replyRecorded'))
+                        : null,
+                      tr.reply && (tr.reply.state === 'queued' || tr.reply.state === 'held')
+                        ? h('span', { style: { flexShrink: 0, fontSize: '11px', color: TONES.amber.fg } }, t('replyPending'))
+                        : null,
+                      tr.reply && tr.reply.state === 'failed'
+                        ? h('span', { style: { flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: '6px' } },
+                            h('span', { style: { fontSize: '11px', color: TONES.red.fg }, title: tr.reply.lastError || '' }, t('replyFailed')),
+                            h('button', {
+                              onClick: function (ev) { ev.stopPropagation(); retryOutbox(tr.reply.id); },
+                              style: { fontSize: '11px', padding: '1px 8px', borderRadius: '6px', cursor: 'pointer', background: 'rgba(230,160,40,0.13)', border: '1px solid ' + TONES.amber.border, color: TONES.amber.fg },
+                            }, t('retryOne')))
+                        : null,
                       tr.dropped
                         ? h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.55, fontStyle: 'italic' } }, t('droppedLabel') + ': ' + tr.dropped)
                         : (tr.stageText ? stagePill(tr.stage || '', tr.stageText) : null),
