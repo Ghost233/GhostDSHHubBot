@@ -240,6 +240,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       filterDroppedOnly: '仅看未受理',
       healthPillRetrying: '重试中',
       healthPillDead: '死信',
+      filterAllOwners: '全部负责人',
       feishuMetricsTitle: '连接质量：',
       feishuMetricsReconnects: '重连 {count} 次',
       feishuMetricsLastConnected: '最近连接',
@@ -382,6 +383,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       filterDroppedOnly: 'Dropped only',
       healthPillRetrying: 'retrying',
       healthPillDead: 'dead',
+      filterAllOwners: 'All owners',
       feishuMetricsTitle: 'Connection:',
       feishuMetricsReconnects: '{count} reconnects',
       feishuMetricsLastConnected: 'last connected',
@@ -740,6 +742,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var rs = React.useState(null); var resolving = rs[0]; var setResolving = rs[1];
           var fts = React.useState(''); var filterText = fts[0]; var setFilterText = fts[1];
           var fss = React.useState(''); var filterStage = fss[0]; var setFilterStage = fss[1];
+          var fos = React.useState(''); var filterOwner = fos[0]; var setFilterOwner = fos[1];
           var rks = React.useState(''); var recentKind = rks[0]; var setRecentKind = rks[1];
           var rds = React.useState(false); var recentDroppedOnly = rds[0]; var setRecentDroppedOnly = rds[1];
 
@@ -855,6 +858,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           // 「需要我处理」永远完整呈现——裁决入口不能被过滤器藏起来。
           var filtered = tickets.filter(function (tk) {
             if (filterStage && tk.stage !== filterStage) return false;
+            if (filterOwner && (tk.ownerLabel || tk.owner) !== filterOwner) return false;
             if (!filterText) return true;
             var q = filterText.toLowerCase();
             return (tk.message || '').toLowerCase().indexOf(q) >= 0
@@ -862,6 +866,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               || (tk.id || '').toLowerCase().indexOf(q) >= 0;
           });
           var presentStages = STAGE_ORDER.filter(function (st) { return tickets.some(function (tk) { return tk.stage === st; }); });
+          var presentOwners = [...new Set(tickets.map(function (tk) { return tk.ownerLabel || tk.owner; }).filter(Boolean))].sort();
           var healthItems = healthProblems(overview.health || {}, t);
           var recent = overview.recentTriggers || [];
           var recentFiltered = recent.filter(function (tr) {
@@ -877,7 +882,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             var el = document.getElementById('hub-bot-stream');
             if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
           };
-          var filterActive = !!filterText || !!filterStage;
+          var filterActive = !!filterText || !!filterStage || !!filterOwner;
           var scrollToSection = function (id) {
             var el = document.getElementById(id);
             if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1083,7 +1088,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 0' } }, t('emptyTickets'))
                 : h('div', { style: { display: 'flex', gap: '8px', marginBottom: '10px', flexWrap: 'wrap' } },
                     h('input', {
-                      style: Object.assign({}, inputStyle, { flex: '1 1 200px', padding: '4px 10px', fontSize: '12px' }),
+                      style: Object.assign({}, inputStyle, { flex: '1 1 200px', width: 'auto', padding: '4px 10px', fontSize: '12px' }),
                       value: filterText, placeholder: t('filterPlaceholder'),
                       onChange: function (ev) { setFilterText(ev.target.value); },
                     }),
@@ -1094,7 +1099,14 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                       presentStages.map(function (st) {
                         var sample = tickets.find(function (tk) { return tk.stage === st; });
                         return h('option', { key: st, value: st }, (sample && sample.stageText) || st);
-                      })))),
+                      }))),
+                    presentOwners.length > 1
+                      ? h('select', {
+                          style: Object.assign({}, inputStyle, { width: 'auto', padding: '4px 10px', fontSize: '12px' }),
+                          value: filterOwner, onChange: function (ev) { setFilterOwner(ev.target.value); },
+                        }, [h('option', { key: '', value: '' }, t('filterAllOwners'))].concat(
+                          presentOwners.map(function (label) { return h('option', { key: label, value: label }, label); })))
+                      : null),
               filtered.length === 0 && tickets.length > 0
                 ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 10px' } }, t('filterNoMatch'))
                 : STAGE_ORDER.map(function (stage) {
