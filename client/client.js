@@ -201,6 +201,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       healthDetailDead: '投递失败（死信）',
       retryOne: '重投',
       retryAll: '全部重投',
+      filterPlaceholder: '筛选消息 / 负责人 / 工单号…',
+      filterAllStages: '全部阶段',
+      filterNoMatch: '没有匹配的票据',
       healthDetailNext: '下次重试',
       healthDetailLast: '最近错误',
       detailAuth: '授权',
@@ -299,6 +302,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       healthDetailDead: 'failed deliveries (dead letters)',
       retryOne: 'Retry',
       retryAll: 'Retry all',
+      filterPlaceholder: 'Filter message / owner / ticket id…',
+      filterAllStages: 'All stages',
+      filterNoMatch: 'No tickets match',
       healthDetailNext: 'next retry',
       healthDetailLast: 'last error',
       detailAuth: 'Authorized',
@@ -627,6 +633,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var bs = React.useState(false); var modelBusy = bs[0]; var setModelBusy = bs[1];
           var ds = React.useState(false); var modelDone = ds[0]; var setModelDone = ds[1];
           var rs = React.useState(null); var resolving = rs[0]; var setResolving = rs[1];
+          var fts = React.useState(''); var filterText = fts[0]; var setFilterText = fts[1];
+          var fss = React.useState(''); var filterStage = fss[0]; var setFilterStage = fss[1];
 
           var load = function () {
             setError(null);
@@ -643,6 +651,18 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             }).catch(function (e) { setError(e && e.message ? e.message : String(e)); });
           };
           React.useEffect(load, []);
+          // 自动刷新（round 7）: 每 15s 拉一次 overview——新消息/票据状态变化不用手动刷新页面。
+          // 只刷 overview 不刷 view: RowConfig 的表单正在编辑时不能被远端值覆盖。
+          // 页面藏进后台（document.hidden）时暂停，失败静默——下一轮自然会再试。
+          React.useEffect(function () {
+            var timer = setInterval(function () {
+              if (typeof document !== 'undefined' && document.hidden) return;
+              scoped.remote.hubBotSettings.overview()
+                .then(function (raw) { setOverview(unwrap(raw)); })
+                .catch(function () {});
+            }, 15000);
+            return function () { clearInterval(timer); };
+          }, []);
           // 死信重投（健康警告条操作闭环）: 单条或全部，成功后整体刷新（overview 在 load 里）。
           var retryOutbox = function (idOrNull) {
             var req = idOrNull === null ? { all: true } : { id: idOrNull };
@@ -709,6 +729,17 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
 
           var tickets = overview.tickets || [];
           var needs = tickets.filter(function (tk) { return NEEDS_ME.indexOf(tk.stage) >= 0; });
+          // 任务流过滤器（round 7）: 文本（消息/负责人/工单号）+ 阶段。只作用于任务流区，
+          // 「需要我处理」永远完整呈现——裁决入口不能被过滤器藏起来。
+          var filtered = tickets.filter(function (tk) {
+            if (filterStage && tk.stage !== filterStage) return false;
+            if (!filterText) return true;
+            var q = filterText.toLowerCase();
+            return (tk.message || '').toLowerCase().indexOf(q) >= 0
+              || (tk.ownerLabel || tk.owner || '').toLowerCase().indexOf(q) >= 0
+              || (tk.id || '').toLowerCase().indexOf(q) >= 0;
+          });
+          var presentStages = STAGE_ORDER.filter(function (st) { return tickets.some(function (tk) { return tk.stage === st; }); });
           var healthItems = healthProblems(overview.health || {}, t);
           var recent = overview.recentTriggers || [];
           var kindLabel = function (k) { return k === 'feishu' ? t('kindFeishu') : k === 'github' ? t('kindGitHub') : t('kindRoute'); };
@@ -744,9 +775,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             rows.push(h('details', { key: 'd', style: { marginTop: '6px', fontSize: '12px', opacity: 0.8 } },
               h('summary', { style: { cursor: 'pointer' } }, t('detailToggle')),
               h('div', { style: { marginTop: '4px', display: 'flex', flexDirection: 'column', gap: '3px' } }, details)));
+            var stageTone = TONES[STAGE_TONE[tk.stage] || 'gray'];
             return h('div', { key: tk.id, style: {
               padding: '10px 12px', borderRadius: '8px', marginBottom: '8px',
               border: '1px solid var(--dsh-border, rgba(127,127,127,0.2))',
+              borderLeft: '3px solid ' + stageTone.border,
               background: 'var(--dsh-surface-raised, rgba(127,127,127,0.04))',
             } }, rows);
           };
@@ -797,17 +830,35 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                           h('button', { style: retryBtnStyle, onClick: function () { retryOutbox(r0.id); } }, t('retryOne'))),
                         r0.lastError ? h('div', { style: { opacity: 0.75, marginTop: '2px', wordBreak: 'break-all' } }, t('healthDetailLast') + ': ' + String(r0.lastError).slice(0, 140)) : null);
                     })) : null) : null,
-            h('div', { style: sectionStyle },
-              h('div', { style: sectionTitleStyle }, t('needsMe')),
+            h('div', { style: Object.assign({}, sectionStyle, needs.length > 0 ? { borderLeft: '3px solid ' + TONES.amber.border, paddingLeft: '14px' } : {}) },
+              h('div', { style: sectionTitleStyle }, t('needsMe'),
+                needs.length > 0 ? h('span', { style: { marginLeft: '8px', fontSize: '12px', fontWeight: 400, color: TONES.amber.fg } }, '· ' + needs.length) : null),
               needs.length === 0
                 ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 0' } }, t('quiet'))
                 : needs.map(function (tk) { return ticketRowItem(tk, true); })),
             h('div', { style: sectionStyle },
-              h('div', { style: sectionTitleStyle }, t('ticketsSection')),
+              h('div', { style: sectionTitleStyle }, t('ticketsSection'),
+                tickets.length > 0 ? h('span', { style: { marginLeft: '8px', fontSize: '12px', fontWeight: 400, opacity: 0.55 } }, '· ' + filtered.length + (filtered.length !== tickets.length ? ' / ' + tickets.length : '')) : null),
               tickets.length === 0
                 ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 0' } }, t('emptyTickets'))
+                : h('div', { style: { display: 'flex', gap: '8px', marginBottom: '10px', flexWrap: 'wrap' } },
+                    h('input', {
+                      style: Object.assign({}, inputStyle, { flex: '1 1 200px', padding: '4px 10px', fontSize: '12px' }),
+                      value: filterText, placeholder: t('filterPlaceholder'),
+                      onChange: function (ev) { setFilterText(ev.target.value); },
+                    }),
+                    h('select', {
+                      style: Object.assign({}, inputStyle, { width: 'auto', padding: '4px 10px', fontSize: '12px' }),
+                      value: filterStage, onChange: function (ev) { setFilterStage(ev.target.value); },
+                    }, [h('option', { key: '', value: '' }, t('filterAllStages'))].concat(
+                      presentStages.map(function (st) {
+                        var sample = tickets.find(function (tk) { return tk.stage === st; });
+                        return h('option', { key: st, value: st }, (sample && sample.stageText) || st);
+                      })))),
+              filtered.length === 0 && tickets.length > 0
+                ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 10px' } }, t('filterNoMatch'))
                 : STAGE_ORDER.map(function (stage) {
-                    var list = tickets.filter(function (tk) { return tk.stage === stage; });
+                    var list = filtered.filter(function (tk) { return tk.stage === stage; });
                     if (!list.length) return null;
                     var isPerson = NEEDS_ME.indexOf(stage) >= 0;
                     return h('details', { key: stage, open: isPerson, style: { marginBottom: '6px' } },
