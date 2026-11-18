@@ -238,6 +238,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       lastActivity: '最近活动',
       filterAllKinds: '全部',
       filterDroppedOnly: '仅看未受理',
+      healthPillRetrying: '重试中',
+      healthPillDead: '死信',
       feishuMetricsTitle: '连接质量：',
       feishuMetricsReconnects: '重连 {count} 次',
       feishuMetricsLastConnected: '最近连接',
@@ -378,6 +380,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       lastActivity: 'active',
       filterAllKinds: 'All',
       filterDroppedOnly: 'Dropped only',
+      healthPillRetrying: 'retrying',
+      healthPillDead: 'dead',
       feishuMetricsTitle: 'Connection:',
       feishuMetricsReconnects: '{count} reconnects',
       feishuMetricsLastConnected: 'last connected',
@@ -1044,21 +1048,25 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 ? h('details', { style: { marginTop: '4px' } },
                     h('summary', { style: { cursor: 'pointer', opacity: 0.85 } }, t('healthDetailRetry') + ' · ' + overview.health.outbox.retrying.length),
                     overview.health.outbox.retrying.map(function (r0) {
-                      return h('div', { key: r0.id, style: { marginTop: '6px', padding: '6px 8px', background: 'rgba(0,0,0,0.18)', borderRadius: '6px', fontSize: '12px' } },
-                        h('div', null, (r0.to || '') + ' — ' + (r0.ticketId || '—')),
+                      return h('div', { key: r0.id, style: { marginTop: '6px', padding: '6px 8px', background: 'rgba(0,0,0,0.18)', borderRadius: '6px', fontSize: '12px', borderLeft: '2px solid ' + TONES.amber.border } },
+                        h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+                          h('span', { style: { fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: TONES.amber.bg, color: TONES.amber.fg, border: '1px solid ' + TONES.amber.border, flexShrink: 0 } }, t('healthPillRetrying')),
+                          h('span', null, (r0.to || '') + ' — ' + (r0.ticketId || '—'))),
                         h('div', { style: { opacity: 0.75, marginTop: '2px' } }, t('healthDetailNext') + ': ' + (r0.nextRetryAt ? relTime(t, r0.nextRetryAt) : '—')),
                         r0.lastError ? h('div', { style: { opacity: 0.75, marginTop: '2px', wordBreak: 'break-all' } }, t('healthDetailLast') + ': ' + String(r0.lastError).slice(0, 140)) : null);
                     })) : null,
               // 死信详情（failed 行——重试耗尽后的最终失败，逐条可查）
               (overview.health && overview.health.outbox && (overview.health.outbox.failedList || []).length > 0)
                 ? h('details', { style: { marginTop: '4px' } },
-                    h('summary', { style: { cursor: 'pointer', opacity: 0.85 } }, t('healthDetailDead') + ' · ' + overview.health.outbox.failedList.length),
+                    h('summary', { style: { cursor: 'pointer', color: TONES.red.fg, opacity: 0.9 } }, t('healthDetailDead') + ' · ' + overview.health.outbox.failedList.length),
                     h('div', { style: { marginTop: '4px' } },
                       h('button', { style: retryBtnStyle, onClick: function (ev) { ev.preventDefault(); retryOutbox(null); } }, t('retryAll'))),
                     overview.health.outbox.failedList.map(function (r0) {
-                      return h('div', { key: r0.id, style: { marginTop: '6px', padding: '6px 8px', background: 'rgba(0,0,0,0.18)', borderRadius: '6px', fontSize: '12px' } },
+                      return h('div', { key: r0.id, style: { marginTop: '6px', padding: '6px 8px', background: 'rgba(0,0,0,0.18)', borderRadius: '6px', fontSize: '12px', borderLeft: '2px solid ' + TONES.red.border } },
                         h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px' } },
-                          h('span', null, (r0.to || '') + ' — ' + (r0.ticketId || '—') + ' · ' + r0.attempts + ' 次尝试'),
+                          h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: '8px', minWidth: 0 } },
+                            h('span', { style: { fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: TONES.red.bg, color: TONES.red.fg, border: '1px solid ' + TONES.red.border, flexShrink: 0 } }, t('healthPillDead')),
+                            h('span', null, (r0.to || '') + ' — ' + (r0.ticketId || '—') + ' · ' + r0.attempts + ' 次尝试')),
                           h('button', { style: retryBtnStyle, onClick: function () { retryOutbox(r0.id); } }, t('retryOne'))),
                         r0.lastError ? h('div', { style: { opacity: 0.75, marginTop: '2px', wordBreak: 'break-all' } }, t('healthDetailLast') + ': ' + String(r0.lastError).slice(0, 140)) : null);
                     })) : null) : null,
