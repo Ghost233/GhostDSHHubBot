@@ -204,6 +204,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       filterPlaceholder: '筛选消息 / 负责人 / 工单号…',
       filterAllStages: '全部阶段',
       filterNoMatch: '没有匹配的票据',
+      answerPlaceholder: '回复负责人的问题…（Enter 发送）',
+      answerBtn: '回复',
+      recentLocateHint: '点击在任务流中定位这张票',
       healthDetailNext: '下次重试',
       healthDetailLast: '最近错误',
       detailAuth: '授权',
@@ -305,6 +308,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       filterPlaceholder: 'Filter message / owner / ticket id…',
       filterAllStages: 'All stages',
       filterNoMatch: 'No tickets match',
+      answerPlaceholder: 'Reply to the owner… (Enter to send)',
+      answerBtn: 'Reply',
+      recentLocateHint: 'Click to locate this ticket in the stream',
       healthDetailNext: 'next retry',
       healthDetailLast: 'last error',
       detailAuth: 'Authorized',
@@ -694,12 +700,27 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               .finally(function () { setModelBusy(false); });
           };
 
+          var as2 = React.useState({}); var answers = as2[0]; var setAnswers = as2[1];
           var resolve = function (tk, resolution) {
             var label = resolution === 'confirm' ? t('confirmBtn') : t('rejectBtn');
             if (!window.confirm(label + ' — ' + (tk.pendingConfirm && tk.pendingConfirm.text ? tk.pendingConfirm.text : tk.id))) return;
             setResolving(tk.id + ':' + resolution); setError(null);
             scoped.remote.hubBotSettings.resolveTicket({ ticketId: tk.id, resolution: resolution })
               .then(function () { load(); })
+              .catch(function (e) { setError(t('resolveFailed') + ': ' + (e && e.message ? e.message : String(e))); })
+              .finally(function () { setResolving(null); });
+          };
+
+          // 回答问题（round 8）: person/answer 不再是只读——面板直接回复，票回 working。
+          var answerTicket = function (tk) {
+            var text = String(answers[tk.id] || '').trim();
+            if (!text) return;
+            setResolving(tk.id + ':answer'); setError(null);
+            scoped.remote.hubBotSettings.resolveTicket({ ticketId: tk.id, resolution: 'answer', message: text })
+              .then(function () {
+                var next = Object.assign({}, answers); delete next[tk.id]; setAnswers(next);
+                load();
+              })
               .catch(function (e) { setError(t('resolveFailed') + ': ' + (e && e.message ? e.message : String(e))); })
               .finally(function () { setResolving(null); });
           };
@@ -743,6 +764,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var healthItems = healthProblems(overview.health || {}, t);
           var recent = overview.recentTriggers || [];
           var kindLabel = function (k) { return k === 'feishu' ? t('kindFeishu') : k === 'github' ? t('kindGitHub') : t('kindRoute'); };
+          // 消息 → 票据定位（round 8）: 点一条最近消息 = 按工单号过滤任务流并滚过去。
+          var locateTicket = function (ticketId) {
+            setFilterText(ticketId); setFilterStage('');
+            var el = document.getElementById('hub-bot-stream');
+            if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          };
+          var filterActive = !!filterText || !!filterStage;
 
           var ticketRowItem = function (tk, withActions) {
             var rows = [];
@@ -764,6 +792,20 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                   onClick: function () { resolve(tk, 'reject'); }, disabled: resolving !== null,
                   style: Object.assign({}, inputStyle, { width: 'auto', padding: '4px 18px', cursor: 'pointer', background: 'rgba(220,80,80,0.12)', border: '1px solid ' + TONES.red.border, color: TONES.red.fg }),
                 }, resolving === tk.id + ':reject' ? '…' : t('rejectBtn'))));
+            }
+            if (withActions && tk.stage === 'person/answer') {
+              rows.push(h('div', { key: 'ans', style: { marginTop: '8px', display: 'flex', gap: '8px' } },
+                h('input', {
+                  style: Object.assign({}, inputStyle, { flex: 1, padding: '5px 12px', fontSize: '13px' }),
+                  value: answers[tk.id] || '', placeholder: t('answerPlaceholder'),
+                  onChange: function (ev) { setAnswers(Object.assign({}, answers, (function () { var m = {}; m[tk.id] = ev.target.value; return m; })())); },
+                  onKeyDown: function (ev) { if (ev.key === 'Enter') answerTicket(tk); },
+                }),
+                h('button', {
+                  onClick: function () { answerTicket(tk); },
+                  disabled: resolving !== null || !String(answers[tk.id] || '').trim(),
+                  style: Object.assign({}, inputStyle, { width: 'auto', padding: '4px 18px', cursor: 'pointer', background: 'rgba(80,140,255,0.15)', border: '1px solid ' + TONES.blue.border, color: TONES.blue.fg }),
+                }, resolving === tk.id + ':answer' ? '…' : t('answerBtn'))));
             }
             var details = [];
             if (tk.authorization) details.push(h('div', { key: 'a' }, t('detailAuth') + '：' + tk.authorization.actor + ' · ' + relTime(t, tk.authorization.at)));
@@ -836,7 +878,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               needs.length === 0
                 ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 0' } }, t('quiet'))
                 : needs.map(function (tk) { return ticketRowItem(tk, true); })),
-            h('div', { style: sectionStyle },
+            h('div', { style: sectionStyle, id: 'hub-bot-stream' },
               h('div', { style: sectionTitleStyle }, t('ticketsSection'),
                 tickets.length > 0 ? h('span', { style: { marginLeft: '8px', fontSize: '12px', fontWeight: 400, opacity: 0.55 } }, '· ' + filtered.length + (filtered.length !== tickets.length ? ' / ' + tickets.length : '')) : null),
               tickets.length === 0
@@ -861,7 +903,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     var list = filtered.filter(function (tk) { return tk.stage === stage; });
                     if (!list.length) return null;
                     var isPerson = NEEDS_ME.indexOf(stage) >= 0;
-                    return h('details', { key: stage, open: isPerson, style: { marginBottom: '6px' } },
+                    return h('details', { key: stage, open: isPerson || filterActive, style: { marginBottom: '6px' } },
                       h('summary', { style: { cursor: 'pointer', padding: '4px 0', display: 'flex', alignItems: 'center', gap: '8px' } },
                         stagePill(stage, (list[0].stageText || stage) + ' · ' + list.length)),
                       h('div', { style: { marginTop: '8px' } }, list.map(function (tk) { return ticketRowItem(tk, false); })));
@@ -871,10 +913,14 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               recent.length === 0
                 ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 0' } }, t('emptyRecent'))
                 : recent.map(function (tr) {
-                    return h('div', { key: tr.id, style: {
+                    return h('div', { key: tr.id,
+                      onClick: tr.ticketId ? function () { locateTicket(tr.ticketId); } : undefined,
+                      title: tr.ticketId ? t('recentLocateHint') : undefined,
+                      style: {
                       display: 'flex', alignItems: 'baseline', gap: '10px', padding: '7px 10px',
                       borderRadius: '8px', marginBottom: '4px', background: 'rgba(255,255,255,0.03)',
                       border: '1px solid rgba(255,255,255,0.06)', fontSize: '13px',
+                      cursor: tr.ticketId ? 'pointer' : 'default',
                     } },
                       h('span', { style: { flexShrink: 0, fontSize: '11px', padding: '1px 7px', borderRadius: '999px', background: tr.kind === 'feishu' ? 'rgba(70,150,255,0.14)' : 'rgba(150,150,150,0.14)', color: tr.kind === 'feishu' ? '#7db8ff' : 'rgba(200,200,200,0.8)', border: '1px solid ' + (tr.kind === 'feishu' ? 'rgba(70,150,255,0.3)' : 'rgba(150,150,150,0.25)') } }, kindLabel(tr.kind)),
                       h('span', { style: { flexShrink: 0, fontSize: '12px', opacity: 0.55, minWidth: '64px' } }, tr.at ? relTime(t, tr.at) : '—'),
@@ -917,7 +963,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     h('td', { style: tdStyle }, o.kind === 'temp' ? t('kindTemp') : t('kindRepo')),
                     h('td', { style: Object.assign({}, tdStyle, { opacity: 0.75 }), title: dir }, shortPath(dir)),
                     h('td', { style: Object.assign({}, tdStyle, { opacity: 0.75 }) }, o.dshWorkspace && o.dshWorkspace.title ? o.dshWorkspace.title : '—'),
-                    h('td', { style: tdStyle }, o.sessionId ? stagePill('done', t('sessionBound')) : stagePill('muted', t('sessionNone'))));
+                    h('td', { style: Object.assign({}, tdStyle, { fontSize: '12px' }), title: o.sessionId || undefined },
+                      o.sessionId
+                        ? h('span', { style: { display: 'inline-flex', alignItems: 'center' } },
+                            dot('#46bb6d'),
+                            h('span', { style: { opacity: 0.75, fontFamily: 'monospace' } }, String(o.sessionId).replace(/^session-/, '').slice(0, 8)))
+                        : h('span', { style: { display: 'inline-flex', alignItems: 'center', opacity: 0.5 } },
+                            dot('rgba(140,140,140,0.6)'), t('sessionNone'))));
                 })))),
             h(FeishuSection, { view: view, onRefresh: refreshView }),
             h(HubBotRowConfig, { hubBotCtx: scoped, hideModel: true }),

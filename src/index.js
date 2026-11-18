@@ -538,7 +538,14 @@ export function apply(ctx, rawConfig) {
   const resolveTicket = async body => {
     const ticketId = requireString(body, 'ticketId')
     const resolution = requireString(body, 'resolution')
-    if (resolution !== 'confirm' && resolution !== 'reject') throw new HttpError(400, 'resolution must be "confirm" or "reject"')
+    if (resolution !== 'confirm' && resolution !== 'reject' && resolution !== 'answer') throw new HttpError(400, 'resolution must be "confirm", "reject" or "answer"')
+    if (resolution === 'answer') {
+      const text = requireString(body, 'message')
+      const ticket0 = hub.router.getTicket(ticketId)
+      if (!ticket0) throw new HttpError(404, 'unknown ticket "' + ticketId + '"')
+      // 回答 = 不带 resolution 的追问: 状态机自己把 person/answer 恢复成 working 并注入回复。
+      return await hub.router.routeToOwner({ ownerId: ticket0.owner, ticketId, message: text })
+    }
     const ticket = hub.router.getTicket(ticketId)
     if (!ticket) throw new HttpError(404, 'unknown ticket "' + ticketId + '"')
     return await hub.router.routeToOwner({
