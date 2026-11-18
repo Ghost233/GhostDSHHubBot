@@ -212,6 +212,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       reworkBtn: '打回重做',
       reworkPlaceholder: '打回意见…（Enter 发送，票回进行中）',
       cardJumpHint: '点击跳到对应区域',
+      verdictCount: '{count} 待裁决',
+      activeTicketsLabel: '{count} 活跃票据',
+      ownerFilterHint: '点击只看这位负责人的票据',
+      emptyOwners: '还没有负责人——飞书或 GitHub 来消息后会自动创建',
       healthDetailNext: '下次重试',
       healthDetailLast: '最近错误',
       detailAuth: '授权',
@@ -321,6 +325,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       reworkBtn: 'Rework',
       reworkPlaceholder: 'Rework note… (Enter sends, ticket resumes)',
       cardJumpHint: 'Click to jump to the section',
+      verdictCount: '{count} to review',
+      activeTicketsLabel: '{count} active tickets',
+      ownerFilterHint: 'Click to show only this owner’s tickets',
+      emptyOwners: 'No owners yet — one is created automatically when a feishu or GitHub message arrives',
       healthDetailNext: 'next retry',
       healthDetailLast: 'last error',
       detailAuth: 'Authorized',
@@ -985,31 +993,44 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 : h('div', { style: warnStyle }, t('catalogUnavailable')),
               h('div', { style: warnStyle }, t('modelPickerHint'))),
             h('div', { style: sectionStyle, id: 'hub-bot-owners' },
-              h('div', { style: sectionTitleStyle }, t('ownersSection')),
-              h('table', { style: tableStyle },
-                h('thead', null, h('tr', null,
-                  h('th', { style: thStyle }, 'ID'),
-                  h('th', { style: thStyle }, t('colRole')),
-                  h('th', { style: thStyle }, t('colKind')),
-                  h('th', { style: thStyle }, t('colDir')),
-                  h('th', { style: thStyle }, t('colWorkspace')),
-                  h('th', { style: thStyle }, t('colSession')))),
-                h('tbody', null, owners.map(function (o) {
-                  var dir = o.cwd || o.workspace || '';
-                  return h('tr', { key: o.id },
-                    h('td', { style: tdStyle }, o.id),
-                    h('td', { style: tdStyle }, o.role === 'chief' ? t('roleChief') : t('roleOwner')),
-                    h('td', { style: tdStyle }, o.kind === 'temp' ? t('kindTemp') : t('kindRepo')),
-                    h('td', { style: Object.assign({}, tdStyle, { opacity: 0.75 }), title: dir }, shortPath(dir)),
-                    h('td', { style: Object.assign({}, tdStyle, { opacity: 0.75 }) }, o.dshWorkspace && o.dshWorkspace.title ? o.dshWorkspace.title : '—'),
-                    h('td', { style: Object.assign({}, tdStyle, { fontSize: '12px' }), title: o.sessionId || undefined },
-                      o.sessionId
-                        ? h('span', { style: { display: 'inline-flex', alignItems: 'center' } },
-                            dot('#46bb6d'),
-                            h('span', { style: { opacity: 0.75, fontFamily: 'monospace' } }, String(o.sessionId).replace(/^session-/, '').slice(0, 8)))
-                        : h('span', { style: { display: 'inline-flex', alignItems: 'center', opacity: 0.5 } },
-                            dot('rgba(140,140,140,0.6)'), t('sessionNone'))));
-                })))),
+              h('div', { style: sectionTitleStyle }, t('ownersSection'),
+                owners.length > 0 ? h('span', { style: { marginLeft: '8px', fontSize: '12px', fontWeight: 400, opacity: 0.55 } }, '· ' + owners.length) : null),
+              owners.length === 0
+                ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 0' } }, t('emptyOwners'))
+                : h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '12px' } },
+                    owners.map(function (o) {
+                      var dir = o.cwd || o.workspace || '';
+                      var mine = tickets.filter(function (tk) { return tk.owner === o.id; });
+                      var active = mine.filter(function (tk) { return tk.stage !== 'done'; }).length;
+                      var verdict = mine.filter(function (tk) { return NEEDS_ME.indexOf(tk.stage) >= 0; }).length;
+                      var roleTone = o.role === 'chief' ? TONES.amber : o.kind === 'temp' ? TONES.gray : TONES.blue;
+                      var label = o.dshWorkspace && o.dshWorkspace.title ? o.dshWorkspace.title : (o.workspace || o.id);
+                      return h('div', {
+                        key: o.id,
+                        onClick: function () { setFilterText(o.workspace || o.id); setFilterStage(''); scrollToSection('hub-bot-stream'); },
+                        title: t('ownerFilterHint'),
+                        style: {
+                          padding: '12px 14px', borderRadius: '10px', cursor: 'pointer',
+                          border: '1px solid var(--dsh-border, rgba(127,127,127,0.2))',
+                          borderLeft: '3px solid ' + roleTone.border,
+                          background: 'var(--dsh-surface-raised, rgba(127,127,127,0.04))',
+                        },
+                      },
+                        h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' } },
+                          h('span', { style: { fontSize: '11px', padding: '1px 8px', borderRadius: '999px', background: roleTone.bg, color: roleTone.fg, border: '1px solid ' + roleTone.border, flexShrink: 0 } },
+                            o.role === 'chief' ? t('roleChief') : o.kind === 'temp' ? t('kindTemp') : t('roleOwner')),
+                          h('span', { style: { fontWeight: 600, fontSize: '14px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, label),
+                          verdict > 0
+                            ? h('span', { style: { marginLeft: 'auto', fontSize: '11px', padding: '1px 8px', borderRadius: '999px', background: TONES.amber.bg, color: TONES.amber.fg, border: '1px solid ' + TONES.amber.border, flexShrink: 0 } },
+                                fill(t('verdictCount'), verdict))
+                            : null),
+                        h('div', { style: { fontSize: '12px', opacity: 0.6, marginBottom: '8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: dir }, shortPath(dir)),
+                        h('div', { style: { display: 'flex', alignItems: 'center', gap: '12px', fontSize: '12px' } },
+                          h('span', { style: { display: 'inline-flex', alignItems: 'center' }, title: o.sessionId || undefined },
+                            o.sessionId ? dot('#46bb6d') : dot('rgba(140,140,140,0.6)'),
+                            h('span', { style: { opacity: 0.7, fontFamily: 'monospace' } }, o.sessionId ? String(o.sessionId).replace(/^session-/, '').slice(0, 8) : t('sessionNone'))),
+                          h('span', { style: { opacity: 0.7 } }, fill(t('activeTicketsLabel'), active))));
+                    }))),
             h('div', { id: 'hub-bot-feishu' },
               h(FeishuSection, { view: view, onRefresh: refreshView })),
             h(HubBotRowConfig, { hubBotCtx: scoped, hideModel: true }),
