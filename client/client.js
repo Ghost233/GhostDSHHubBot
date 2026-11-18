@@ -226,6 +226,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       replyPending: '投递中',
       replyFailed: '回复投递失败',
       artifactsLabel: '产物目录（负责人工作区）',
+      confirmActionInject: '确认后：原样投递挂起的注入（会话无人值守执行）',
+      confirmActionFork: '确认后：fork 当前会话并在副本上续作（原会话保留）',
+      confirmFullText: '查看完整挂起内容',
       feishuMetricsTitle: '连接质量：',
       feishuMetricsReconnects: '重连 {count} 次',
       feishuMetricsLastConnected: '最近连接',
@@ -354,6 +357,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       replyPending: 'delivering',
       replyFailed: 'reply delivery failed',
       artifactsLabel: 'Artifacts (owner workspace)',
+      confirmActionInject: 'On confirm: deliver the held injection verbatim (unattended)',
+      confirmActionFork: 'On confirm: fork the session and continue on the copy (original kept)',
+      confirmFullText: 'View the full held content',
       feishuMetricsTitle: 'Connection:',
       feishuMetricsReconnects: '{count} reconnects',
       feishuMetricsLastConnected: 'last connected',
@@ -859,6 +865,19 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               tk.recoveryPending ? stagePill('queued', t('recovering')) : null,
               h('span', { style: { fontSize: '12px', opacity: 0.55, whiteSpace: 'nowrap' } }, relTime(t, tk.updatedAt))));
             if (tk.pendingConfirm) rows.push(h('div', { key: 'pc', style: { marginTop: '6px', fontSize: '13px', color: TONES.amber.fg } }, t('pendingConfirmLabel') + tk.pendingConfirm.text));
+            // 确认语义透明化： 危险注入挂起 → 确认=原样投递；fork 提案（无 action）→ 确认=fork 副本续作。
+            if (tk.pendingConfirm && tk.stage === 'person/confirm') {
+              var pcAction = tk.pendingConfirm.action;
+              var isDanger = pcAction && pcAction.type === 'dangerous-inject';
+              rows.push(h('div', { key: 'pca', style: { marginTop: '3px', fontSize: '12px', opacity: 0.7 } },
+                isDanger ? t('confirmActionInject') : t('confirmActionFork')));
+              // 文案只摘录 200 字——完整挂起内容折叠可查（确认对象的全文不该靠猜）。
+              if (isDanger && typeof pcAction.message === 'string' && pcAction.message.length > 0) {
+                rows.push(h('details', { key: 'pcf', style: { marginTop: '4px', fontSize: '12px' } },
+                  h('summary', { style: { cursor: 'pointer', opacity: 0.65 } }, t('confirmFullText')),
+                  h('pre', { style: { margin: '6px 0 0', padding: '8px 10px', borderRadius: '6px', background: 'rgba(127,127,127,0.08)', border: '1px solid rgba(127,127,127,0.16)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'monospace', fontSize: '11px', maxHeight: '160px', overflowY: 'auto' } }, pcAction.message)));
+              }
+            }
             if (tk.question && tk.stage === 'person/answer') rows.push(h('div', { key: 'q', style: { marginTop: '6px', fontSize: '13px', color: TONES.amber.fg } }, t('questionLabel') + tk.question.text));
             // 等验收时报告就是要审的内容——直接摆出来，不藏进「详情」。
             if (tk.stage === 'person/review' && tk.report && (tk.report.summary || tk.report.text)) {
