@@ -8,7 +8,7 @@ import { DEFAULT_DANGEROUS_PATTERNS } from '../src/security.js'
 const valid = () => ({ stateDir: '/tmp/hub-bot-state', homeRepo: '/Volumes/home' })
 
 test('accepts an absolute stateDir and homeRepo', () => {
-  assert.deepEqual(resolveConfig(valid()), { stateDir: '/tmp/hub-bot-state', homeRepo: '/Volumes/home', reporting: { auto: false, intervalMs: 60000 }, feishu: { enabled: false }, github: { enabled: false, intervalMs: 300000, loginAllowlist: [] }, concurrency: { slotsPerOwner: 3 }, security: { dangerousPatterns: [...DEFAULT_DANGEROUS_PATTERNS] }, chief: { model: null }, workspaces: { enabled: true, chiefPath: null, chiefTitle: 'Hub Bot 中枢' } })
+  assert.deepEqual(resolveConfig(valid()), { stateDir: '/tmp/hub-bot-state', homeRepo: '/Volumes/home', reporting: { auto: false, intervalMs: 60000 }, feishu: { enabled: false }, github: { enabled: false, intervalMs: 300000, loginAllowlist: [] }, concurrency: { slotsPerOwner: 3 }, security: { dangerousPatterns: [...DEFAULT_DANGEROUS_PATTERNS] }, chief: { model: null }, workspaces: { enabled: true, chiefPath: null, chiefTitle: 'Hub Bot 中枢', chiefWorkspaceId: null } })
 })
 
 test('reporting defaults to OFF (无自动汇报) and parses explicit overrides', () => {
@@ -87,12 +87,12 @@ test('cordis schema backfill tolerance: empty objects/arrays keep safe defaults'
   assert.equal(resolved.devApi, undefined)
   assert.equal(resolved.chief.model, null)
   assert.deepEqual(resolved.security.dangerousPatterns, [...DEFAULT_DANGEROUS_PATTERNS]) // 绝不被回填清空
-  assert.deepEqual(resolved.workspaces, { enabled: true, chiefPath: null, chiefTitle: 'Hub Bot 中枢' })
+  assert.deepEqual(resolved.workspaces, { enabled: true, chiefPath: null, chiefTitle: 'Hub Bot 中枢', chiefWorkspaceId: null })
 })
 
 test('workspaces section: custom chiefPath/chiefTitle, strict validation', () => {
   const r = resolveConfig({ ...valid(), workspaces: { chiefPath: '/pub/ws', chiefTitle: '我的中枢', enabled: false } })
-  assert.deepEqual(r.workspaces, { enabled: false, chiefPath: '/pub/ws', chiefTitle: '我的中枢' })
+  assert.deepEqual(r.workspaces, { enabled: false, chiefPath: '/pub/ws', chiefTitle: '我的中枢', chiefWorkspaceId: null })
   assert.throws(() => resolveConfig({ ...valid(), workspaces: { chiefPath: 'relative/path' } }), ConfigError)
   assert.throws(() => resolveConfig({ ...valid(), workspaces: { chiefTitle: '' } }), ConfigError)
   assert.throws(() => resolveConfig({ ...valid(), workspaces: { nope: 1 } }), ConfigError)

@@ -215,7 +215,7 @@ export function apply(ctx, rawConfig) {
   }
   // GUI 工作区 (#52): ctx.get 动态探测（不放 inject 声明——旧版 DSH 无该服务时插件仍须可加载）。
   // 会话只能「出生即归位」（create({ workspaceId })）——已创建会话无任何归位 API（cwd 严格校验）。
-  const placer = new WorkspacePlacer({ workspaceController: safeGetService(ctx, 'workspaceController'), homeRepo: config.homeRepo, workspaces: config.workspaces, logger: ctx.logger })
+  const placer = new WorkspacePlacer({ workspaceController: safeGetService(ctx, 'workspaceController'), homeRepo: config.homeRepo, workspaces: config.workspaces, logger: ctx.logger, registryList: () => safeGetService(ctx, 'workspaceRegistry')?.list?.() ?? [] })
   const hub = new Hub({ store, config, sessions, onSystemProblem: p => ctx.logger.warn('hub-bot system problem: %s (ticket %s, row %s)', p.reason, p.ticketId, p.rowId), placer })
   const chief = hub.registry.ensureChief({ cwd: config.homeRepo, workspace: basename(config.homeRepo) })
   setHub(hub)
@@ -352,6 +352,7 @@ export function apply(ctx, rawConfig) {
     overview: forwardDep('overview'),
     resolveTicket: forwardDep('resolveTicket'),
     startFeishuRegister: forwardDep('startFeishuRegister'),
+    listWorkspaces: forwardDep('listWorkspaces'),
   })
   // 填充真实实现——转发层延迟解引用；devApi 未配置时管理面方法本就不该可用（行为与现状一致）。
   Object.assign(serviceDeps, {
@@ -359,6 +360,8 @@ export function apply(ctx, rawConfig) {
     applySettings: applySettingsCore,
     listOwners: () => hub.registry.list(),
     modelCatalog: () => sessions.modelCatalog(),
+    // 关联式归位选择器（turn 108）: DSH 工作区枚举。registry 服务缺席（老 DSH）→ 空数组，选择器降级为「自动」。
+    listWorkspaces: () => (safeGetService(ctx, 'workspaceRegistry')?.list?.() ?? []).map(w => ({ workspaceId: String(w.id), title: w.title ?? null, path: w.path ?? null })),
     overview: async () => buildOverview({ store, registry: hub.registry, health: await buildHealth() }),
     resolveTicket: request => resolveTicket(request),
     startFeishuRegister: () => {
@@ -499,6 +502,10 @@ export function apply(ctx, rawConfig) {
       .filter(r => r.state === 'queued' && (r.attempts ?? 0) > 0)
       .map(r => ({ id: r.id, ticketId: r.ticketId ?? null, to: r.to, attempts: r.attempts, nextRetryAt: r.nextRetryAt ?? null, lastError: r.lastError ?? null }))
     const problems = rows.filter(r => r.kind === 'system-problem')
+    // 死信投影（GUI 健康警告条展开用）: failed 行逐条列出——警告计数可点击查看原因，不再是个死数字。
+    const failedList = rows
+      .filter(r => r.state === 'failed')
+      .map(r => ({ id: r.id, ticketId: r.ticketId ?? null, to: r.to, attempts: r.attempts ?? 0, lastError: r.lastError ?? null }))
     return {
       feishu: feishu.status(),
       github: await github.status(),
@@ -506,6 +513,7 @@ export function apply(ctx, rawConfig) {
         queued: count('queued'), held: count('held'), recorded: count('recorded'),
         failed: count('failed'), sent: count('sent'),
         retrying,
+        failedList,
         systemProblems: problems.length,
         recentProblems: problems.slice(-5).map(r => ({ id: r.id, ticketId: r.ticketId ?? null, body: String(r.body ?? '').slice(0, 200) })),
       },

@@ -57,6 +57,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           parameters: [],
           result: anyCodec('dsh-hub-bot#json-result'),
         },
+        'hubBotSettings/listWorkspaces': {
+          service: 'hubBotSettings',
+          description: 'List DSH workspaces for the L1 workspace pick-list (read-only projection).',
+          invocation: { kind: 'direct' },
+          parameters: [],
+          result: anyCodec('dsh-hub-bot#json-result'),
+        },
         'hubBotSettings/modelCatalog': {
           service: 'hubBotSettings',
           description: 'Model catalog for the chief-model picker.',
@@ -100,6 +107,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       workspaceSection: '会话工作区归位',
       enabled: '负责人会话出生即落进工作区',
       chiefPath: 'L1 公共工作区目录（绝对路径；留空 = 默认 <homeRepo>/.hub-bot/chief）',
+      chiefWorkspace: 'L1 公共工作区',
+      chiefWorkspaceAuto: '自动（hub-bot 自建「Hub Bot 中枢」）',
+      chiefWorkspaceHint: '在左侧「工作区」区新建一个工作区，然后在这里选中它；chief 会话会出生在那里。选中的工作区由你全权管理，hub-bot 不会改名、不会动它。',
+      chiefWorkspaceMissing: '⚠ 当前关联的工作区已不存在——保存后将回落到自动模式。',
       chiefPathWarn: '注意：指定到 homeRepo 树外时，chief 会话将失去仓库 AGENTS.md 指令上下文。',
       chiefTitle: 'L1 工作区标题（你手动改过的名字不会被覆盖）',
       modelSection: '总管模型',
@@ -169,6 +180,17 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       feishuScanHint: '用飞书手机 App 扫码完成授权；二维码有时效，过期请重新发起。',
       feishuPermsTitle: '权限申明（授权时将申请）',
       feishuBindFailed: '发起绑定失败',
+      feishuDisabled: '飞书未启用（配置里 feishu.enabled 未开）',
+      recentSection: '最近消息',
+      emptyRecent: '还没有消息进来',
+      kindFeishu: '飞书',
+      kindGithub: 'GitHub',
+      kindRoute: '直派',
+      droppedLabel: '未受理',
+      healthDetailRetry: '重试中',
+      healthDetailDead: '投递失败（死信）',
+      healthDetailNext: '下次重试',
+      healthDetailLast: '最近错误',
       detailAuth: '授权',
       detailReport: '报告',
     };
@@ -178,6 +200,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       workspaceSection: 'Workspace placement',
       enabled: 'Owner sessions are born inside their workspace',
       chiefPath: 'L1 shared workspace directory (absolute path; empty = default <homeRepo>/.hub-bot/chief)',
+      chiefWorkspace: 'L1 shared workspace',
+      chiefWorkspaceAuto: 'Automatic (hub-bot creates "Hub Bot 中枢")',
+      chiefWorkspaceHint: 'Create a workspace in the sidebar first, then pick it here — chief sessions are born there. The picked workspace stays fully yours: hub-bot never renames or manages it.',
+      chiefWorkspaceMissing: '⚠ The linked workspace no longer exists — saving falls back to automatic mode.',
       chiefPathWarn: 'Note: outside the homeRepo tree the chief session loses the repo AGENTS.md context.',
       chiefTitle: 'L1 workspace title (a name you set yourself is never overwritten)',
       modelSection: 'Chief model',
@@ -247,6 +273,17 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       feishuScanHint: 'Scan with the Feishu mobile app to authorize; the QR code expires — restart if it does.',
       feishuPermsTitle: 'Permissions (requested at authorization)',
       feishuBindFailed: 'Failed to start binding',
+      feishuDisabled: 'Feishu disabled (feishu.enabled is off in config)',
+      recentSection: 'Recent messages',
+      emptyRecent: 'No inbound messages yet',
+      kindFeishu: 'Feishu',
+      kindGitHub: 'GitHub',
+      kindRoute: 'Direct',
+      droppedLabel: 'dropped',
+      healthDetailRetry: 'retrying',
+      healthDetailDead: 'failed deliveries (dead letters)',
+      healthDetailNext: 'next retry',
+      healthDetailLast: 'last error',
       detailAuth: 'Authorized',
       detailReport: 'Report',
     };
@@ -254,7 +291,14 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
 
     // 防御性拆包：remote 结果可能带 {ok:true,value} envelope（官方 stub 在生成代码里拆，
     // 我们的手写 contribution 没有那层），裸对象则原样通过。
+    // typert 失败结果也 resolve（{ok:false,error} 信封）——unwrap 遇到错误信封直接抛，让调用方 catch 兜底；
+    // 数组结果再兜一层 Array.isArray（v0.4.1 教训: 错误信封漏进 setState 导致渲染崩溃）。
     function unwrap(x) {
+      if (x && typeof x === 'object' && x.ok === false && x.error) {
+        var err = new Error((x.error && (x.error.message || x.error.code)) || 'remote call failed');
+        err.remoteError = x.error;
+        throw err;
+      }
       return x && typeof x === 'object' && x.ok === true && 'value' in x ? x.value : x;
     }
 
@@ -281,8 +325,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       var busy = busyState[0]; var setBusy = busyState[1];
       var savedState = React.useState(false);
       var saved = savedState[0]; var setSaved = savedState[1];
-      var formState = React.useState({ enabled: true, chiefPath: '', chiefTitle: '' });
+      var formState = React.useState({ enabled: true, chiefWorkspaceId: '', chiefTitle: '' });
       var form = formState[0]; var setForm = formState[1];
+      var wsListState = React.useState(null);
+      var wsList = wsListState[0]; var setWsList = wsListState[1];
 
       var load = function () {
         setError(null);
@@ -291,10 +337,17 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           setView(v);
           setForm({
             enabled: v.workspaces ? v.workspaces.enabled !== false : true,
-            chiefPath: (v.workspaces && v.workspaces.chiefPath) || '',
+            chiefWorkspaceId: (v.workspaces && v.workspaces.chiefWorkspaceId) || '',
             chiefTitle: (v.workspaces && v.workspaces.chiefTitle) || 'Hub Bot 中枢',
           });
         }).catch(function (e) { setError(e && e.message ? e.message : String(e)); });
+        // 关联式归位（turn 108）: 工作区选择器数据——你在 DSH 里建好的工作区在这里挑。
+        if (ctx.remote.hubBotSettings.listWorkspaces) {
+          ctx.remote.hubBotSettings.listWorkspaces().then(function (raw) {
+            var list = unwrap(raw);
+            setWsList(Array.isArray(list) ? list : []);
+          }).catch(function () { setWsList([]); });
+        } else { setWsList([]); }
       };
       React.useEffect(load, []);
 
@@ -310,7 +363,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
         ctx.remote.hubBotSettings.update({
           workspaces: {
             enabled: form.enabled,
-            chiefPath: form.chiefPath.trim(),
+            chiefWorkspaceId: form.chiefWorkspaceId || null,
             chiefTitle: form.chiefTitle.trim() || 'Hub Bot 中枢',
           },
         }).then(function (v) { setView(unwrap(v)); setSaved(true); })
@@ -329,12 +382,21 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             }),
             h('span', null, t('enabled'))),
           h('div', { style: fieldStyle },
-            h('label', { style: labelStyle }, t('chiefPath')),
-            h('input', {
-              style: inputStyle, value: form.chiefPath, placeholder: '/Volumes/…',
-              onChange: function (ev) { setForm(Object.assign({}, form, { chiefPath: ev.target.value })); },
-            }),
-            h('div', { style: warnStyle }, t('chiefPathWarn'))),
+            h('label', { style: labelStyle }, t('chiefWorkspace')),
+            h('select', {
+              style: inputStyle, value: form.chiefWorkspaceId,
+              onChange: function (ev) { setForm(Object.assign({}, form, { chiefWorkspaceId: ev.target.value })); },
+            },
+              h('option', { value: '' }, t('chiefWorkspaceAuto')),
+              (wsList || []).map(function (w) {
+                return h('option', { key: w.workspaceId, value: w.workspaceId },
+                  (w.title || w.workspaceId) + (w.path ? ' — ' + w.path : ''));
+              })),
+            // 选中的工作区被删了 → 显示一个占位项，让当前值可见（保存时仍写回，后端会 warn 回落自动）
+            form.chiefWorkspaceId && (wsList || []).every(function (w) { return w.workspaceId !== form.chiefWorkspaceId; })
+              ? h('div', { style: warnStyle }, t('chiefWorkspaceMissing'))
+              : null,
+            h('div', { style: warnStyle }, t('chiefWorkspaceHint'))),
           h('div', { style: fieldStyle },
             h('label', { style: labelStyle }, t('chiefTitle')),
             h('input', {
@@ -612,6 +674,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var tickets = overview.tickets || [];
           var needs = tickets.filter(function (tk) { return NEEDS_ME.indexOf(tk.stage) >= 0; });
           var healthItems = healthProblems(overview.health || {}, t);
+          var recent = overview.recentTriggers || [];
+          var kindLabel = function (k) { return k === 'feishu' ? t('kindFeishu') : k === 'github' ? t('kindGitHub') : t('kindRoute'); };
 
           var ticketRowItem = function (tk, withActions) {
             var rows = [];
@@ -673,7 +737,26 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               padding: '10px 14px', borderRadius: '8px', marginBottom: '18px', fontSize: '13px',
               background: 'rgba(230,160,40,0.1)', border: '1px solid rgba(230,160,40,0.35)', color: TONES.amber.fg,
               display: 'flex', flexDirection: 'column', gap: '4px',
-            } }, healthItems.map(function (item, i) { return h('div', { key: i }, '⚠ ' + item); })) : null,
+            } }, healthItems.map(function (item, i) { return h('div', { key: i }, '⚠ ' + item); }),
+              // outbox 重试详情（重试中的投递逐条列出——哪张票、发给谁、第几次、下次什么时候、为什么失败）
+              (overview.health && overview.health.outbox && (overview.health.outbox.retrying || []).length > 0)
+                ? h('details', { style: { marginTop: '4px' } },
+                    h('summary', { style: { cursor: 'pointer', opacity: 0.85 } }, t('healthDetailRetry') + ' · ' + overview.health.outbox.retrying.length),
+                    overview.health.outbox.retrying.map(function (r0) {
+                      return h('div', { key: r0.id, style: { marginTop: '6px', padding: '6px 8px', background: 'rgba(0,0,0,0.18)', borderRadius: '6px', fontSize: '12px' } },
+                        h('div', null, (r0.to || '') + ' — ' + (r0.ticketId || '—')),
+                        h('div', { style: { opacity: 0.75, marginTop: '2px' } }, t('healthDetailNext') + ': ' + (r0.nextRetryAt ? relTime(t, r0.nextRetryAt) : '—')),
+                        r0.lastError ? h('div', { style: { opacity: 0.75, marginTop: '2px', wordBreak: 'break-all' } }, t('healthDetailLast') + ': ' + String(r0.lastError).slice(0, 140)) : null);
+                    })) : null,
+              // 死信详情（failed 行——重试耗尽后的最终失败，逐条可查）
+              (overview.health && overview.health.outbox && (overview.health.outbox.failedList || []).length > 0)
+                ? h('details', { style: { marginTop: '4px' } },
+                    h('summary', { style: { cursor: 'pointer', opacity: 0.85 } }, t('healthDetailDead') + ' · ' + overview.health.outbox.failedList.length),
+                    overview.health.outbox.failedList.map(function (r0) {
+                      return h('div', { key: r0.id, style: { marginTop: '6px', padding: '6px 8px', background: 'rgba(0,0,0,0.18)', borderRadius: '6px', fontSize: '12px' } },
+                        h('div', null, (r0.to || '') + ' — ' + (r0.ticketId || '—') + ' · ' + r0.attempts + ' 次尝试'),
+                        r0.lastError ? h('div', { style: { opacity: 0.75, marginTop: '2px', wordBreak: 'break-all' } }, t('healthDetailLast') + ': ' + String(r0.lastError).slice(0, 140)) : null);
+                    })) : null) : null,
             h('div', { style: sectionStyle },
               h('div', { style: sectionTitleStyle }, t('needsMe')),
               needs.length === 0
@@ -691,6 +774,24 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                       h('summary', { style: { cursor: 'pointer', padding: '4px 0', display: 'flex', alignItems: 'center', gap: '8px' } },
                         stagePill(stage, (list[0].stageText || stage) + ' · ' + list.length)),
                       h('div', { style: { marginTop: '8px' } }, list.map(function (tk) { return ticketRowItem(tk, false); })));
+                  })),
+            h('div', { style: sectionStyle },
+              h('div', { style: sectionTitleStyle }, t('recentSection')),
+              recent.length === 0
+                ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 0' } }, t('emptyRecent'))
+                : recent.map(function (tr) {
+                    return h('div', { key: tr.id, style: {
+                      display: 'flex', alignItems: 'baseline', gap: '10px', padding: '7px 10px',
+                      borderRadius: '8px', marginBottom: '4px', background: 'rgba(255,255,255,0.03)',
+                      border: '1px solid rgba(255,255,255,0.06)', fontSize: '13px',
+                    } },
+                      h('span', { style: { flexShrink: 0, fontSize: '11px', padding: '1px 7px', borderRadius: '999px', background: tr.kind === 'feishu' ? 'rgba(70,150,255,0.14)' : 'rgba(150,150,150,0.14)', color: tr.kind === 'feishu' ? '#7db8ff' : 'rgba(200,200,200,0.8)', border: '1px solid ' + (tr.kind === 'feishu' ? 'rgba(70,150,255,0.3)' : 'rgba(150,150,150,0.25)') } }, kindLabel(tr.kind)),
+                      h('span', { style: { flexShrink: 0, fontSize: '12px', opacity: 0.55, minWidth: '64px' } }, tr.at ? relTime(t, tr.at) : '—'),
+                      h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, tr.message || '—'),
+                      tr.dropped
+                        ? h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.55, fontStyle: 'italic' } }, t('droppedLabel') + ': ' + tr.dropped)
+                        : (tr.stageText ? stagePill(tr.stage || '', tr.stageText) : null),
+                      tr.ownerLabel ? h('span', { style: { flexShrink: 0, fontSize: '12px', opacity: 0.6 } }, tr.ownerLabel) : null);
                   })),
             h('div', { style: sectionStyle },
               h('div', { style: sectionTitleStyle }, t('modelSection')),

@@ -31,8 +31,10 @@ export class WorkspacePlacer {
    * @param {{ warn: (...args: any[]) => void }} deps.logger
    * @param {(path: string) => void} [deps.mkdir] - 测试替身；默认 mkdirSync recursive。
    */
-  constructor({ workspaceController, homeRepo, workspaces, logger, mkdir }) {
+  constructor({ workspaceController, homeRepo, workspaces, logger, mkdir, registryList }) {
     this.ws = workspaceController ?? null
+    /** 工作区枚举（关联式归位用）: () => [{id, path, title}...]；缺省时关联模式不可用。 */
+    this.registryList = registryList ?? (() => [])
     this.homeRepo = homeRepo
     // workspaces.enabled=false 时整体关闭归位（全部返回 null → 回退 cwd 创建）。
     this.cfg = workspaces ?? { enabled: true, chiefPath: null, chiefTitle: 'Hub Bot 中枢' }
@@ -45,6 +47,13 @@ export class WorkspacePlacer {
   /** chief 专属工作区：返回 { workspaceId, path }；不可用/失败 → null（调用方回退 cwd 创建）。 */
   async chiefWorkspace() {
     if (!this.available) return null
+    // 关联式归位: 用户选定的工作区直接采用——不 mkdir、不 rename、不创建（那是用户自己的地盘）。
+    // 工作区被删了 → warn 并回落到自动模式（绝不让消息注入失败）。
+    if (this.cfg.chiefWorkspaceId) {
+      const found = this.registryList().find(w => String(w.id) === this.cfg.chiefWorkspaceId)
+      if (found) return { workspaceId: String(found.id), path: found.path ?? null, title: found.title ?? null }
+      this.logger.warn('hub-bot workspace: configured chiefWorkspaceId %s no longer exists — falling back to auto', this.cfg.chiefWorkspaceId)
+    }
     const path = this.cfg.chiefPath ?? join(this.homeRepo, CHIEF_WORKSPACE_DIR)
     try { this.mkdir(path) } catch (error) {
       this.logger.warn('hub-bot workspace: chief workspace dir mkdir failed: %s', error instanceof Error ? error.message : error)

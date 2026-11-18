@@ -38,7 +38,7 @@ const DEFAULT_SLOTS_PER_OWNER = 3
 const KNOWN_SECURITY_KEYS = new Set(['dangerousPatterns'])
 
 /** The keys the workspaces section (#52 GUI 工作区归位) understands. */
-const KNOWN_WORKSPACES_KEYS = new Set(['enabled', 'chiefPath', 'chiefTitle'])
+const KNOWN_WORKSPACES_KEYS = new Set(['enabled', 'chiefPath', 'chiefTitle', 'chiefWorkspaceId'])
 const DEFAULT_CHIEF_WORKSPACE_TITLE = 'Hub Bot 中枢'
 
 /** The keys the chief section understands — the L1 总管's declared working model (面板「总管模型」). */
@@ -246,7 +246,7 @@ export function resolveConfig(config) {
   // 工作区归位 (#52): chief 专属工作区的落点。chiefPath 为空 → 默认 homeRepo/.hub-bot/chief；
   // 用户可指定任意绝对路径作「公共工作区」。警告：路径在 homeRepo 树外时 AGENTS.md 向上查找失效，
   // chief 会话将失去仓库指令上下文（设置界面需注明）。
-  const workspaces = { enabled: true, chiefPath: null, chiefTitle: DEFAULT_CHIEF_WORKSPACE_TITLE }
+  const workspaces = { enabled: true, chiefPath: null, chiefTitle: DEFAULT_CHIEF_WORKSPACE_TITLE, chiefWorkspaceId: null }
   if (raw.workspaces !== undefined) {
     const rawWs = raw.workspaces
     if (typeof rawWs !== 'object' || rawWs === null || Array.isArray(rawWs)) {
@@ -263,6 +263,12 @@ export function resolveConfig(config) {
       if (typeof rawWs.chiefPath !== 'string') throw new ConfigError('hub-bot config.workspaces.chiefPath must be a string')
       if (!isAbsolute(rawWs.chiefPath)) throw new ConfigError('hub-bot config.workspaces.chiefPath must be absolute, got "' + rawWs.chiefPath + '"')
       workspaces.chiefPath = rawWs.chiefPath
+    }
+    // 关联式归位（turn 108）: 用户在 DSH 里自己建好公共工作区，hub-bot 按 id 关联——不再手填路径。
+    // chiefWorkspaceId 优先于 chiefPath；两者皆空 → 自动创建 homeRepo/.hub-bot/chief。
+    if (rawWs.chiefWorkspaceId !== undefined && rawWs.chiefWorkspaceId !== null && rawWs.chiefWorkspaceId !== '') {
+      if (typeof rawWs.chiefWorkspaceId !== 'string') throw new ConfigError('hub-bot config.workspaces.chiefWorkspaceId must be a string')
+      workspaces.chiefWorkspaceId = rawWs.chiefWorkspaceId.trim()
     }
     if (rawWs.chiefTitle !== undefined) {
       if (typeof rawWs.chiefTitle !== 'string' || !rawWs.chiefTitle.trim()) throw new ConfigError('hub-bot config.workspaces.chiefTitle must be a non-empty string')

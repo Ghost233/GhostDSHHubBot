@@ -18,6 +18,8 @@ const makeService = (overrides = {}) => {
     modelCatalog: async () => ({ groups: [] }),
     overview: async () => ({ tickets: [], owners: [], health: {} }),
     resolveTicket: async req => ({ resolved: req }),
+    listWorkspaces: async () => [],
+    startFeishuRegister: async () => ({ started: true }),
     ...overrides,
   }
   const ctx = new Context()
@@ -124,4 +126,36 @@ test('resolveTicket delegates and maps validation failures to ticket/invalid', a
     assert.equal(error.code, 'ticket/invalid')
     return true
   })
+})
+
+
+test('listWorkspaces is discoverable and projects rows to plain JSON', async () => {
+  const { service } = makeService({
+    listWorkspaces: async () => [
+      { workspaceId: 'ws-1', title: '中枢', path: '/Volumes/home/.hub-bot/chief' },
+      { workspaceId: 'ws-2', title: null, path: '/tmp/x' },
+    ],
+  })
+  const methods = remoteMethods(service).map(m => m.method)
+  assert.ok(methods.includes('listWorkspaces'), 'listWorkspaces discoverable')
+  const rows = await service.listWorkspaces()
+  assert.deepEqual(rows, [
+    { workspaceId: 'ws-1', title: '中枢', path: '/Volumes/home/.hub-bot/chief' },
+    { workspaceId: 'ws-2', title: null, path: '/tmp/x' },
+  ])
+})
+
+test('listWorkspaces returns empty array when deps give nothing', async () => {
+  const { service } = makeService({ listWorkspaces: async () => undefined })
+  assert.deepEqual(await service.listWorkspaces(), [])
+})
+
+test('startFeishuRegister is discoverable and delegates', async () => {
+  let called = 0
+  const { service } = makeService({ startFeishuRegister: async () => { called += 1; return { started: true } } })
+  const methods = remoteMethods(service).map(m => m.method)
+  assert.ok(methods.includes('startFeishuRegister'), 'startFeishuRegister discoverable')
+  const result = await service.startFeishuRegister()
+  assert.deepEqual(result, { started: true })
+  assert.equal(called, 1)
 })

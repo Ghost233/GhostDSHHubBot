@@ -73,6 +73,12 @@ export class HubBotSettingsService extends TypertRemoteService {
   /** Model catalog passthrough for the chief-model picker (read-only). Plain-JSON'd: the catalog carries
    *  DSH internal shapes (class instances etc.) that the typert wire encoder can choke on after a hot reload —
    *  surfacing as an opaque gateway/internal on the client while the same object serves fine over HTTP (#53). */
+  /** DSH 工作区枚举（关联式归位的选择器数据）: 只读投影，列不出时给空数组（选择器降级为「自动」）。 */
+  async listWorkspaces() {
+    const rows = await this.deps.listWorkspaces()
+    return (rows ?? []).map(w => ({ workspaceId: w.workspaceId ?? null, title: w.title ?? null, path: w.path ?? null }))
+  }
+
   async modelCatalog() {
     const value = await this.deps.modelCatalog()
     return value === undefined ? null : JSON.parse(JSON.stringify(value))
@@ -112,6 +118,7 @@ markRemote(HubBotSettingsService, 'read', {})
 markRemote(HubBotSettingsService, 'update', {})
 markRemote(HubBotSettingsService, 'listOwners', {})
 markRemote(HubBotSettingsService, 'modelCatalog', {})
+markRemote(HubBotSettingsService, 'listWorkspaces', {})
 markRemote(HubBotSettingsService, 'overview', {})
 markRemote(HubBotSettingsService, 'resolveTicket', {})
 markRemote(HubBotSettingsService, 'startFeishuRegister', {})

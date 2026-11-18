@@ -155,3 +155,49 @@ test('user-renamed workspace (title != basename) is never re-titled', async () =
   await p.chiefWorkspace()
   assert.deepEqual(ctrl.calls.map(c => c[0]), ['create']) // 无 rename
 })
+
+
+test('chiefWorkspace: configured chiefWorkspaceId links the user-created workspace as-is (turn 108)', async () => {
+  const ctrl = fakeController()
+  const mkdirs = []
+  const warns = []
+  const p = new WorkspacePlacer({
+    workspaceController: ctrl, homeRepo: '/repo',
+    workspaces: { enabled: true, chiefWorkspaceId: 'ws-user-1' },
+    logger: { warn: (...a) => warns.push(a.join(' ')) },
+    mkdir: m => mkdirs.push(m),
+    registryList: () => [{ id: 'ws-user-1', path: '/pub/中枢', title: '我的中枢' }],
+  })
+  const result = await p.chiefWorkspace()
+  assert.deepEqual(result, { workspaceId: 'ws-user-1', path: '/pub/中枢', title: '我的中枢' })
+  assert.equal(mkdirs.length, 0, '关联模式不 mkdir——那是用户自己的地盘')
+  assert.equal(ctrl.calls.length, 0, '关联模式不 create / rename')
+  assert.equal(warns.length, 0)
+})
+
+test('chiefWorkspace: configured chiefWorkspaceId missing → warn + fall back to auto', async () => {
+  const ctrl = fakeController()
+  const warns = []
+  const p = new WorkspacePlacer({
+    workspaceController: ctrl, homeRepo: '/repo',
+    workspaces: { enabled: true, chiefWorkspaceId: 'ws-gone' },
+    logger: { warn: (...a) => warns.push(a.join(' ')) },
+    mkdir: () => {},
+    registryList: () => [{ id: 'ws-other', path: '/x', title: 'x' }],
+  })
+  const result = await p.chiefWorkspace()
+  assert.equal(result.workspaceId, 'ws-1', '回落到自动模式（create 出来的 ws-1）')
+  assert.ok(warns.some(w => w.includes('ws-gone')), 'warn 记录失效的关联')
+})
+
+test('chiefWorkspace: configured chiefWorkspaceId without registryList → falls back to auto', async () => {
+  const ctrl = fakeController()
+  const p = new WorkspacePlacer({
+    workspaceController: ctrl, homeRepo: '/repo',
+    workspaces: { enabled: true, chiefWorkspaceId: 'ws-x' },
+    logger: silent,
+    mkdir: () => {},
+  })
+  const result = await p.chiefWorkspace()
+  assert.equal(result.workspaceId, 'ws-1', 'registryList 缺省（老 DSH）时关联不可用 → 自动模式')
+})

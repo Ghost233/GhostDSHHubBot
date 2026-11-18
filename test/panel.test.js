@@ -180,6 +180,16 @@ test('overview answers the three questions from ticket faces: state / doing / ou
     assert.ok(ticket1.trigger && ticket1.trigger.id === ticket1.trigger.id, '基于哪条消息: Trigger 引用在票面')
     assert.equal(ticket2.dirListing, null, '非等验收票不列目录')
     assert.ok(Array.isArray(ticket1.assignments) && ticket1.assignments.length >= 1, '任务历史: Assignment 段在票面')
+    // 最近消息流: trigger 倒序投影，带票面的 owner/阶段，倒序排列
+    assert.ok(Array.isArray(overview.recentTriggers), 'recentTriggers 在 overview 里')
+    assert.equal(overview.recentTriggers.length, 2, '两条 trigger 都在流里')
+    const confirmMsg = overview.recentTriggers.find(t => t.message === '重构存储层')
+    const reviewMsg = overview.recentTriggers.find(t => t.message === '实现登录功能')
+    assert.ok(confirmMsg && reviewMsg, '两条消息都在流里（fixture 的 now 固定，at 相同，不断言顺序）')
+    assert.equal(confirmMsg.ownerLabel, 'DSH-Workflow', '消息带 owner 标签')
+    assert.equal(confirmMsg.stage, 'person/confirm', '消息带票面阶段')
+    assert.equal(confirmMsg.kind, 'route', 'kind 投影（fixture 里 routeToOwner 直记的 kind）')
+    assert.ok(confirmMsg.ticketId && reviewMsg.ticketId, 'ticketId 投影在')
   } finally {
     cleanup()
   }

@@ -37,7 +37,7 @@ const SETTABLE = {
   feishu: [],
   security: ['dangerousPatterns'],
   chief: ['model'],
-  workspaces: ['enabled', 'chiefPath', 'chiefTitle'],
+  workspaces: ['enabled', 'chiefPath', 'chiefTitle', 'chiefWorkspaceId'],
 }
 
 function requireBoolean(value, path) {
@@ -142,6 +142,16 @@ function applyOne(config, section, key, value) {
     config.workspaces.chiefPath = value
     return value
   }
+  if (section === 'workspaces' && key === 'chiefWorkspaceId') {
+    // 关联式归位（turn 108）: 用户选中的 DSH 工作区 id；'' / null = 自动模式。
+    if (value === null || value === '') {
+      config.workspaces.chiefWorkspaceId = null
+      return null
+    }
+    if (typeof value !== 'string' || !value.trim()) throw new SettingsError('workspaces.chiefWorkspaceId must be a non-empty string or null')
+    config.workspaces.chiefWorkspaceId = value.trim()
+    return config.workspaces.chiefWorkspaceId
+  }
   if (section === 'workspaces' && key === 'chiefTitle') {
     if (typeof value !== 'string' || !value.trim()) throw new SettingsError('workspaces.chiefTitle must be a non-empty string')
     config.workspaces.chiefTitle = value.trim()
@@ -214,6 +224,7 @@ export function buildSettingsView(config, { feishuStatus, githubStatus } = {}) {
       enabled: config.workspaces?.enabled ?? true,
       chiefPath: config.workspaces?.chiefPath ?? null,
       chiefTitle: config.workspaces?.chiefTitle ?? 'Hub Bot 中枢',
+      chiefWorkspaceId: config.workspaces?.chiefWorkspaceId ?? null,
     },
     feishu: {
       enabled: config.feishu.enabled,
@@ -277,10 +288,32 @@ export function buildOverview({ store, registry, health, now, listDir }) {
     }
     return row
   })
+  // 最近消息流（GUI 面板「最近消息」区）: trigger 按时间倒序前 12 条，带上票面的 owner/阶段——
+  // 让「刚才飞书那句话进来没有、派给谁了、现在什么状态」一眼可查，不用翻任务流。
+  // 关联方向: ticket.triggerId → trigger（trigger 侧没有 ticketId——入站先记 trigger，票面后建）。
+  const ticketByTriggerId = new Map(tickets.filter(t => t.trigger?.id).map(t => [t.trigger.id, t]))
+  const recentTriggers = [...triggers.values()]
+    .sort((a, b) => String(b.at ?? '').localeCompare(String(a.at ?? '')))
+    .slice(0, 12)
+    .map(t => {
+      const tk = ticketByTriggerId.get(t.id)
+      return {
+        id: t.id,
+        kind: t.kind ?? null,
+        at: t.at ?? null,
+        message: typeof t.message === 'string' ? (t.message.length > 160 ? t.message.slice(0, 160) + '…' : t.message) : null,
+        dropped: t.dropped ?? null,
+        ticketId: tk?.id ?? null,
+        ownerLabel: tk?.ownerLabel ?? null,
+        stage: tk?.stage ?? null,
+        stageText: tk?.stageText ?? null,
+      }
+    })
   return {
     generatedAt: (now ?? (() => new Date().toISOString()))(),
     owners,
     tickets,
+    recentTriggers,
     health: health ?? {},
   }
 }
