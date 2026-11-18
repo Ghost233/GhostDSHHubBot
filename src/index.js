@@ -316,6 +316,9 @@ export function apply(ctx, rawConfig) {
     // GUI 面板的只读投影：owner 注册表与模型目录（模型选择器用）。
     listOwners: () => hub.registry.list(),
     modelCatalog: () => sessions.modelCatalog(),
+    // 任务板三问视图与确认裁决——与 HTTP 面板同一构建器、同一状态机路径（闭包延迟引用，定义点在后面）。
+    overview: async () => buildOverview({ store, registry: hub.registry, health: await buildHealth() }),
+    resolveTicket: request => resolveTicket(request),
   })
 
   if (!config.devApi) return

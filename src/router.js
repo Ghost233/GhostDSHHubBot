@@ -330,7 +330,9 @@ export class Router {
     if (typeof message !== 'string' || !message.trim()) throw new RouterError('message-required', 'route_to_owner: message must be a non-empty string')
     const owner = this.registry.get(ownerId)
     if (!owner) throw new RouterError('unknown-owner', 'route_to_owner: unknown owner "' + ownerId + '" — call list_owners first')
-    if (owner.role === 'chief') throw new RouterError('cannot-route-to-chief', 'route_to_owner: the chief is the router, not a route target')
+    // chief 不是路由目标——但仅约束「新建任务」；带 ticketId 的 resolution 裁决（面板 confirm/reject）
+    // 是票面状态机推进，不给 chief 会话发消息，chief 票（如黑名单挂起的注入）必须能由此裁决。
+    if (owner.role === 'chief' && ticketId === undefined) throw new RouterError('cannot-route-to-chief', 'route_to_owner: the chief is the router, not a route target')
     // #70: a recycled scratch owner's directory is gone (物理上无法恢复) — follow-ups to its finished task start
     // a NEW task instead (spec「已结束任务的跟进」例外); never route into a recycled row.
     if (owner.recycled) throw new RouterError('owner-recycled', 'route_to_owner: owner ' + ownerId + ' 已回收（临时目录已删）——请新建任务，不要复活旧负责人')

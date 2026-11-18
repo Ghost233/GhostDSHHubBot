@@ -31,7 +31,7 @@ function markRemote(cls, methodName, options) {
 export class HubBotSettingsService extends TypertRemoteService {
   /**
    * @param {import('cordis').Context} ctx
-   * @param {{ settingsView: () => Promise<object>, applySettings: (patch: object) => Promise<object>, listOwners: () => object[] | Promise<object[]>, modelCatalog: () => Promise<object> }} deps
+   * @param {{ settingsView: () => Promise<object>, applySettings: (patch: object) => Promise<object>, listOwners: () => object[] | Promise<object[]>, modelCatalog: () => Promise<object>, overview: () => Promise<object>, resolveTicket: (req: { ticketId: string, resolution: string, message?: string }) => Promise<object> }} deps
    */
   constructor(ctx, deps) {
     super(ctx, 'hubBotSettings')
@@ -74,9 +74,28 @@ export class HubBotSettingsService extends TypertRemoteService {
   async modelCatalog() {
     return await this.deps.modelCatalog()
   }
+
+  /** Ticket board overview (three-questions view) — same builder as the HTTP panel API. */
+  async overview() {
+    return await this.deps.overview()
+  }
+
+  /** One-click confirm/reject on a person/confirm ticket — same state-machine path as route_to_owner. */
+  async resolveTicket(request) {
+    try {
+      return await this.deps.resolveTicket(request ?? {})
+    } catch (error) {
+      if (error?.name === 'SettingsError' || error?.statusCode === 400 || error?.statusCode === 404 || error?.name === 'RouterError') {
+        throw new RemoteError('ticket/invalid', error.message ?? 'invalid ticket resolution')
+      }
+      throw error
+    }
+  }
 }
 
 markRemote(HubBotSettingsService, 'read', {})
 markRemote(HubBotSettingsService, 'update', {})
 markRemote(HubBotSettingsService, 'listOwners', {})
 markRemote(HubBotSettingsService, 'modelCatalog', {})
+markRemote(HubBotSettingsService, 'overview', {})
+markRemote(HubBotSettingsService, 'resolveTicket', {})

@@ -256,6 +256,27 @@ test("resolution 'accept' gates person/review → done; 'cancel' closes a person
   } finally { cleanup() }
 })
 
+test('chief ticket resolution passes the state machine (面板裁决不是路由，不能被 cannot-route-to-chief 拦)', async () => {
+  const { router, store, cleanup } = fixture()
+  try {
+    // chief 票的来源不是 routeToOwner（新建被拒），而是黑名单挂起的注入——直接票面构造该状态。
+    const ticket = {
+      id: 'tsk-chief-1', owner: 'chief', stage: 'person/confirm', requestId: 'req-1',
+      createdAt: '2026-11-15T00:00:00.000Z', updatedAt: '2026-11-15T00:00:00.000Z',
+      authorization: { actor: 'ghost', source: 'feishu', at: '2026-11-15T00:00:00.000Z' },
+      pendingConfirm: { text: '改动会推送到 main，确认执行？' },
+      assignments: [],
+    }
+    store.db.prepare('INSERT INTO ticket (id, value) VALUES (?, ?)').run(ticket.id, JSON.stringify(ticket))
+    const rejected = await router.routeToOwner({ ownerId: 'chief', message: '面板拒绝', ticketId: ticket.id, resolution: 'reject' })
+    assert.equal(rejected.rejected, true)
+    assert.equal(rejected.stage, 'blocked')
+    assert.equal(router.getTicket(ticket.id).stage, 'blocked')
+    // 新建路由仍然拒绝 chief
+    await assert.rejects(() => router.routeToOwner({ ownerId: 'chief', message: '新任务' }), (e) => e.code === 'cannot-route-to-chief')
+  } finally { cleanup() }
+})
+
 test('a ticket without an authorization record is failed, never executed on a guess (缺上下文升级不编造)', async () => {
   const { router, registry, store, cleanup } = fixture()
   try {

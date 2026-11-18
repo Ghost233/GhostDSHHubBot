@@ -16,6 +16,8 @@ const makeService = (overrides = {}) => {
     applySettings: async patch => { calls.push(patch); return { applied: patch } },
     listOwners: () => [],
     modelCatalog: async () => ({ groups: [] }),
+    overview: async () => ({ tickets: [], owners: [], health: {} }),
+    resolveTicket: async req => ({ resolved: req }),
     ...overrides,
   }
   const ctx = new Context()
@@ -30,6 +32,8 @@ test('exposes read and update as discoverable Remote methods', () => {
   assert.ok(names.includes('update'), 'update must be Remote-marked')
   assert.ok(names.includes('listOwners'), 'listOwners must be Remote-marked')
   assert.ok(names.includes('modelCatalog'), 'modelCatalog must be Remote-marked')
+  assert.ok(names.includes('overview'), 'overview must be Remote-marked')
+  assert.ok(names.includes('resolveTicket'), 'resolveTicket must be Remote-marked')
 })
 
 test('registers itself under the hubBotSettings service key', async () => {
@@ -101,4 +105,23 @@ test('modelCatalog passes the catalog through untouched', async () => {
   const catalog = { default: null, groups: [{ id: 'p1', name: 'P1', models: [{ id: 'm1' }] }] }
   const { service } = makeService({ modelCatalog: async () => catalog })
   assert.deepEqual(await service.modelCatalog(), catalog)
+})
+
+test('overview delegates to the injected builder', async () => {
+  const board = { tickets: [{ id: 'tsk-1', stage: 'working' }], owners: [], health: {} }
+  const { service } = makeService({ overview: async () => board })
+  assert.deepEqual(await service.overview(), board)
+})
+
+test('resolveTicket delegates and maps validation failures to ticket/invalid', async () => {
+  const ok = await makeService().service.resolveTicket({ ticketId: 'tsk-1', resolution: 'confirm' })
+  assert.deepEqual(ok, { resolved: { ticketId: 'tsk-1', resolution: 'confirm' } })
+  const bad = makeService({
+    resolveTicket: async () => { const e = new Error('resolution must be \"confirm\" or \"reject\"'); e.statusCode = 400; throw e },
+  })
+  await assert.rejects(() => bad.service.resolveTicket({ ticketId: 'tsk-1', resolution: 'x' }), error => {
+    assert.ok(error instanceof RemoteError)
+    assert.equal(error.code, 'ticket/invalid')
+    return true
+  })
 })
