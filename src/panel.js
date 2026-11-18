@@ -37,6 +37,7 @@ const SETTABLE = {
   feishu: [],
   security: ['dangerousPatterns'],
   chief: ['model'],
+  workspaces: ['enabled', 'chiefPath', 'chiefTitle'],
 }
 
 function requireBoolean(value, path) {
@@ -125,6 +126,27 @@ function applyOne(config, section, key, value) {
     config.security.dangerousPatterns = list
     return list
   }
+  if (section === 'workspaces' && key === 'enabled') {
+    config.workspaces.enabled = requireBoolean(value, 'workspaces.enabled')
+    return value
+  }
+  if (section === 'workspaces' && key === 'chiefPath') {
+    // 公共工作区 (#52 后续): '' / null = 回落默认 homeRepo/.hub-bot/chief; 否则必须绝对路径。
+    if (value === null || value === '') {
+      config.workspaces.chiefPath = null
+      return null
+    }
+    if (typeof value !== 'string' || !isAbsolute(value)) {
+      throw new SettingsError('workspaces.chiefPath must be an absolute path, or empty to use the default')
+    }
+    config.workspaces.chiefPath = value
+    return value
+  }
+  if (section === 'workspaces' && key === 'chiefTitle') {
+    if (typeof value !== 'string' || !value.trim()) throw new SettingsError('workspaces.chiefTitle must be a non-empty string')
+    config.workspaces.chiefTitle = value.trim()
+    return config.workspaces.chiefTitle
+  }
   if (section === 'chief' && key === 'model') {
     // 总管模型 (面板「总管模型」): null = 跟随部署默认; 否则固定 {provider, model, reasoningEffort?}。
     const model = validateChiefModel(value, 'chief', SettingsError)
@@ -188,6 +210,11 @@ export function buildSettingsView(config, { feishuStatus, githubStatus } = {}) {
     reporting: { auto: config.reporting.auto, intervalMs: config.reporting.intervalMs },
     security: { dangerousPatterns: [...(config.security?.dangerousPatterns ?? [])] },
     chief: { model: config.chief?.model ?? null },
+    workspaces: {
+      enabled: config.workspaces?.enabled ?? true,
+      chiefPath: config.workspaces?.chiefPath ?? null,
+      chiefTitle: config.workspaces?.chiefTitle ?? 'Hub Bot 中枢',
+    },
     feishu: {
       enabled: config.feishu.enabled,
       status: feishuStatus ?? null,

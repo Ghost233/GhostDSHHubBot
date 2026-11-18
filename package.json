@@ -14,11 +14,13 @@
     ".": "./src/index.js",
     "./router-tools": "./src/router-tools.js",
     "./owner-tools": "./src/owner-tools.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./client": "./client/client.js"
   },
   "files": [
     "src",
     "panel",
+    "client",
     "cordis.patch.yml",
     "README.md"
   ],
@@ -26,7 +28,15 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
-    "manifestVersion": 1
+    "manifestVersion": 1,
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
+        "@deepseek-ai/dsh-api-remotes"
+      ],
+      "platform": "web"
+    }
   },
   "scripts": {
     "test": "node --test \"test/*.test.js\""
@@ -37,6 +47,7 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.76.0",
-    "@deepseek-ai/schemastery": "^3.19.0"
+    "@deepseek-ai/schemastery": "^3.19.0",
+    "@deepseek-ai/dsh-typert-protocol": "^0.2.2-rc.4"
   }
 }

@@ -36,6 +36,7 @@ import { FeishuSource } from './feishu.js'
 import { GitHubSource } from './github.js'
 import { Recycler } from './recycle.js'
 import { WorkspacePlacer } from './workspaces.js'
+import { HubBotSettingsService } from './settings-service.js'
 
 export const name = 'hub-bot'
 export const inject = ['sessionController', 'sessionPersistence', 'webServer']
@@ -276,6 +277,41 @@ export function apply(ctx, rawConfig) {
     store.stateDir, store.schemaVersion, chief.owner.cwd, chief.created ? 'registered pending' : 'already registered',
     config.devApi ? '' : '; management API disabled (no config.devApi)')
 
+  /** Reads the effective settings view (config ⊕ overlay + live Source status). */
+  const settingsView = async () => buildSettingsView(config, { feishuStatus: feishu.status(), githubStatus: await github.status() })
+
+  /** The accumulated settings overlay (boot value), merged with every accepted patch and persisted. */
+  let settingsOverlay = loadSettingsOverlay(config.stateDir)
+
+  /**
+   * Settings write core, shared by the HTTP panel route and the GUI Remote service: validate → mutate the
+   * live config → persist the merged overlay → live side effects (GitHub polling cadence, chief model).
+   */
+  const applySettingsCore = async patch => {
+    applySettingsPatch(config, patch) // SettingsError 上抛，两个入口各自包装
+    settingsOverlay = mergeSettingsOverlay(settingsOverlay, patch)
+    saveSettingsOverlay(config.stateDir, settingsOverlay)
+    restartGithubPolling() // 轮询开关/间隔即时生效（幂等重启）
+    if (patch.chief?.model !== undefined) {
+      // 总管模型即时生效：对已绑定的 L1 会话直接 selectModel；失败只告警（会话可能在跑，下条消息还会对齐）。
+      const chiefRow = hub.registry.get('chief')
+      if (chiefRow?.sessionId && config.chief.model) {
+        try {
+          await sessions.selectModel({ sessionId: chiefRow.sessionId, ...config.chief.model })
+          ctx.logger.info('hub-bot chief model applied live: %s/%s', config.chief.model.provider, config.chief.model.model)
+        } catch (error) {
+          ctx.logger.warn('hub-bot chief model live-apply failed (will align on next injection): %s', error instanceof Error ? error.message : error)
+        }
+      }
+    }
+    ctx.logger.info('hub-bot settings updated: %s', Object.keys(patch).join(', '))
+    return await settingsView()
+  }
+
+  // GUI 设置面板的数据通路（client/ 半侧）：与 HTTP 面板共用同一条 settingsView/applySettingsCore。
+  // 独立于 devApi——管理 API 关掉时 GUI 设置页照常工作。
+  new HubBotSettingsService(ctx, { settingsView, applySettings: applySettingsCore })
+
   if (!config.devApi) return
   const token = config.devApi.token
   if (ctx.webServer.host !== '127.0.0.1' && ctx.webServer.host !== 'localhost' && ctx.webServer.host !== '::1') {
@@ -412,38 +448,15 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  /** The accumulated settings overlay (boot value), merged with every accepted panel patch and persisted. */
-  let settingsOverlay = loadSettingsOverlay(config.stateDir)
-
-  /** Reads the effective settings view (config ⊕ overlay + live Source status). */
-  const settingsView = async () => buildSettingsView(config, { feishuStatus: feishu.status(), githubStatus: await github.status() })
-
-  /** Applies one panel settings patch: validate → mutate live config → persist overlay → live side effects. */
+  /** HTTP 面板路由的薄包装：readBody → 共享核心；SettingsError → 400。 */
   const applySettings = async req => {
     const patch = await readBody(req)
     try {
-      applySettingsPatch(config, patch)
+      return await applySettingsCore(patch)
     } catch (error) {
       if (error?.name === 'SettingsError') throw new HttpError(400, error.message)
       throw error
     }
-    settingsOverlay = mergeSettingsOverlay(settingsOverlay, patch)
-    saveSettingsOverlay(config.stateDir, settingsOverlay)
-    restartGithubPolling() // 轮询开关/间隔即时生效（幂等重启）
-    if (patch.chief?.model !== undefined) {
-      // 总管模型即时生效：对已绑定的 L1 会话直接 selectModel；失败只告警（会话可能在跑，下条消息还会对齐）。
-      const chiefRow = hub.registry.get('chief')
-      if (chiefRow?.sessionId && config.chief.model) {
-        try {
-          await sessions.selectModel({ sessionId: chiefRow.sessionId, ...config.chief.model })
-          ctx.logger.info('hub-bot chief model applied live: %s/%s', config.chief.model.provider, config.chief.model.model)
-        } catch (error) {
-          ctx.logger.warn('hub-bot chief model live-apply failed (will align on next injection): %s', error instanceof Error ? error.message : error)
-        }
-      }
-    }
-    ctx.logger.info('hub-bot settings updated via panel: %s', Object.keys(patch).join(', '))
-    return await settingsView()
   }
 
   /** 确认裁决: person/confirm 票的一键 confirm/reject — 与 route_to_owner resolution 同一条状态机路径. */
