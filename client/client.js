@@ -166,6 +166,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       rejectBtn: '拒绝',
       pendingConfirmLabel: '待确认：',
       questionLabel: '等您回复：',
+      reportLabel: '交付报告：',
       recovering: '恢复中',
       emptyTickets: '还没有任务',
       relJustNow: '刚刚',
@@ -207,6 +208,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       answerPlaceholder: '回复负责人的问题…（Enter 发送）',
       answerBtn: '回复',
       recentLocateHint: '点击在任务流中定位这张票',
+      acceptBtn: '验收通过',
+      reworkBtn: '打回重做',
+      reworkPlaceholder: '打回意见…（Enter 发送，票回进行中）',
+      cardJumpHint: '点击跳到对应区域',
       healthDetailNext: '下次重试',
       healthDetailLast: '最近错误',
       detailAuth: '授权',
@@ -270,6 +275,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       rejectBtn: 'Reject',
       pendingConfirmLabel: 'Pending confirm: ',
       questionLabel: 'Waiting for your reply: ',
+      reportLabel: 'Report: ',
       recovering: 'Recovering',
       emptyTickets: 'No tickets yet',
       relJustNow: 'just now',
@@ -311,6 +317,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       answerPlaceholder: 'Reply to the owner… (Enter to send)',
       answerBtn: 'Reply',
       recentLocateHint: 'Click to locate this ticket in the stream',
+      acceptBtn: 'Accept',
+      reworkBtn: 'Rework',
+      reworkPlaceholder: 'Rework note… (Enter sends, ticket resumes)',
+      cardJumpHint: 'Click to jump to the section',
       healthDetailNext: 'next retry',
       healthDetailLast: 'last error',
       detailAuth: 'Authorized',
@@ -702,7 +712,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
 
           var as2 = React.useState({}); var answers = as2[0]; var setAnswers = as2[1];
           var resolve = function (tk, resolution) {
-            var label = resolution === 'confirm' ? t('confirmBtn') : t('rejectBtn');
+            var label = resolution === 'confirm' ? t('confirmBtn') : resolution === 'accept' ? t('acceptBtn') : t('rejectBtn');
             if (!window.confirm(label + ' — ' + (tk.pendingConfirm && tk.pendingConfirm.text ? tk.pendingConfirm.text : tk.id))) return;
             setResolving(tk.id + ':' + resolution); setError(null);
             scoped.remote.hubBotSettings.resolveTicket({ ticketId: tk.id, resolution: resolution })
@@ -771,6 +781,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
           };
           var filterActive = !!filterText || !!filterStage;
+          var scrollToSection = function (id) {
+            var el = document.getElementById(id);
+            if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          };
+          var clickableCard = function (targetId) {
+            return targetId ? { cursor: 'pointer' } : {};
+          };
 
           var ticketRowItem = function (tk, withActions) {
             var rows = [];
@@ -782,6 +799,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               h('span', { style: { fontSize: '12px', opacity: 0.55, whiteSpace: 'nowrap' } }, relTime(t, tk.updatedAt))));
             if (tk.pendingConfirm) rows.push(h('div', { key: 'pc', style: { marginTop: '6px', fontSize: '13px', color: TONES.amber.fg } }, t('pendingConfirmLabel') + tk.pendingConfirm.text));
             if (tk.question) rows.push(h('div', { key: 'q', style: { marginTop: '6px', fontSize: '13px', color: TONES.amber.fg } }, t('questionLabel') + tk.question.text));
+            // 等验收时报告就是要审的内容——直接摆出来，不藏进「详情」。
+            if (tk.stage === 'person/review' && tk.report && tk.report.text) {
+              rows.push(h('div', { key: 'rp', style: { marginTop: '6px', fontSize: '13px', color: TONES.blue.fg, whiteSpace: 'pre-wrap' } }, t('reportLabel') + tk.report.text));
+            }
             if (withActions && tk.stage === 'person/confirm') {
               rows.push(h('div', { key: 'act', style: { marginTop: '8px', display: 'flex', gap: '8px' } },
                 h('button', {
@@ -806,6 +827,24 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                   disabled: resolving !== null || !String(answers[tk.id] || '').trim(),
                   style: Object.assign({}, inputStyle, { width: 'auto', padding: '4px 18px', cursor: 'pointer', background: 'rgba(80,140,255,0.15)', border: '1px solid ' + TONES.blue.border, color: TONES.blue.fg }),
                 }, resolving === tk.id + ':answer' ? '…' : t('answerBtn'))));
+            }
+            if (withActions && tk.stage === 'person/review') {
+              rows.push(h('div', { key: 'rev', style: { marginTop: '8px', display: 'flex', gap: '8px', flexWrap: 'wrap' } },
+                h('button', {
+                  onClick: function () { resolve(tk, 'accept'); }, disabled: resolving !== null,
+                  style: Object.assign({}, inputStyle, { width: 'auto', padding: '4px 18px', cursor: 'pointer', background: 'rgba(60,180,100,0.15)', border: '1px solid ' + TONES.green.border, color: TONES.green.fg }),
+                }, resolving === tk.id + ':accept' ? '…' : t('acceptBtn')),
+                h('input', {
+                  style: Object.assign({}, inputStyle, { flex: '1 1 220px', padding: '5px 12px', fontSize: '13px' }),
+                  value: answers[tk.id] || '', placeholder: t('reworkPlaceholder'),
+                  onChange: function (ev) { setAnswers(Object.assign({}, answers, (function () { var m = {}; m[tk.id] = ev.target.value; return m; })())); },
+                  onKeyDown: function (ev) { if (ev.key === 'Enter') answerTicket(tk); },
+                }),
+                h('button', {
+                  onClick: function () { answerTicket(tk); },
+                  disabled: resolving !== null || !String(answers[tk.id] || '').trim(),
+                  style: Object.assign({}, inputStyle, { width: 'auto', padding: '4px 18px', cursor: 'pointer', background: 'rgba(230,160,40,0.13)', border: '1px solid ' + TONES.amber.border, color: TONES.amber.fg }),
+                }, resolving === tk.id + ':answer' ? '…' : t('reworkBtn'))));
             }
             var details = [];
             if (tk.authorization) details.push(h('div', { key: 'a' }, t('detailAuth') + '：' + tk.authorization.actor + ' · ' + relTime(t, tk.authorization.at)));
@@ -841,9 +880,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           return h('div', { style: { padding: '20px 24px', overflowY: 'auto', height: '100%', boxSizing: 'border-box' } },
             h('h2', { style: { fontSize: '17px', fontWeight: 600, margin: '0 0 18px' } }, t('title')),
             h('div', { style: cardRowStyle },
-              h('div', { style: cardStyle }, h('div', { style: cardTitleStyle }, t('feishuCard')), h('div', { style: cardValueStyle }, dot(feishuColor), feishuText), feishuSub ? h('div', { style: cardSubStyle }, feishuSub) : null),
+              h('div', { style: Object.assign({}, cardStyle, clickableCard('hub-bot-feishu')), onClick: function () { scrollToSection('hub-bot-feishu'); }, title: t('cardJumpHint') }, h('div', { style: cardTitleStyle }, t('feishuCard')), h('div', { style: cardValueStyle }, dot(feishuColor), feishuText), feishuSub ? h('div', { style: cardSubStyle }, feishuSub) : null),
               h('div', { style: cardStyle }, h('div', { style: cardTitleStyle }, t('githubCard')), h('div', { style: cardValueStyle }, dot(githubColor), githubText)),
-              h('div', { style: cardStyle }, h('div', { style: cardTitleStyle }, t('ownersCard')), h('div', { style: cardValueStyle }, String(owners.length)), h('div', { style: cardSubStyle }, ownersSub))),
+              h('div', { style: Object.assign({}, cardStyle, clickableCard('hub-bot-owners')), onClick: function () { scrollToSection('hub-bot-owners'); }, title: t('cardJumpHint') }, h('div', { style: cardTitleStyle }, t('ownersCard')), h('div', { style: cardValueStyle }, String(owners.length)), h('div', { style: cardSubStyle }, ownersSub))),
             healthItems.length ? h('div', { style: {
               padding: '10px 14px', borderRadius: '8px', marginBottom: '18px', fontSize: '13px',
               background: 'rgba(230,160,40,0.1)', border: '1px solid rgba(230,160,40,0.35)', color: TONES.amber.fg,
@@ -945,7 +984,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     modelDone ? h('span', { style: { fontSize: '12px', color: TONES.green.fg, whiteSpace: 'nowrap' } }, t('modelApplied')) : null)
                 : h('div', { style: warnStyle }, t('catalogUnavailable')),
               h('div', { style: warnStyle }, t('modelPickerHint'))),
-            h('div', { style: sectionStyle },
+            h('div', { style: sectionStyle, id: 'hub-bot-owners' },
               h('div', { style: sectionTitleStyle }, t('ownersSection')),
               h('table', { style: tableStyle },
                 h('thead', null, h('tr', null,
@@ -971,7 +1010,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                         : h('span', { style: { display: 'inline-flex', alignItems: 'center', opacity: 0.5 } },
                             dot('rgba(140,140,140,0.6)'), t('sessionNone'))));
                 })))),
-            h(FeishuSection, { view: view, onRefresh: refreshView }),
+            h('div', { id: 'hub-bot-feishu' },
+              h(FeishuSection, { view: view, onRefresh: refreshView })),
             h(HubBotRowConfig, { hubBotCtx: scoped, hideModel: true }),
             error ? h('div', { style: { fontSize: '12px', color: TONES.red.fg, marginTop: '8px' } }, error) : null);
         }

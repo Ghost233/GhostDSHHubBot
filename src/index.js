@@ -538,7 +538,7 @@ export function apply(ctx, rawConfig) {
   const resolveTicket = async body => {
     const ticketId = requireString(body, 'ticketId')
     const resolution = requireString(body, 'resolution')
-    if (resolution !== 'confirm' && resolution !== 'reject' && resolution !== 'answer') throw new HttpError(400, 'resolution must be "confirm", "reject" or "answer"')
+    if (!['confirm', 'reject', 'answer', 'accept'].includes(resolution)) throw new HttpError(400, 'resolution must be "confirm", "reject", "answer" or "accept"')
     if (resolution === 'answer') {
       const text = requireString(body, 'message')
       const ticket0 = hub.router.getTicket(ticketId)
