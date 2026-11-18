@@ -235,6 +235,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       forkColAtSeq: '切点',
       forkColReason: '理由',
       forkAtSeqValue: '从事件 {count}（含）处',
+      lastActivity: '最近活动',
       feishuMetricsTitle: '连接质量：',
       feishuMetricsReconnects: '重连 {count} 次',
       feishuMetricsLastConnected: '最近连接',
@@ -372,6 +373,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       forkColAtSeq: 'Cut at',
       forkColReason: 'Reason',
       forkAtSeqValue: 'from event {count} (inclusive)',
+      lastActivity: 'active',
       feishuMetricsTitle: 'Connection:',
       feishuMetricsReconnects: '{count} reconnects',
       feishuMetricsLastConnected: 'last connected',
@@ -1176,7 +1178,17 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                           h('span', { style: { display: 'inline-flex', alignItems: 'center' }, title: o.sessionId || undefined },
                             o.sessionId ? dot('#46bb6d') : dot('rgba(140,140,140,0.6)'),
                             h('span', { style: { opacity: 0.7, fontFamily: 'monospace' } }, o.sessionId ? String(o.sessionId).replace(/^session-/, '').slice(0, 8) : t('sessionNone'))),
-                          h('span', { style: { opacity: 0.7 } }, fill(t('activeTicketsLabel'), active))));
+                          h('span', { style: { opacity: 0.7 } }, fill(t('activeTicketsLabel'), active)),
+                          (function () {
+                            var lastAt = null;
+                            mine.forEach(function (tk) {
+                              var at = tk.updatedAt || tk.createdAt;
+                              if (at && (lastAt === null || String(at) > String(lastAt))) lastAt = at;
+                            });
+                            return lastAt
+                              ? h('span', { style: { marginLeft: 'auto', opacity: 0.55, fontSize: '11px' }, title: lastAt }, t('lastActivity') + ' ' + relTime(t, lastAt))
+                              : null;
+                          })()));
                     }))),
             h('div', { id: 'hub-bot-feishu' },
               h(FeishuSection, { view: view, onRefresh: refreshView })),
