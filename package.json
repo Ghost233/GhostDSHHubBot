@@ -48,6 +48,7 @@
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.76.0",
     "@deepseek-ai/schemastery": "^3.19.0",
-    "@deepseek-ai/dsh-typert-protocol": "^0.2.2-rc.4"
+    "@deepseek-ai/dsh-typert-protocol": "^0.2.2-rc.4",
+    "@deepseek-ai/cordis": "~4.1.0"
   }
 }
