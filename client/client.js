@@ -229,6 +229,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       confirmActionInject: '确认后：原样投递挂起的注入（会话无人值守执行）',
       confirmActionFork: '确认后：fork 当前会话并在副本上续作（原会话保留）',
       confirmFullText: '查看完整挂起内容',
+      forkDetail: 'fork 提案明细',
+      forkColSession: '会话',
+      forkColCwd: '工作目录',
+      forkColAtSeq: '切点',
+      forkColReason: '理由',
+      forkAtSeqValue: '从事件 {count}（含）处',
       feishuMetricsTitle: '连接质量：',
       feishuMetricsReconnects: '重连 {count} 次',
       feishuMetricsLastConnected: '最近连接',
@@ -360,6 +366,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       confirmActionInject: 'On confirm: deliver the held injection verbatim (unattended)',
       confirmActionFork: 'On confirm: fork the session and continue on the copy (original kept)',
       confirmFullText: 'View the full held content',
+      forkDetail: 'Fork proposal detail',
+      forkColSession: 'Session',
+      forkColCwd: 'Directory',
+      forkColAtSeq: 'Cut at',
+      forkColReason: 'Reason',
+      forkAtSeqValue: 'from event {count} (inclusive)',
       feishuMetricsTitle: 'Connection:',
       feishuMetricsReconnects: '{count} reconnects',
       feishuMetricsLastConnected: 'last connected',
@@ -871,6 +883,22 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               var isDanger = pcAction && pcAction.type === 'dangerous-inject';
               rows.push(h('div', { key: 'pca', style: { marginTop: '3px', fontSize: '12px', opacity: 0.7 } },
                 isDanger ? t('confirmActionInject') : t('confirmActionFork')));
+              // fork 提案： action 携带结构化字段（sessionId/cwd/atSeq/reason），拆成明细行免读长文。
+              if (!isDanger && pcAction && pcAction.type === 'fork') {
+                var forkRows = [
+                  [t('forkColSession'), pcAction.sessionId || '—'],
+                  [t('forkColCwd'), pcAction.cwd || '—'],
+                ];
+                if (pcAction.atSeq !== undefined && pcAction.atSeq !== null) forkRows.push([t('forkColAtSeq'), fill(t('forkAtSeqValue'), pcAction.atSeq)]);
+                forkRows.push([t('forkColReason'), pcAction.reason || '—']);
+                rows.push(h('div', { key: 'pfd', style: { marginTop: '6px', padding: '8px 10px', borderRadius: '6px', background: 'rgba(127,127,127,0.06)', border: '1px solid rgba(127,127,127,0.14)' } },
+                  h('div', { style: { fontSize: '11px', opacity: 0.55, marginBottom: '4px' } }, t('forkDetail')),
+                  forkRows.map(function (pair, i) {
+                    return h('div', { key: i, style: { display: 'flex', gap: '10px', fontSize: '12px', lineHeight: '1.8' } },
+                      h('span', { style: { minWidth: '58px', opacity: 0.55, flexShrink: 0 } }, pair[0]),
+                      h('span', { style: { fontFamily: i === forkRows.length - 1 ? 'inherit' : 'monospace', wordBreak: 'break-all' } }, pair[1]));
+                  })));
+              }
               // 文案只摘录 200 字——完整挂起内容折叠可查（确认对象的全文不该靠猜）。
               if (isDanger && typeof pcAction.message === 'string' && pcAction.message.length > 0) {
                 rows.push(h('details', { key: 'pcf', style: { marginTop: '4px', fontSize: '12px' } },
