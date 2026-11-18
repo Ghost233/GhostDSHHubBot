@@ -99,8 +99,27 @@ test('listOwners projects registry rows to plain JSON', async () => {
   assert.deepEqual(await service.listOwners(), [{
     id: 'chief', role: 'chief', kind: 'repo', workspace: 'Ghost233HomeRepo',
     cwd: '/Volumes/x/Ghost233HomeRepo', sessionId: 'session-1', status: 'bound',
-    createdAt: '2026-11-18T00:00:00.000Z',
+    createdAt: '2026-11-18T00:00:00.000Z', dshWorkspace: null,
   }])
+})
+
+test('listOwners reverse-maps sessions to their DSH workspace (turn 109)', async () => {
+  const rows = [
+    { id: 'chief', role: 'chief', kind: 'repo', sessionId: 'session-1', status: 'bound' },
+    { id: 'repo-x', role: 'owner', kind: 'repo', sessionId: 'session-9', status: 'bound' },
+    { id: 'repo-y', role: 'owner', kind: 'repo', sessionId: null, status: 'created' },
+  ]
+  const { service } = makeService({
+    listOwners: () => rows,
+    listWorkspaces: async () => [
+      { workspaceId: 'ws-chief', title: '我的中枢', path: '/pub/中枢', sessionIds: ['session-1'] },
+      { workspaceId: 'ws-x', title: 'Repo X', path: '/x', sessionIds: ['session-9', 'session-other'] },
+    ],
+  })
+  const result = await service.listOwners()
+  assert.deepEqual(result[0].dshWorkspace, { workspaceId: 'ws-chief', title: '我的中枢' })
+  assert.deepEqual(result[1].dshWorkspace, { workspaceId: 'ws-x', title: 'Repo X' })
+  assert.equal(result[2].dshWorkspace, null, '无会话 → null')
 })
 
 test('modelCatalog passes the catalog through untouched', async () => {

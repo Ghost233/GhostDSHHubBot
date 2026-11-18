@@ -136,6 +136,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       colKind: '类型',
       colDir: '目录',
       colSession: '会话',
+      colWorkspace: '工作区',
+      activeSessions: '{count} 个会话活跃',
+      titleManagedByYou: '关联模式下标题由你在工作区里直接改，这里不再覆盖。',
       roleChief: '总管',
       roleOwner: '负责人',
       kindRepo: '仓库',
@@ -229,6 +232,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       colKind: 'Kind',
       colDir: 'Directory',
       colSession: 'Session',
+      colWorkspace: 'Workspace',
+      activeSessions: '{count} active session(s)',
+      titleManagedByYou: 'With a linked workspace, its title is yours to edit in the sidebar — hub-bot will not overwrite it.',
       roleChief: 'Chief',
       roleOwner: 'Owner',
       kindRepo: 'Repo',
@@ -400,9 +406,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           h('div', { style: fieldStyle },
             h('label', { style: labelStyle }, t('chiefTitle')),
             h('input', {
-              style: inputStyle, value: form.chiefTitle,
+              style: Object.assign({}, inputStyle, form.chiefWorkspaceId ? { opacity: 0.5, cursor: 'not-allowed' } : {}),
+              value: form.chiefTitle,
+              disabled: !!form.chiefWorkspaceId,
               onChange: function (ev) { setForm(Object.assign({}, form, { chiefTitle: ev.target.value })); },
-            }))),
+            }),
+            form.chiefWorkspaceId ? h('div', { style: warnStyle }, t('titleManagedByYou')) : null)),
         hideModel ? null : h('div', { style: sectionStyle },
           h('div', { style: sectionTitleStyle }, t('modelSection')),
           h('div', { style: { fontSize: '13px' } }, model ? model.provider + ' / ' + model.model : t('modelFollow')),
@@ -670,6 +679,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var followed = github.followed || [];
           var githubText = !github.enabled ? t('disabled') : fill(t('watching'), followed.length);
           var githubColor = !github.enabled ? 'rgba(140,140,140,0.6)' : '#6b97ff';
+          // 副标（turn 109 信息密度）: 飞书卡显示 bot 名；负责人卡显示活跃会话数。
+          var feishuSub = feishuOn && fs.bot && fs.bot.name ? fs.bot.name : null;
+          var activeSessions = owners.filter(function (o) { return !!o.sessionId; }).length;
+          var ownersSub = fill(t('activeSessions'), activeSessions);
+          var cardSubStyle = { fontSize: '11px', opacity: 0.6, marginTop: '2px' };
 
           var tickets = overview.tickets || [];
           var needs = tickets.filter(function (tk) { return NEEDS_ME.indexOf(tk.stage) >= 0; });
@@ -730,9 +744,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           return h('div', { style: { padding: '20px 24px', overflowY: 'auto', height: '100%', boxSizing: 'border-box' } },
             h('h2', { style: { fontSize: '17px', fontWeight: 600, margin: '0 0 18px' } }, t('title')),
             h('div', { style: cardRowStyle },
-              h('div', { style: cardStyle }, h('div', { style: cardTitleStyle }, t('feishuCard')), h('div', { style: cardValueStyle }, dot(feishuColor), feishuText)),
+              h('div', { style: cardStyle }, h('div', { style: cardTitleStyle }, t('feishuCard')), h('div', { style: cardValueStyle }, dot(feishuColor), feishuText), feishuSub ? h('div', { style: cardSubStyle }, feishuSub) : null),
               h('div', { style: cardStyle }, h('div', { style: cardTitleStyle }, t('githubCard')), h('div', { style: cardValueStyle }, dot(githubColor), githubText)),
-              h('div', { style: cardStyle }, h('div', { style: cardTitleStyle }, t('ownersCard')), h('div', { style: cardValueStyle }, String(owners.length)))),
+              h('div', { style: cardStyle }, h('div', { style: cardTitleStyle }, t('ownersCard')), h('div', { style: cardValueStyle }, String(owners.length)), h('div', { style: cardSubStyle }, ownersSub))),
             healthItems.length ? h('div', { style: {
               padding: '10px 14px', borderRadius: '8px', marginBottom: '18px', fontSize: '13px',
               background: 'rgba(230,160,40,0.1)', border: '1px solid rgba(230,160,40,0.35)', color: TONES.amber.fg,
@@ -816,6 +830,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                   h('th', { style: thStyle }, t('colRole')),
                   h('th', { style: thStyle }, t('colKind')),
                   h('th', { style: thStyle }, t('colDir')),
+                  h('th', { style: thStyle }, t('colWorkspace')),
                   h('th', { style: thStyle }, t('colSession')))),
                 h('tbody', null, owners.map(function (o) {
                   var dir = o.cwd || o.workspace || '';
@@ -824,6 +839,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     h('td', { style: tdStyle }, o.role === 'chief' ? t('roleChief') : t('roleOwner')),
                     h('td', { style: tdStyle }, o.kind === 'temp' ? t('kindTemp') : t('kindRepo')),
                     h('td', { style: Object.assign({}, tdStyle, { opacity: 0.75 }), title: dir }, shortPath(dir)),
+                    h('td', { style: Object.assign({}, tdStyle, { opacity: 0.75 }) }, o.dshWorkspace && o.dshWorkspace.title ? o.dshWorkspace.title : '—'),
                     h('td', { style: tdStyle }, o.sessionId ? stagePill('done', t('sessionBound')) : stagePill('muted', t('sessionNone'))));
                 })))),
             h(FeishuSection, { view: view, onRefresh: refreshView }),

@@ -361,7 +361,7 @@ export function apply(ctx, rawConfig) {
     listOwners: () => hub.registry.list(),
     modelCatalog: () => sessions.modelCatalog(),
     // 关联式归位选择器（turn 108）: DSH 工作区枚举。registry 服务缺席（老 DSH）→ 空数组，选择器降级为「自动」。
-    listWorkspaces: () => (safeGetService(ctx, 'workspaceRegistry')?.list?.() ?? []).map(w => ({ workspaceId: String(w.id), title: w.title ?? null, path: w.path ?? null })),
+    listWorkspaces: () => (safeGetService(ctx, 'workspaceRegistry')?.list?.() ?? []).map(w => ({ workspaceId: String(w.id), title: w.title ?? null, path: w.path ?? null, sessionIds: Array.isArray(w.sessionIds) ? [...w.sessionIds] : [] })),
     overview: async () => buildOverview({ store, registry: hub.registry, health: await buildHealth() }),
     resolveTicket: request => resolveTicket(request),
     startFeishuRegister: () => {

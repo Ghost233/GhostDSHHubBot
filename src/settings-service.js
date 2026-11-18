@@ -58,6 +58,17 @@ export class HubBotSettingsService extends TypertRemoteService {
   /** Owner registry rows projected for the GUI panel (read-only, plain JSON). */
   async listOwners() {
     const rows = await this.deps.listOwners()
+    // 会话工作区反查（turn 109）: owner.sessionId ∈ ws.sessionIds → 该会话落在哪个 DSH 工作区——
+    // 面板「工作区」列让「这个负责人的会话在哪」一眼可查。registry 缺席（老 DSH）→ 列留空。
+    let sessionToWorkspace = new Map()
+    try {
+      const wsList = (await this.deps.listWorkspaces?.()) ?? []
+      for (const ws of wsList) {
+        for (const sid of ws.sessionIds ?? []) {
+          if (!sessionToWorkspace.has(sid)) sessionToWorkspace.set(sid, { workspaceId: ws.workspaceId ?? null, title: ws.title ?? null })
+        }
+      }
+    } catch { /* 反查失败不阻塞列表 */ }
     return rows.map(row => ({
       id: row.id,
       role: row.role ?? null,
@@ -67,6 +78,7 @@ export class HubBotSettingsService extends TypertRemoteService {
       sessionId: row.sessionId ?? null,
       status: row.status ?? null,
       createdAt: row.createdAt ?? null,
+      dshWorkspace: (row.sessionId && sessionToWorkspace.get(row.sessionId)) ?? null,
     }))
   }
 
