@@ -175,15 +175,21 @@ export function apply(ctx, rawConfig) {
   applySettingsOverlay(config, loadSettingsOverlay(config.stateDir))
   const store = new Store(config.stateDir)
 
+  // #53: capture the service reference while this fiber's context is ACTIVE. A hot reload rebuilds the
+  // fiber but the rebuilt context can end up inactive (cordis loader lifecycle) — lazy sessionController
+  // access then throws "cannot get required service in inactive context" on every call. The captured service
+  // object itself stays alive and usable regardless of the context state marker.
+  const sessionController = ctx.sessionController
+
   // The Sessions port of src/router.js over the real sessionController. prompt uses queue mode: an owner Session
   // is event-driven — an injected message wakes it exactly like a person typing (spec「核心原则」2).
   const sessions = {
     create: async request => {
-      const value = await ctx.sessionController.create(request, deadline(30_000))
+      const value = await sessionController.create(request, deadline(30_000))
       return { sessionId: value.sessionId ?? value.session?.id }
     },
     prompt: async ({ sessionId, requestId, text }) => {
-      const value = await ctx.sessionController.prompt({
+      const value = await sessionController.prompt({
         requestId, sessionId, mode: 'queue', content: [{ type: 'text', text }],
       }, deadline(30_000))
       await ctx.sessionPersistence.flush()
@@ -191,18 +197,18 @@ export function apply(ctx, rawConfig) {
     },
     // Wake coalescing (#67): digests flush once the owner Session goes idle, so one wake = one outward message.
     isRunning: async sessionId => {
-      const listed = await ctx.sessionController.list({}, deadline(10_000))
+      const listed = await sessionController.list({}, deadline(10_000))
       const item = (listed.items ?? []).find(s => s.sessionId === sessionId)
       return Boolean(item?.running)
     },
     // 总管模型 (面板「总管模型」): sessionController.selectModel —— 配置变更后下一条消息即生效。
     selectModel: async ({ sessionId, provider, model, reasoningEffort }) =>
-      ctx.sessionController.selectModel({ sessionId, provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) }, deadline(30_000)),
+      sessionController.selectModel({ sessionId, provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) }, deadline(30_000)),
     // 面板「总管模型」的数据源：部署内全部可路由模型（provider 分组 + 默认选择 + 隔离故障）。
-    modelCatalog: () => ctx.sessionController.modelCatalog(deadline(30_000)),
+    modelCatalog: () => sessionController.modelCatalog(deadline(30_000)),
     // #69 fork 路径（Lead 授权仅此 4 行）: the user-confirmed fork execution over sessionController.
     fork: async request => {
-      const value = await ctx.sessionController.fork(request, deadline(30_000))
+      const value = await sessionController.fork(request, deadline(30_000))
       await ctx.sessionPersistence.flush()
       return { sessionId: value.sessionId ?? value.session?.id }
     },
@@ -273,7 +279,8 @@ export function apply(ctx, rawConfig) {
   // nor even globalThis reaches them (observed live). A service provided at this scope is the channel that crosses —
   // the same way the subtree sees Host services like 'tools'. The fiber's unload unregisters it (reflect.provide).
   const unprovide = ctx.root.reflect.provide('hubBot', hub)
-  ctx.on('dispose', () => { void feishu.disconnect(); unprovide(); setHub(null); store.close() })
+  // #53: cleanup moved to the single dispose hook after webServer.register (correct ordering: routes first).
+  let staleReported = false
   ctx.logger.info('hub-bot ready: state %s (schema %s); chief owner %s (%s)%s',
     store.stateDir, store.schemaVersion, chief.owner.cwd, chief.created ? 'registered pending' : 'already registered',
     config.devApi ? '' : '; management API disabled (no config.devApi)')
@@ -333,16 +340,27 @@ export function apply(ctx, rawConfig) {
 
   // GUI 设置面板的数据通路（client/ 半侧）：与 HTTP 面板共用同一条 settingsView/applySettingsCore。
   // 独立于 devApi——管理 API 关掉时 GUI 设置页照常工作。
+  // #53 转发 deps：cordis service 注册全局唯一，热重载时旧 service 实例可能残留（dispose 不保证注销）——
+  // 它的 deps 若捕获旧 fiber 闭包，重载后调用会撞上 inactive context。转发层让任何残留实例都落到最新实现。
+  const serviceDeps = {}
+  const forwardDep = name => (...args) => serviceDeps[name](...args)
   new HubBotSettingsService(ctx, {
+    settingsView: forwardDep('settingsView'),
+    applySettings: forwardDep('applySettings'),
+    listOwners: forwardDep('listOwners'),
+    modelCatalog: forwardDep('modelCatalog'),
+    overview: forwardDep('overview'),
+    resolveTicket: forwardDep('resolveTicket'),
+    startFeishuRegister: forwardDep('startFeishuRegister'),
+  })
+  // 填充真实实现——转发层延迟解引用；devApi 未配置时管理面方法本就不该可用（行为与现状一致）。
+  Object.assign(serviceDeps, {
     settingsView,
     applySettings: applySettingsCore,
-    // GUI 面板的只读投影：owner 注册表与模型目录（模型选择器用）。
     listOwners: () => hub.registry.list(),
     modelCatalog: () => sessions.modelCatalog(),
-    // 任务板三问视图与确认裁决——与 HTTP 面板同一构建器、同一状态机路径（闭包延迟引用，定义点在后面）。
     overview: async () => buildOverview({ store, registry: hub.registry, health: await buildHealth() }),
     resolveTicket: request => resolveTicket(request),
-    // 扫码绑定（与 HTTP feishu/register 同一入口语义）：幂等——进行中的注册不重复启动。
     startFeishuRegister: () => {
       if (!config.feishu?.enabled) {
         const error = new Error('飞书未启用（feishu.enabled 未配置为 true），无法发起扫码绑定')
@@ -362,9 +380,12 @@ export function apply(ctx, rawConfig) {
   }
 
   /** Management calls are loopback-only and must carry the configured token. */
+  // #53: capture the port NOW — after a hot-reload dispose the ctx.webServer proxy is dead, and a stale
+  // handler surviving in the route table must still be able to authenticate and answer 503 (not bare 400).
+  const webServerPort = ctx.webServer.port
   const admitted = req => {
     const host = req.headers.host ?? ''
-    const loopback = host === '127.0.0.1:' + ctx.webServer.port || host === 'localhost:' + ctx.webServer.port || host === '[::1]:' + ctx.webServer.port
+    const loopback = host === '127.0.0.1:' + webServerPort || host === 'localhost:' + webServerPort || host === '[::1]:' + webServerPort
     return loopback && tokenMatches(req.headers['x-hub-bot-token'], token)
   }
 
@@ -400,7 +421,7 @@ export function apply(ctx, rawConfig) {
     const mode = body.mode ?? 'queue'
     if (mode !== 'queue' && mode !== 'steer') throw new HttpError(400, 'mode must be "queue" or "steer"')
     const requestId = optionalString(body, 'requestId') ?? 'hub-bot-' + randomUUID()
-    const value = await ctx.sessionController.prompt({
+    const value = await sessionController.prompt({
       requestId, sessionId, mode, content: [{ type: 'text', text }],
     }, deadline(30_000))
     await ctx.sessionPersistence.flush()
@@ -422,7 +443,7 @@ export function apply(ctx, rawConfig) {
   const decorate = async body => {
     const sessionId = requireString(body, 'sessionId')
     // resolveAgent resolves/resumes the Session and reports failures as a value, not a throw.
-    const found = await ctx.sessionController.resolveAgent(sessionId)
+    const found = await sessionController.resolveAgent(sessionId)
     const agent = found && typeof found === 'object' && 'error' in found ? null : (found?.agent ?? found)
     if (!agent?.ctx) throw new HttpError(404, 'Session ' + sessionId + ' could not be resolved to a live Agent')
     decorations.get(sessionId)?.()
@@ -436,14 +457,14 @@ export function apply(ctx, rawConfig) {
   const waitIdle = async body => {
     const sessionId = requireString(body, 'sessionId')
     const timeoutMs = typeof body.timeoutMs === 'number' && body.timeoutMs > 0 ? Math.min(body.timeoutMs, 600_000) : 120_000
-    return await ctx.sessionController.wait({ sessionId, timeoutMs }, deadline(timeoutMs + 10_000))
+    return await sessionController.wait({ sessionId, timeoutMs }, deadline(timeoutMs + 10_000))
   }
 
   /** Reads the durable transcript of one Session (what the DSH Web transcript view renders). */
   const transcript = async query => {
     const sessionId = requireString(query, 'sessionId')
     const maxMessages = Number.isInteger(Number(query.maxMessages)) && Number(query.maxMessages) > 0 ? Number(query.maxMessages) : 200
-    return await ctx.sessionController.page({ address: { kind: 'session', sessionId }, maxMessages }, deadline(30_000))
+    return await sessionController.page({ address: { kind: 'session', sessionId }, maxMessages }, deadline(30_000))
   }
 
   // ---- 面板 (#73 面板三问与设置页) -------------------------------------------------------
@@ -519,13 +540,25 @@ export function apply(ctx, rawConfig) {
     kind: 'prefix',
     path: '/hub-bot',
     handler: async (req, res) => {
-      const url = new URL(req.url ?? '/', 'http://localhost')
-      // 面板静态壳 (#73): served without the token — it carries no data; every fetch inside goes through
-      // the token-guarded API below. Loopback-only like the API itself.
-      if (url.pathname === '/hub-bot/panel' || url.pathname.startsWith('/hub-bot/panel/')) { servePanel(url.pathname, req, res); return }
-      if (!url.pathname.startsWith('/hub-bot/api/')) { res.writeHead(404); res.end(); return }
-      if (!admitted(req)) { json(res, 401, { error: 'Missing or wrong x-hub-bot-token' }); return }
       try {
+        // #53 半失效自检: a hot reload disposes this fiber's store but the old route can survive — answer
+        // a diagnosable 503 (JSON) instead of crashing into the webServer's bare 400. The GUI 面板经
+        // Remote 通道独立存活，会继续工作；HTTP 管理面等重启后恢复。
+        if (store.closed) {
+          if (!staleReported) {
+            staleReported = true
+            ctx.logger.warn('hub-bot stale management handler still serving after reload — answering 503 until instance restart')
+          }
+          json(res, 503, { error: 'hub-bot management API is reloading — restart the DSH instance if this persists', code: 'reloading' })
+          return
+        }
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        // 面板静态壳 (#73): served without the token — it carries no data; every fetch inside goes through
+        // the token-guarded API below. Loopback-only like the API itself.
+        if (url.pathname === '/hub-bot/panel' || url.pathname.startsWith('/hub-bot/panel/')) { servePanel(url.pathname, req, res); return }
+        if (!url.pathname.startsWith('/hub-bot/api/')) { res.writeHead(404); res.end(); return }
+        if (!admitted(req)) { json(res, 401, { error: 'Missing or wrong x-hub-bot-token' }); return }
+        try {
         const route = url.pathname.slice('/hub-bot/api/'.length)
         const method = req.method ?? 'GET'
         if (route === 'state' && method === 'GET') {
@@ -624,8 +657,28 @@ export function apply(ctx, rawConfig) {
         if (error?.name === 'RouterError') { json(res, 400, { error: message, code: error.code }); return }
         ctx.logger.warn('hub-bot management call failed: %s', message)
         json(res, 500, { error: message })
+        }
+      } catch (error) {
+        // #53 外层兜底: anything above the route dispatch (URL parse, servePanel, admitted) must never
+        // escape into the webServer's bare 400 — always answer JSON.
+        const message = error instanceof Error ? error.message : String(error)
+        ctx.logger.warn('hub-bot management handler failed outside dispatch: %s', message)
+        try { json(res, 500, { error: message, code: 'handler-outer' }) } catch { /* response already ended */ }
       }
     },
   })
-  ctx.on('dispose', unregister)
+  // #53 dispose 单钩子: unregister FIRST (stop new traffic before tearing down resources), every step
+  // isolated — one failing step must never skip the rest of the cleanup.
+  ctx.on('dispose', () => {
+    const steps = [
+      ['unregister management routes', () => unregister()],
+      ['disconnect feishu', () => feishu.disconnect()],
+      ['unprovide hub service', () => unprovide()],
+      ['release hub reference', () => setHub(null)],
+      ['close store', () => store.close()],
+    ]
+    for (const [label, step] of steps) {
+      try { void step() } catch (error) { ctx.logger.warn('hub-bot dispose step "%s" failed: %s', label, error?.message ?? error) }
+    }
+  })
 }

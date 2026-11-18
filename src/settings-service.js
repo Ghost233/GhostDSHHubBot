@@ -70,9 +70,12 @@ export class HubBotSettingsService extends TypertRemoteService {
     }))
   }
 
-  /** Model catalog passthrough for the chief-model picker (read-only). */
+  /** Model catalog passthrough for the chief-model picker (read-only). Plain-JSON'd: the catalog carries
+   *  DSH internal shapes (class instances etc.) that the typert wire encoder can choke on after a hot reload —
+   *  surfacing as an opaque gateway/internal on the client while the same object serves fine over HTTP (#53). */
   async modelCatalog() {
-    return await this.deps.modelCatalog()
+    const value = await this.deps.modelCatalog()
+    return value === undefined ? null : JSON.parse(JSON.stringify(value))
   }
 
   /** Ticket board overview (three-questions view) — same builder as the HTTP panel API. */

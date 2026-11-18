@@ -45,6 +45,8 @@ export class StoreError extends Error {
 export class Store {
   /** @param {string} stateDir - absolute state directory from the plugin configuration. */
   constructor(stateDir) {
+    /** True once close() ran — management handlers use it to answer 503 instead of crashing on a stale fiber. */
+    this.closed = false
     this.stateDir = stateDir
     this.path = join(stateDir, 'hub-bot.sqlite')
     mkdirSync(dirname(this.path), { recursive: true })
@@ -99,8 +101,10 @@ export class Store {
     return row === undefined ? undefined : JSON.parse(String(row.value))
   }
 
-  /** Closes the database; the store must not be used afterwards. */
+  /** Closes the database; the store must not be used afterwards. Idempotent (reload paths may run twice). */
   close() {
+    if (this.closed) return
+    this.closed = true
     this.db.close()
   }
 }
