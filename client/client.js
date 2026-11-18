@@ -236,6 +236,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       forkColReason: '理由',
       forkAtSeqValue: '从事件 {count}（含）处',
       lastActivity: '最近活动',
+      filterAllKinds: '全部',
+      filterDroppedOnly: '仅看未受理',
       feishuMetricsTitle: '连接质量：',
       feishuMetricsReconnects: '重连 {count} 次',
       feishuMetricsLastConnected: '最近连接',
@@ -374,6 +376,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       forkColReason: 'Reason',
       forkAtSeqValue: 'from event {count} (inclusive)',
       lastActivity: 'active',
+      filterAllKinds: 'All',
+      filterDroppedOnly: 'Dropped only',
       feishuMetricsTitle: 'Connection:',
       feishuMetricsReconnects: '{count} reconnects',
       feishuMetricsLastConnected: 'last connected',
@@ -732,6 +736,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var rs = React.useState(null); var resolving = rs[0]; var setResolving = rs[1];
           var fts = React.useState(''); var filterText = fts[0]; var setFilterText = fts[1];
           var fss = React.useState(''); var filterStage = fss[0]; var setFilterStage = fss[1];
+          var rks = React.useState(''); var recentKind = rks[0]; var setRecentKind = rks[1];
+          var rds = React.useState(false); var recentDroppedOnly = rds[0]; var setRecentDroppedOnly = rds[1];
 
           var load = function () {
             setError(null);
@@ -854,6 +860,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var presentStages = STAGE_ORDER.filter(function (st) { return tickets.some(function (tk) { return tk.stage === st; }); });
           var healthItems = healthProblems(overview.health || {}, t);
           var recent = overview.recentTriggers || [];
+          var recentFiltered = recent.filter(function (tr) {
+            if (recentKind && tr.kind !== recentKind) return false;
+            if (recentDroppedOnly && !tr.dropped) return false;
+            return true;
+          });
+          var recentFilterActive = recentKind !== '' || recentDroppedOnly;
           var kindLabel = function (k) { return k === 'feishu' ? t('kindFeishu') : k === 'github' ? t('kindGitHub') : t('kindRoute'); };
           // 消息 → 票据定位（round 8）: 点一条最近消息 = 按工单号过滤任务流并滚过去。
           var locateTicket = function (ticketId) {
@@ -1087,10 +1099,37 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                       h('div', { style: { marginTop: '8px' } }, list.map(function (tk) { return ticketRowItem(tk, false); })));
                   })),
             h('div', { style: sectionStyle },
-              h('div', { style: sectionTitleStyle }, t('recentSection')),
+              h('div', { style: Object.assign({}, sectionTitleStyle, { display: 'flex', alignItems: 'center', gap: '8px' }) },
+                t('recentSection'),
+                recentFilterActive ? h('span', { style: { fontSize: '12px', fontWeight: 400, opacity: 0.55 } }, '· ' + recentFiltered.length + '/' + recent.length) : null,
+                h('span', { style: { marginLeft: 'auto', display: 'inline-flex', gap: '6px', flexWrap: 'wrap' } },
+                  ['', 'feishu', 'github', 'route'].map(function (k) {
+                    var on = recentKind === k;
+                    return h('button', {
+                      key: k || 'all',
+                      onClick: function () { setRecentKind(k); },
+                      style: { fontSize: '11px', fontWeight: 400, padding: '1px 10px', borderRadius: '999px', cursor: 'pointer',
+                        background: on ? 'rgba(70,150,255,0.16)' : 'rgba(127,127,127,0.08)',
+                        color: on ? '#7db8ff' : 'inherit',
+                        border: '1px solid ' + (on ? 'rgba(70,150,255,0.4)' : 'rgba(127,127,127,0.2)'),
+                        opacity: on ? 1 : 0.7 },
+                    }, k === '' ? t('filterAllKinds') : kindLabel(k));
+                  }),
+                  recent.some(function (tr) { return tr.dropped; })
+                    ? h('button', {
+                        onClick: function () { setRecentDroppedOnly(!recentDroppedOnly); },
+                        style: { fontSize: '11px', fontWeight: 400, padding: '1px 10px', borderRadius: '999px', cursor: 'pointer',
+                          background: recentDroppedOnly ? 'rgba(230,160,40,0.16)' : 'rgba(127,127,127,0.08)',
+                          color: recentDroppedOnly ? TONES.amber.fg : 'inherit',
+                          border: '1px solid ' + (recentDroppedOnly ? TONES.amber.border : 'rgba(127,127,127,0.2)'),
+                          opacity: recentDroppedOnly ? 1 : 0.7 },
+                      }, t('filterDroppedOnly'))
+                    : null)),
               recent.length === 0
                 ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 0' } }, t('emptyRecent'))
-                : recent.map(function (tr) {
+                : recentFiltered.length === 0
+                  ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 0' } }, t('filterNoMatch'))
+                  : recentFiltered.map(function (tr) {
                     return h('div', { key: tr.id,
                       onClick: tr.ticketId ? function () { locateTicket(tr.ticketId); } : undefined,
                       title: tr.ticketId ? t('recentLocateHint') : undefined,
