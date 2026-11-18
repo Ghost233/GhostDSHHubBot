@@ -216,6 +216,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       activeTicketsLabel: '{count} 活跃票据',
       ownerFilterHint: '点击只看这位负责人的票据',
       emptyOwners: '还没有负责人——飞书或 GitHub 来消息后会自动创建',
+      tlCreated: '创建',
+      tlAssign: '分派会话',
+      tlAssignEnd: '分派结束',
+      tlQuestion: '提问',
+      tlConfirm: '挂起确认',
+      tlReport: '交付报告',
       healthDetailNext: '下次重试',
       healthDetailLast: '最近错误',
       detailAuth: '授权',
@@ -329,6 +335,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       activeTicketsLabel: '{count} active tickets',
       ownerFilterHint: 'Click to show only this owner’s tickets',
       emptyOwners: 'No owners yet — one is created automatically when a feishu or GitHub message arrives',
+      tlCreated: 'Created',
+      tlAssign: 'Assigned',
+      tlAssignEnd: 'Assignment ended',
+      tlQuestion: 'Question',
+      tlConfirm: 'Pending confirm',
+      tlReport: 'Report',
       healthDetailNext: 'next retry',
       healthDetailLast: 'last error',
       detailAuth: 'Authorized',
@@ -556,6 +568,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
         }
         function fill(template, n) {
           return String(template).replace('{n}', String(n)).replace('{count}', String(n));
+        }
+        function hhmm(iso) {
+            var d = new Date(iso);
+            if (isNaN(d.getTime())) return '—';
+            var p = function (n) { return String(n).padStart(2, '0'); };
+            return p(d.getHours()) + ':' + p(d.getMinutes());
         }
         function relTime(t, iso) {
           if (!iso) return '';
@@ -806,10 +824,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               tk.recoveryPending ? stagePill('queued', t('recovering')) : null,
               h('span', { style: { fontSize: '12px', opacity: 0.55, whiteSpace: 'nowrap' } }, relTime(t, tk.updatedAt))));
             if (tk.pendingConfirm) rows.push(h('div', { key: 'pc', style: { marginTop: '6px', fontSize: '13px', color: TONES.amber.fg } }, t('pendingConfirmLabel') + tk.pendingConfirm.text));
-            if (tk.question) rows.push(h('div', { key: 'q', style: { marginTop: '6px', fontSize: '13px', color: TONES.amber.fg } }, t('questionLabel') + tk.question.text));
+            if (tk.question && tk.stage === 'person/answer') rows.push(h('div', { key: 'q', style: { marginTop: '6px', fontSize: '13px', color: TONES.amber.fg } }, t('questionLabel') + tk.question.text));
             // 等验收时报告就是要审的内容——直接摆出来，不藏进「详情」。
-            if (tk.stage === 'person/review' && tk.report && tk.report.text) {
-              rows.push(h('div', { key: 'rp', style: { marginTop: '6px', fontSize: '13px', color: TONES.blue.fg, whiteSpace: 'pre-wrap' } }, t('reportLabel') + tk.report.text));
+            if (tk.stage === 'person/review' && tk.report && (tk.report.summary || tk.report.text)) {
+              rows.push(h('div', { key: 'rp', style: { marginTop: '6px', fontSize: '13px', color: TONES.blue.fg, whiteSpace: 'pre-wrap' } }, t('reportLabel') + (tk.report.summary || tk.report.text)));
             }
             if (withActions && tk.stage === 'person/confirm') {
               rows.push(h('div', { key: 'act', style: { marginTop: '8px', display: 'flex', gap: '8px' } },
@@ -854,16 +872,31 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                   style: Object.assign({}, inputStyle, { width: 'auto', padding: '4px 18px', cursor: 'pointer', background: 'rgba(230,160,40,0.13)', border: '1px solid ' + TONES.amber.border, color: TONES.amber.fg }),
                 }, resolving === tk.id + ':answer' ? '…' : t('reworkBtn'))));
             }
-            var details = [];
-            if (tk.authorization) details.push(h('div', { key: 'a' }, t('detailAuth') + '：' + tk.authorization.actor + ' · ' + relTime(t, tk.authorization.at)));
-            (tk.assignments || []).forEach(function (a, i) {
-              details.push(h('div', { key: 'as' + i }, 'Assignment · ' + a.state + (a.endedReason ? '（' + a.endedReason + '）' : '')));
+            // 时间线（round 11）: 创建→分派→提问→确认→报告→当前，按时间排序。
+            // 字段以 tasks.js 为准： report.summary / pendingConfirm.text / assignment.endReason。
+            var evs = [];
+            if (tk.createdAt) evs.push({ at: tk.createdAt, tone: 'muted', label: t('tlCreated'), detail: tk.authorization ? tk.authorization.actor + ' · ' + tk.authorization.source : null });
+            (tk.assignments || []).forEach(function (a) {
+              if (a.at) evs.push({ at: a.at, tone: 'blue', label: t('tlAssign'), detail: a.sessionId ? String(a.sessionId).replace(/^session-/, '').slice(0, 8) : null });
+              if (a.endedAt) evs.push({ at: a.endedAt, tone: 'muted', label: t('tlAssignEnd'), detail: a.endReason || null });
             });
-            if (tk.report) details.push(h('div', { key: 'r' }, t('detailReport') + '：' + (tk.report.summary || '')));
-            details.push(h('div', { key: 'id', style: { opacity: 0.5 } }, tk.id));
-            rows.push(h('details', { key: 'd', style: { marginTop: '6px', fontSize: '12px', opacity: 0.8 } },
+            if (tk.question && tk.question.at) evs.push({ at: tk.question.at, tone: 'amber', label: t('tlQuestion'), detail: tk.question.text });
+            if (tk.pendingConfirm && tk.pendingConfirm.at) evs.push({ at: tk.pendingConfirm.at, tone: 'amber', label: t('tlConfirm'), detail: tk.pendingConfirm.text });
+            if (tk.report && tk.report.at) evs.push({ at: tk.report.at, tone: 'blue', label: t('tlReport'), detail: tk.report.summary || '' });
+            evs.push({ at: tk.updatedAt || tk.createdAt, tone: STAGE_TONE[tk.stage] || 'gray', label: tk.stageText || tk.stage, detail: null, current: true });
+            evs.sort(function (a, b) { return String(a.at || '').localeCompare(String(b.at || '')); });
+            rows.push(h('details', { key: 'd', style: { marginTop: '6px', fontSize: '12px', opacity: 0.85 } },
               h('summary', { style: { cursor: 'pointer' } }, t('detailToggle')),
-              h('div', { style: { marginTop: '4px', display: 'flex', flexDirection: 'column', gap: '3px' } }, details)));
+              h('div', { style: { marginTop: '6px', paddingLeft: '4px', display: 'flex', flexDirection: 'column' } },
+                evs.map(function (ev, i) {
+                  var tone = TONES[ev.tone] || TONES.gray;
+                  return h('div', { key: i, style: { display: 'flex', alignItems: 'baseline', gap: '8px', padding: '2px 0' } },
+                    h('span', { style: { flexShrink: 0, width: '8px', height: '8px', borderRadius: '999px', background: ev.current ? tone.border : 'transparent', border: '2px solid ' + tone.border, alignSelf: 'center' } }),
+                    h('span', { style: { flexShrink: 0, opacity: 0.5, fontFamily: 'monospace', fontSize: '11px', minWidth: '42px' }, title: ev.at || '' }, ev.at ? hhmm(ev.at) : '—'),
+                    h('span', { style: { flexShrink: 0, color: tone.fg, fontWeight: ev.current ? 600 : 400 } }, ev.label),
+                    ev.detail ? h('span', { style: { opacity: 0.65, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, ev.detail) : null);
+                })),
+              h('div', { style: { marginTop: '4px', opacity: 0.5, fontFamily: 'monospace', fontSize: '11px' } }, tk.id)));
             var stageTone = TONES[STAGE_TONE[tk.stage] || 'gray'];
             return h('div', { key: tk.id, style: {
               padding: '10px 12px', borderRadius: '8px', marginBottom: '8px',
