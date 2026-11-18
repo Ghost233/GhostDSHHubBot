@@ -71,6 +71,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           parameters: [],
           result: anyCodec('dsh-hub-bot#json-result'),
         },
+        'hubBotSettings/startFeishuRegister': {
+          service: 'hubBotSettings',
+          description: 'Start the feishu scan-to-bind device flow (idempotent).',
+          invocation: { kind: 'direct' },
+          parameters: [],
+          result: anyCodec('dsh-hub-bot#json-result'),
+        },
         'hubBotSettings/resolveTicket': {
           service: 'hubBotSettings',
           description: 'Confirm or reject a person/confirm ticket.',
@@ -150,6 +157,18 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       healthOutboxFailed: '{n} 条投递失败',
       resolveFailed: '操作失败',
       detailToggle: '详情',
+      feishuSection: '飞书 Bot',
+      feishuBound: '已绑定',
+      feishuBoundAt: '绑定于',
+      feishuWsOk: '长连接正常',
+      feishuWsDown: '长连接未建立',
+      feishuNotBound: '尚未绑定飞书 Bot',
+      feishuInvalid: '凭据失效 — 请重新扫码绑定',
+      feishuBindStart: '开始扫码绑定',
+      feishuBinding: '正在等待二维码…',
+      feishuScanHint: '用飞书手机 App 扫码完成授权；二维码有时效，过期请重新发起。',
+      feishuPermsTitle: '权限申明（授权时将申请）',
+      feishuBindFailed: '发起绑定失败',
       detailAuth: '授权',
       detailReport: '报告',
     };
@@ -216,6 +235,18 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       healthOutboxFailed: '{n} deliveries failed',
       resolveFailed: 'Action failed',
       detailToggle: 'Details',
+      feishuSection: 'Feishu Bot',
+      feishuBound: 'Bound',
+      feishuBoundAt: 'bound',
+      feishuWsOk: 'Long connection OK',
+      feishuWsDown: 'Long connection down',
+      feishuNotBound: 'No feishu bot bound yet',
+      feishuInvalid: 'Credentials invalid — scan to re-bind',
+      feishuBindStart: 'Start scan-to-bind',
+      feishuBinding: 'Waiting for the QR code…',
+      feishuScanHint: 'Scan with the Feishu mobile app to authorize; the QR code expires — restart if it does.',
+      feishuPermsTitle: 'Permissions (requested at authorization)',
+      feishuBindFailed: 'Failed to start binding',
       detailAuth: 'Authorized',
       detailReport: 'Report',
     };
@@ -436,6 +467,73 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           return items;
         }
 
+        // 飞书 bot 管理块（唯一总 bot）：已绑定名片+权限 / 未绑定预告+扫码 / 失效重扫，三态同一区块。
+        function FeishuSection(props) {
+          var t = scoped.locale.bind(NS);
+          var view = props.view;
+          var onRefresh = props.onRefresh;
+          var fs = (view.feishu && view.feishu.status) || {};
+          var enabled = !!(view.feishu && view.feishu.enabled);
+          var bound = fs.credentialState === 'ok' && !!fs.bot;
+          var invalid = enabled && fs.credentialState && fs.credentialState !== 'ok' && !fs.registration;
+          var pending = fs.registration === 'pending';
+          var bs = React.useState(false); var busy = bs[0]; var setBusy = bs[1];
+          var es = React.useState(null); var err = es[0]; var setErr = es[1];
+          var ts = React.useState(0); var tick = ts[0]; var setTick = ts[1];
+          // 注册流 pending 时轮询 read()，直到扫码完成（credentialState 转 ok）或二维码过期
+          React.useEffect(function () {
+            if (!pending) return undefined;
+            var timer = setInterval(function () { onRefresh(); setTick(function (n) { return n + 1; }); }, 2500);
+            return function () { clearInterval(timer); };
+          }, [pending]);
+          var start = function () {
+            setBusy(true); setErr(null);
+            scoped.remote.hubBotSettings.startFeishuRegister()
+              .then(function () { onRefresh(); })
+              .catch(function (e) { setErr(t('feishuBindFailed') + ': ' + (e && e.message ? e.message : String(e))); })
+              .finally(function () { setBusy(false); });
+          };
+          var perms = fs.permissions || [];
+          var rows = [];
+          if (!enabled) {
+            rows.push(h('p', { key: 'off', style: { fontSize: '13px', opacity: 0.6, margin: 0 } }, t('feishuDisabled')));
+          } else if (bound) {
+            rows.push(h('div', { key: 'card', style: { display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' } },
+              dot(fs.bot.connected ? '#46bb6d' : '#e06060'),
+              h('span', { style: { fontWeight: 600 } }, fs.bot.name || 'bot'),
+              h('span', { style: { fontSize: '12px', opacity: 0.65 } }, 'App ID：' + (fs.bot.appIdMasked || '—')),
+              fs.bot.boundAt ? h('span', { style: { fontSize: '12px', opacity: 0.65 } }, t('feishuBoundAt') + ' ' + relTime(t, fs.bot.boundAt)) : null,
+              stagePill(fs.bot.connected ? 'done' : 'failed', fs.bot.connected ? t('feishuWsOk') : t('feishuWsDown'))));
+          } else {
+            if (invalid) rows.push(h('p', { key: 'inv', style: { fontSize: '13px', color: TONES.red.fg, margin: '0 0 4px' } }, t('feishuInvalid')));
+            else rows.push(h('p', { key: 'nb', style: { fontSize: '13px', opacity: 0.75, margin: '0 0 4px' } }, t('feishuNotBound')));
+            if (!pending) {
+              rows.push(h('button', { key: 'start', onClick: start, disabled: busy,
+                style: Object.assign({}, inputStyle, { width: 'auto', cursor: 'pointer', padding: '6px 18px', marginTop: '6px' }),
+              }, busy ? t('feishuBinding') : t('feishuBindStart')));
+            }
+          }
+          if (pending && fs.qr && fs.qr.svg) {
+            rows.push(h('div', { key: 'qr', style: { marginTop: '12px', display: 'flex', gap: '16px', alignItems: 'center', flexWrap: 'wrap' } },
+              h('img', {
+                src: 'data:image/svg+xml;utf8,' + encodeURIComponent(fs.qr.svg),
+                alt: 'feishu qr', style: { width: '168px', height: '168px', borderRadius: '8px', background: '#fff', padding: '6px' },
+              }),
+              h('div', { style: { fontSize: '13px', opacity: 0.8, maxWidth: '320px' } }, t('feishuScanHint'))));
+          } else if (pending) {
+            rows.push(h('p', { key: 'wait', style: { fontSize: '13px', opacity: 0.7 } }, t('feishuBinding')));
+          }
+          if (enabled && perms.length) {
+            rows.push(h('div', { key: 'perms', style: { marginTop: '12px' } },
+              h('div', { style: { fontSize: '12px', opacity: 0.65, marginBottom: '6px' } }, t('feishuPermsTitle')),
+              h('div', { style: { display: 'flex', flexDirection: 'column', gap: '4px' } }, perms.map(function (p) {
+                return h('div', { key: p.key, style: { fontSize: '12px', opacity: 0.85 } }, '· ' + (p.label || p.key));
+              }))));
+          }
+          if (err) rows.push(h('div', { key: 'err', style: { fontSize: '12px', color: TONES.red.fg, marginTop: '6px' } }, err));
+          return h('div', { style: sectionStyle }, h('div', { style: sectionTitleStyle }, t('feishuSection')), rows);
+        }
+
         function HubBotPanelPage() {
           var t = scoped.locale.bind(NS);
           var vs = React.useState(null); var view = vs[0]; var setView = vs[1];
@@ -463,6 +561,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             }).catch(function (e) { setError(e && e.message ? e.message : String(e)); });
           };
           React.useEffect(load, []);
+          var refreshView = function () {
+            scoped.remote.hubBotSettings.read()
+              .then(function (raw) { setView(unwrap(raw)); })
+              .catch(function () { /* 轮询失败静默——下一次再试 */ });
+          };
 
           var saveModel = function () {
             setModelBusy(true); setModelDone(false); setError(null);
@@ -622,6 +725,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     h('td', { style: Object.assign({}, tdStyle, { opacity: 0.75 }), title: dir }, shortPath(dir)),
                     h('td', { style: tdStyle }, o.sessionId ? stagePill('done', t('sessionBound')) : stagePill('muted', t('sessionNone'))));
                 })))),
+            h(FeishuSection, { view: view, onRefresh: refreshView }),
             h(HubBotRowConfig, { hubBotCtx: scoped, hideModel: true }),
             error ? h('div', { style: { fontSize: '12px', color: TONES.red.fg, marginTop: '8px' } }, error) : null);
         }

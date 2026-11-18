@@ -24,6 +24,7 @@ import { createHash, timingSafeEqual, randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
 import z from '@deepseek-ai/schemastery'
 import { resolveConfig } from './config.js'
 import {
@@ -278,7 +279,29 @@ export function apply(ctx, rawConfig) {
     config.devApi ? '' : '; management API disabled (no config.devApi)')
 
   /** Reads the effective settings view (config ⊕ overlay + live Source status). */
-  const settingsView = async () => buildSettingsView(config, { feishuStatus: feishu.status(), githubStatus: await github.status() })
+  // QR 码在 host 侧生成 SVG（复用面板的 vendor 库，CJS），client 半侧零依赖渲染。
+  let qrcodeLib = null
+  const qrSvgFor = url => {
+    try {
+      if (!qrcodeLib) qrcodeLib = createRequire(import.meta.url)('../panel/vendor/qrcode.cjs')
+      const qr = qrcodeLib(0, 'M')
+      qr.addData(url)
+      qr.make()
+      return qr.createSvgTag({ cellSize: 4, margin: 16, scalable: true })
+    } catch (error) {
+      ctx.logger.warn('hub-bot qr svg render failed: %s', error?.message ?? error)
+      return null
+    }
+  }
+  const settingsView = async () => {
+    const view = buildSettingsView(config, { feishuStatus: feishu.status(), githubStatus: await github.status() })
+    const qr = view.feishu?.status?.qr
+    if (qr?.url) {
+      const svg = qrSvgFor(qr.url)
+      if (svg) view.feishu.status.qr = { ...qr, svg }
+    }
+    return view
+  }
 
   /** The accumulated settings overlay (boot value), merged with every accepted patch and persisted. */
   let settingsOverlay = loadSettingsOverlay(config.stateDir)
@@ -319,6 +342,17 @@ export function apply(ctx, rawConfig) {
     // 任务板三问视图与确认裁决——与 HTTP 面板同一构建器、同一状态机路径（闭包延迟引用，定义点在后面）。
     overview: async () => buildOverview({ store, registry: hub.registry, health: await buildHealth() }),
     resolveTicket: request => resolveTicket(request),
+    // 扫码绑定（与 HTTP feishu/register 同一入口语义）：幂等——进行中的注册不重复启动。
+    startFeishuRegister: () => {
+      if (!config.feishu?.enabled) {
+        const error = new Error('飞书未启用（feishu.enabled 未配置为 true），无法发起扫码绑定')
+        error.name = 'SettingsError'
+        throw error
+      }
+      if (feishu.registering) return { started: false, registration: 'pending' }
+      void feishu.register().catch(error => ctx.logger.warn('hub-bot feishu register failed: %s', error?.message ?? error))
+      return { started: true }
+    },
   })
 
   if (!config.devApi) return
@@ -421,7 +455,7 @@ export function apply(ctx, rawConfig) {
     ['/hub-bot/panel/', ['index.html', 'text/html; charset=utf-8']],
     ['/hub-bot/panel/app.js', ['app.js', 'text/javascript; charset=utf-8']],
     ['/hub-bot/panel/style.css', ['style.css', 'text/css; charset=utf-8']],
-    ['/hub-bot/panel/vendor/qrcode.js', ['vendor/qrcode.js', 'text/javascript; charset=utf-8']],
+    ['/hub-bot/panel/vendor/qrcode.cjs', ['vendor/qrcode.cjs', 'text/javascript; charset=utf-8']],
   ])
 
   /** Serves one allowlisted panel asset, loopback-only; the token guards DATA (/hub-bot/api/*), not the shell. */

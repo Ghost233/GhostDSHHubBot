@@ -80,6 +80,18 @@ export class HubBotSettingsService extends TypertRemoteService {
     return await this.deps.overview()
   }
 
+  /** Start the feishu scan-to-bind device flow (idempotent: a pending registration is not restarted). */
+  async startFeishuRegister() {
+    try {
+      return await this.deps.startFeishuRegister()
+    } catch (error) {
+      if (error?.name === 'SettingsError' || error?.statusCode === 400) {
+        throw new RemoteError('feishu/unavailable', error.message ?? 'feishu register unavailable')
+      }
+      throw error
+    }
+  }
+
   /** One-click confirm/reject on a person/confirm ticket — same state-machine path as route_to_owner. */
   async resolveTicket(request) {
     try {
@@ -99,3 +111,4 @@ markRemote(HubBotSettingsService, 'listOwners', {})
 markRemote(HubBotSettingsService, 'modelCatalog', {})
 markRemote(HubBotSettingsService, 'overview', {})
 markRemote(HubBotSettingsService, 'resolveTicket', {})
+markRemote(HubBotSettingsService, 'startFeishuRegister', {})
