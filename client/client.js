@@ -316,6 +316,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       expandAll: '全部展开',
       collapseAll: '全部收起',
       expandAllHint: '展开或收起任务流的全部阶段分组',
+      showMoreInGroup: '展开剩余 {count} 条',
       barFilterHint: '点击筛选该阶段',
       copyDigestBtn: '复制待办摘要',
       copyDigestHint: '把待办列表复制成纯文本（可贴到飞书/笔记）',
@@ -566,6 +567,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       expandAll: 'Expand all',
       collapseAll: 'Collapse all',
       expandAllHint: 'Expand or collapse every stage group in the stream',
+      showMoreInGroup: 'Show {count} more',
       barFilterHint: 'Click to filter this stage',
       copyDigestBtn: 'Copy digest',
       copyDigestHint: 'Copy the needs-me list as plain text (paste to Feishu/notes)',
@@ -1307,6 +1309,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var hvs = React.useState(null); var hoverTicket = hvs[0]; var setHoverTicket = hvs[1];
           var eds = React.useState({}); var expandedDone = eds[0]; var setExpandedDone = eds[1];
           var aos = React.useState(false); var allOpen = aos[0]; var setAllOpen = aos[1];
+          var egs = React.useState({}); var expandedGroups = egs[0]; var setExpandedGroups = egs[1];
           var resolve = function (tk, resolution) {
             var label = resolution === 'confirm' ? t('confirmBtn') : resolution === 'accept' ? t('acceptBtn') : resolution === 'retry' ? t('retryTicketBtn') : resolution === 'cancel' ? t('cancelTicketBtn') : t('rejectBtn');
             if (!window.confirm(label + ' — ' + (tk.pendingConfirm && tk.pendingConfirm.text ? tk.pendingConfirm.text : tk.id))) return;
@@ -1881,7 +1884,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     return h('details', { key: stage, open: isPerson || filterActive, style: { marginBottom: '6px' } },
                       h('summary', { style: { cursor: 'pointer', padding: '4px 0', display: 'flex', alignItems: 'center', gap: '8px' } },
                         stagePill(stage, (list[0].stageText || stage) + ' · ' + list.length)),
-                      h('div', { style: { marginTop: '8px' } }, list.map(function (tk) {
+                      h('div', { style: { marginTop: '8px' } }, (function () { var shown = filterActive || expandedGroups[stage] ? list : list.slice(0, 12); var rows = shown.map(function (tk) {
                         if (tk.stage === 'done' && !expandedDone[tk.id]) {
                           return h('div', { key: tk.id, className: 'hb-recent-row',
                             onClick: function () { var next = {}; for (var k in expandedDone) next[k] = expandedDone[k]; next[tk.id] = true; setExpandedDone(next); },
@@ -1893,7 +1896,15 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                             h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.5 } }, relTime(t, tk.updatedAt || tk.createdAt)));
                         }
                         return ticketRowItem(tk, false);
-                      })));
+                      });
+                      if (list.length > shown.length) {
+                        rows.push(h('button', {
+                          key: 'more-' + stage,
+                          onClick: function () { var next = {}; for (var k in expandedGroups) next[k] = expandedGroups[k]; next[stage] = true; setExpandedGroups(next); },
+                          style: { display: 'block', width: '100%', textAlign: 'center', fontSize: '12px', padding: '6px 0', marginTop: '2px', borderRadius: '6px', cursor: 'pointer', background: 'rgba(127,127,127,0.07)', border: '1px dashed rgba(127,127,127,0.3)', opacity: 0.8 },
+                        }, fill(t('showMoreInGroup'), list.length - shown.length)));
+                      }
+                      return rows; })()));
                   })),
             h('div', { style: sectionStyle },
               h('div', { style: Object.assign({}, sectionTitleStyle, { display: 'flex', alignItems: 'center', gap: '8px' }) },
