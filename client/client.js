@@ -309,6 +309,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       ownerFilterHint: '点击只看这位负责人的票据',
       replySent: '已回复',
       replyCopyHint: '点击复制回复内容',
+      originHint: '这条任务的来源渠道',
       replyRecorded: '已注入会话',
       replyPending: '投递中',
       replyFailed: '回复投递失败',
@@ -538,6 +539,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       ownerFilterHint: 'Click to show only this owner’s tickets',
       replySent: 'replied',
       replyCopyHint: 'Click to copy the reply text',
+      originHint: 'Origin channel of this task',
       replyRecorded: 'injected',
       replyPending: 'delivering',
       replyFailed: 'reply delivery failed',
@@ -1414,6 +1416,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             var rows = [];
             rows.push(h('div', { key: 'head', style: { display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0 } },
               stagePill(tk.stage, tk.stageText || tk.stage),
+              tk.trigger && tk.trigger.kind
+                ? h('span', { style: { flexShrink: 0, fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: tk.trigger.kind === 'feishu' ? 'rgba(70,150,255,0.14)' : 'rgba(150,150,150,0.14)', color: tk.trigger.kind === 'feishu' ? '#7db8ff' : 'rgba(200,200,200,0.8)', border: '1px solid ' + (tk.trigger.kind === 'feishu' ? 'rgba(70,150,255,0.3)' : 'rgba(150,150,150,0.25)') }, title: t('originHint') }, kindLabel(tk.trigger.kind))
+                : null,
               h('span', { style: { fontWeight: 600, whiteSpace: 'nowrap' } }, tk.ownerLabel || tk.owner),
               h('span', { style: { flex: 1, opacity: 0.85, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: tk.message || '' }, tk.message || '（无原文）'),
               tk.recoveryPending ? h('span', { title: t('recoveringHint') }, stagePill('queued', t('recovering'))) : null,
@@ -1902,10 +1907,14 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                             }));
                         })(),
                         h('div', { style: { display: 'flex', alignItems: 'center', gap: '12px', fontSize: '12px' } },
-                          h('span', { style: { display: 'inline-flex', alignItems: 'center', minWidth: 0 }, title: (o.sessionTitle ? o.sessionTitle + ' — ' : '') + (o.sessionId || '') || undefined },
-                            o.sessionId ? dot('#46bb6d') : dot('rgba(140,140,140,0.6)'),
-                            h('span', { style: { opacity: 0.7, fontFamily: o.sessionTitle ? 'inherit' : 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '130px' } },
-                              o.sessionTitle || (o.sessionId ? String(o.sessionId).replace(/^session-/, '').slice(0, 8) : t('sessionNone')))),
+                          h('span', {
+                            style: { display: 'inline-flex', alignItems: 'center', minWidth: 0, cursor: o.sessionId ? 'pointer' : 'default' },
+                            title: ((o.sessionTitle ? o.sessionTitle + ' — ' : '') + (o.sessionId || '')) + (o.sessionId ? '\n' + t('copySessionHint') : '') || undefined,
+                            onClick: o.sessionId ? function (ev) { ev.stopPropagation(); copyText(o.sessionId, 'sid:' + o.id); } : undefined,
+                          },
+                            o.sessionId ? dot(copiedId === 'sid:' + o.id ? '#46bb6d' : '#46bb6d') : dot('rgba(140,140,140,0.6)'),
+                            h('span', { style: { opacity: 0.7, fontFamily: o.sessionTitle ? 'inherit' : 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '130px', color: copiedId === 'sid:' + o.id ? TONES.green.fg : undefined } },
+                              copiedId === 'sid:' + o.id ? t('copiedBtn') : (o.sessionTitle || (o.sessionId ? String(o.sessionId).replace(/^session-/, '').slice(0, 8) : t('sessionNone'))))),
                           h('span', { style: { opacity: 0.7 } }, fill(t('activeTicketsLabel'), active)),
                           (function () {
                             var lastAt = null;
