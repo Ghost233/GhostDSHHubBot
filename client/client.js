@@ -167,6 +167,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       modelPickerHint: '修改立即生效；「跟随部署默认」使用当前 DSH 配置的默认模型。',
       needsMe: '需要我处理',
       quiet: '没有 — 一切安静。',
+      quietHint: '没有待确认、待回答或待验收的事。新消息进来时会出现在这里。',
       ticketsSection: '任务流',
       confirmBtn: '确认',
       rejectBtn: '拒绝',
@@ -328,6 +329,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       modelPickerHint: 'Takes effect immediately; "Follows the deployment default" uses the DSH default model.',
       needsMe: 'Needs me',
       quiet: 'Nothing — all quiet.',
+      quietHint: 'No confirmations, answers, or reviews waiting. New items land here as they arrive.',
       ticketsSection: 'Ticket stream',
       confirmBtn: 'Confirm',
       rejectBtn: 'Reject',
@@ -1233,7 +1235,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                          : null)
                    : null),
                needs.length === 0
-                 ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 0' } }, t('quiet'))
+                 ? h('div', { style: { display: 'flex', alignItems: 'center', gap: '12px', padding: '13px 15px', borderRadius: '10px', background: 'rgba(70,180,100,0.07)', border: '1px solid rgba(70,180,100,0.22)' } },
+                      h('span', { style: { fontSize: '16px', width: '28px', height: '28px', lineHeight: '27px', textAlign: 'center', borderRadius: '50%', background: TONES.green.bg, border: '1px solid ' + TONES.green.border, color: TONES.green.fg, flexShrink: 0 } }, '✓'),
+                      h('div', null,
+                        h('div', { style: { fontSize: '13px', fontWeight: 600 } }, t('quiet')),
+                        h('div', { style: { fontSize: '12px', opacity: 0.65, marginTop: '2px' } }, t('quietHint'))))
                  : needs.map(function (tk) {
                      var card = ticketRowItem(tk, true);
                      if (confirmable.length < 2 || tk.stage !== 'person/confirm') return card;
