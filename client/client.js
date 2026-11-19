@@ -170,6 +170,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       refreshBtn: '刷新',
       refreshHint: '重新拉取状态、票据与设置',
       autoRefreshHint: '每 15s 自动刷新',
+      recoveringHint: '实例重启后，系统正在自动恢复这条票据的执行现场',
+      copyReportBtn: '复制',
+      copyReportHint: '复制报告全文',
+      copyPathHint: '点击复制完整路径',
       ownersCard: '负责人',
       needsCard: '待我处理',
       connected: '已连接',
@@ -367,6 +371,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       refreshBtn: 'Refresh',
       refreshHint: 'Reload status, tickets and settings',
       autoRefreshHint: 'auto-refresh every 15s',
+      recoveringHint: 'The instance restarted; the system is re-establishing this ticket’s execution',
+      copyReportBtn: 'Copy',
+      copyReportHint: 'Copy the full report',
+      copyPathHint: 'Click to copy the full path',
       ownersCard: 'Owners',
       needsCard: 'Needs me',
       connected: 'Connected',
@@ -1182,16 +1190,18 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             var el = document.getElementById('hub-bot-stream');
             if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
           };
-          var copyTicketId = function (id) {
-            var done = function () { setCopiedId(id); setTimeout(function () { setCopiedId(''); }, 1200); };
+          // 通用复制（round 37）：报告全文/负责人路径/票据 id 共用一套翻转反馈，key 区分来源。
+          var copyText = function (text, key) {
+            var done = function () { setCopiedId(key); setTimeout(function () { setCopiedId(''); }, 1200); };
             try {
               if (navigator.clipboard && navigator.clipboard.writeText) {
-                navigator.clipboard.writeText(id).then(done, function () { legacyCopy(id); done(); });
+                navigator.clipboard.writeText(text).then(done, function () { legacyCopy(text); done(); });
                 return;
               }
             } catch (e) { /* fall through */ }
-            legacyCopy(id); done();
+            legacyCopy(text); done();
           };
+          var copyTicketId = function (id) { copyText(id, id); };
           var legacyCopy = function (text) {
             try {
               var ta = document.createElement('textarea');
@@ -1215,7 +1225,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               stagePill(tk.stage, tk.stageText || tk.stage),
               h('span', { style: { fontWeight: 600, whiteSpace: 'nowrap' } }, tk.ownerLabel || tk.owner),
               h('span', { style: { flex: 1, opacity: 0.85, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: tk.message || '' }, tk.message || '（无原文）'),
-              tk.recoveryPending ? stagePill('queued', t('recovering')) : null,
+              tk.recoveryPending ? h('span', { title: t('recoveringHint') }, stagePill('queued', t('recovering'))) : null,
               h('span', { style: { fontSize: '12px', opacity: 0.55, whiteSpace: 'nowrap' } }, relTime(t, tk.updatedAt))));
             if (tk.pendingConfirm) rows.push(h('div', { key: 'pc', style: { marginTop: '6px', fontSize: '13px', color: TONES.amber.fg } }, t('pendingConfirmLabel') + tk.pendingConfirm.text));
             // 确认语义透明化： 危险注入挂起 → 确认=原样投递；fork 提案（无 action）→ 确认=fork 副本续作。
@@ -1250,7 +1260,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             if (tk.question && tk.stage === 'person/answer') rows.push(h('div', { key: 'q', style: { marginTop: '6px', fontSize: '13px', color: TONES.amber.fg } }, t('questionLabel') + tk.question.text));
             // 等验收时报告就是要审的内容——直接摆出来，不藏进「详情」。
             if (tk.stage === 'person/review' && tk.report && (tk.report.summary || tk.report.text)) {
-              rows.push(h('div', { key: 'rp', style: { marginTop: '6px', fontSize: '13px', color: TONES.blue.fg, whiteSpace: 'pre-wrap' } }, t('reportLabel') + (tk.report.summary || tk.report.text)));
+              rows.push(h('div', { key: 'rp', style: { marginTop: '6px', fontSize: '13px', color: TONES.blue.fg, whiteSpace: 'pre-wrap', display: 'flex', alignItems: 'flex-start', gap: '8px' } },
+                h('span', { style: { flex: 1, minWidth: 0 } }, t('reportLabel') + (tk.report.summary || tk.report.text)),
+                h('button', { onClick: function (ev) { ev.preventDefault(); copyText(tk.report.summary || tk.report.text, 'rp:' + tk.id); }, title: t('copyReportHint'), style: { fontSize: '10px', padding: '0 7px', borderRadius: '5px', cursor: 'pointer', flexShrink: 0, background: copiedId === 'rp:' + tk.id ? 'rgba(70,180,100,0.14)' : 'rgba(127,127,127,0.1)', color: copiedId === 'rp:' + tk.id ? TONES.green.fg : 'inherit', border: '1px solid ' + (copiedId === 'rp:' + tk.id ? TONES.green.border : 'rgba(127,127,127,0.25)'), opacity: copiedId === 'rp:' + tk.id ? 1 : 0.6 } }, copiedId === 'rp:' + tk.id ? t('copiedBtn') : t('copyReportBtn'))));
             }
             // 结果在哪（三问之一）: 等验收票的产物目录——投影层早已产出 dirListing，这里补上渲染。
             if (tk.stage === 'person/review' && Array.isArray(tk.dirListing) && tk.dirListing.length > 0) {
@@ -1606,7 +1618,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                             ? h('span', { style: { marginLeft: 'auto', fontSize: '11px', padding: '1px 8px', borderRadius: '999px', background: TONES.amber.bg, color: TONES.amber.fg, border: '1px solid ' + TONES.amber.border, flexShrink: 0 } },
                                 fill(t('verdictCount'), verdict))
                             : null),
-                        h('div', { style: { fontSize: '12px', opacity: 0.6, marginBottom: '8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: dir }, shortPath(dir)),
+                        h('div', { onClick: function (ev) { ev.stopPropagation(); if (dir) copyText(dir, 'cwd:' + o.id); }, style: { fontSize: '12px', opacity: 0.6, marginBottom: '8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: dir ? 'pointer' : 'default', display: 'flex', alignItems: 'center', gap: '6px' }, title: dir ? dir + String.fromCharCode(10) + t('copyPathHint') : '' },
+                          h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis' } }, shortPath(dir)),
+                          copiedId === 'cwd:' + o.id ? h('span', { style: { color: TONES.green.fg, flexShrink: 0 } }, t('copiedBtn')) : null),
                         h('div', { style: { display: 'flex', alignItems: 'center', gap: '12px', fontSize: '12px' } },
                           h('span', { style: { display: 'inline-flex', alignItems: 'center', minWidth: 0 }, title: (o.sessionTitle ? o.sessionTitle + ' — ' : '') + (o.sessionId || '') || undefined },
                             o.sessionId ? dot('#46bb6d') : dot('rgba(140,140,140,0.6)'),
