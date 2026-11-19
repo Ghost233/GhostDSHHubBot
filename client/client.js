@@ -283,7 +283,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       healthDetailRetry: '重试中',
       healthDetailDead: '投递失败（死信）',
       healthSysProblems: '系统问题 {n} 条（展开查看）',
-      healthUnprocessed: '{n} 条消息超过 5 分钟未受理（无票据也无回复）——检查负责人会话是否被归档',
+      healthUnprocessed: '{n} 条消息超过 5 分钟未处理（无票据也无回复）——检查负责人会话是否被归档',
+      healthUnprocessedJump: '去最近消息看看',
+      unprocessedLabel: '未处理',
+      unprocessedHint: '这条消息进来超过 5 分钟，没有生成任务也没有回复——负责人会话可能被归档',
       healthDetailSys: '系统问题',
       healthPillSys: '系统',
       retryOne: '重投',
@@ -538,6 +541,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       healthDetailDead: 'failed deliveries (dead letters)',
       healthSysProblems: '{n} system problem(s) (expand to view)',
       healthUnprocessed: '{n} message(s) unprocessed for over 5 minutes (no ticket, no reply) — check whether owner sessions are archived',
+      healthUnprocessedJump: 'view recent messages',
+      unprocessedLabel: 'unprocessed',
+      unprocessedHint: 'Arrived over 5 minutes ago with no ticket and no reply — the owner session may be archived',
       healthDetailSys: 'System problems',
       healthPillSys: 'system',
       retryOne: 'Retry',
@@ -1430,7 +1436,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var presentStages = STAGE_ORDER.filter(function (st) { return tickets.some(function (tk) { return tk.stage === st; }); });
           var presentOwners = [...new Set(tickets.map(function (tk) { return tk.ownerLabel || tk.owner; }).filter(Boolean))].sort();
           var healthItems = healthProblems(overview.health || {}, t);
-          if ((overview.unprocessedTriggers || 0) > 0) healthItems.push(fill(t('healthUnprocessed'), overview.unprocessedTriggers));
+          if ((overview.unprocessedTriggers || 0) > 0) healthItems.push(fill(t('healthUnprocessed'), overview.unprocessedTriggers) + ' — ' + t('healthUnprocessedJump'));
           var recent = overview.recentTriggers || [];
           var recentFiltered = recent.filter(function (tr) {
             if (recentKind && tr.kind !== recentKind) return false;
@@ -1920,7 +1926,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                       }
                       return rows; })()));
                   })),
-            h('div', { style: sectionStyle },
+            h('div', { style: sectionStyle, id: 'hub-bot-recent' },
               h('div', { style: Object.assign({}, sectionTitleStyle, { display: 'flex', alignItems: 'center', gap: '8px' }) },
                 t('recentSection'),
                 recentFilterActive ? h('span', { style: { fontSize: '12px', fontWeight: 400, opacity: 0.55 } }, '· ' + recentFiltered.length + '/' + recent.length) : null,
@@ -1996,7 +2002,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                               style: { fontSize: '11px', padding: '1px 8px', borderRadius: '6px', cursor: 'pointer', background: 'rgba(230,160,40,0.13)', border: '1px solid ' + TONES.amber.border, color: TONES.amber.fg },
                             }, t('retryOne')))
                         : null,
-                      tr.dropped
+                      tr.unprocessed
+                        ? h('span', { style: { flexShrink: 0, fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: TONES.red.bg, color: TONES.red.fg, border: '1px solid ' + TONES.red.border }, title: t('unprocessedHint') }, t('unprocessedLabel'))
+                        : tr.dropped
                         ? h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.55, fontStyle: 'italic' } }, t('droppedLabel') + ': ' + tr.dropped)
                         : (tr.stageText ? stagePill(tr.stage || '', tr.stageText) : null),
                       tr.ownerLabel ? h('span', { style: { flexShrink: 0, fontSize: '12px', opacity: 0.6 } }, tr.ownerLabel) : null);

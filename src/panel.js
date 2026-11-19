@@ -325,6 +325,7 @@ export function buildOverview({ store, registry, health, now, listDir }) {
     const worst = [...rows].sort((a, b) => (REPLY_PRIORITY[a.state] ?? 9) - (REPLY_PRIORITY[b.state] ?? 9))[0]
     return { state: worst.state ?? 'queued', id: worst.id, attempts: worst.attempts ?? 0, lastError: worst.lastError ?? null, text: replyTextOf(worst) }
   }
+  const nowMs = Date.parse((now ?? (() => new Date().toISOString()))()) || Date.now()
   const recentTriggers = [...triggers.values()]
     .sort((a, b) => String(b.at ?? '').localeCompare(String(a.at ?? '')))
     .slice(0, 12)
@@ -342,11 +343,12 @@ export function buildOverview({ store, registry, health, now, listDir }) {
         stage: tk?.stage ?? null,
         stageText: tk?.stageText ?? null,
         reply: tk?.id ? replyStateFor(tk.id) : (direct ? replyStateForRow(direct) : null),
+        unprocessed: !t.dropped && !tk?.id && !direct
+          && Number.isFinite(Date.parse(t.at ?? '')) && (nowMs - Date.parse(t.at)) > 5 * 60 * 1000,
       }
     })
   // 未受理信号：非 dropped、无票据、无回复、且已超过 5 分钟的触发——
   // 消息进来了却什么都没发生（生产 archived-chief 事故的可见化）。
-  const nowMs = Date.parse((now ?? (() => new Date().toISOString()))()) || Date.now()
   const unprocessedTriggers = [...triggers.values()].filter(t => {
     if (t.dropped) return false
     if (ticketByTriggerId.has(t.id)) return false
