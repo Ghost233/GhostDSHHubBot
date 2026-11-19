@@ -139,6 +139,22 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       statusSection: '状态',
       feishuCard: '飞书',
       githubCard: 'GitHub 监听',
+      githubSection: 'GitHub 监听',
+      githubDisabled: 'GitHub 监听未启用（配置里 github.enabled 未开）',
+      githubEnableHowto: '启用后，Hub Bot 定时轮询各负责人仓库，新 issue/PR 或 @提到会进入任务流。',
+      githubEnableStep1: '编辑 DSH profile 的 cordis.patch.yml，把 hub-bot 配置的 github.enabled 改为 true',
+      githubEnableStep2: '重启 DSH 实例（配置改动需要重启生效）',
+      githubInterval: '轮询间隔',
+      githubIntervalValue: '{n} 分钟',
+      githubHandle: 'Mention 句柄',
+      githubAllowlist: '允许触发者',
+      githubAllowlistEmpty: '未配置（默认仅 gh 登录用户）',
+      githubFollowedTitle: '监听清单（跟随负责人注册表自动推导）',
+      githubNoRepos: '暂无监听仓库',
+      githubWatermark: '水位',
+      githubOwnerCol: '负责人',
+      githubNotInited: '未初始化',
+      githubResolveError: '负责人解析失败：',
       ownersCard: '负责人',
       needsCard: '待我处理',
       connected: '已连接',
@@ -305,6 +321,22 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       statusSection: 'Status',
       feishuCard: 'Feishu',
       githubCard: 'GitHub watch',
+      githubSection: 'GitHub watch',
+      githubDisabled: 'GitHub watch disabled (github.enabled is off in config)',
+      githubEnableHowto: 'Once enabled, Hub Bot polls owner repos on an interval; new issues/PRs or @mentions enter the ticket stream.',
+      githubEnableStep1: 'Edit cordis.patch.yml of the DSH profile: set github.enabled to true in the hub-bot config',
+      githubEnableStep2: 'Restart the DSH instance (config changes require a restart)',
+      githubInterval: 'Poll interval',
+      githubIntervalValue: '{n} min',
+      githubHandle: 'Mention handle',
+      githubAllowlist: 'Allowed authors',
+      githubAllowlistEmpty: 'not set (defaults to the gh login)',
+      githubFollowedTitle: 'Watched repos (derived from the owner registry)',
+      githubNoRepos: 'No watched repos yet',
+      githubWatermark: 'watermark',
+      githubOwnerCol: 'owner',
+      githubNotInited: 'not initialized',
+      githubResolveError: 'Owner resolution failed:',
       ownersCard: 'Owners',
       needsCard: 'Needs me',
       connected: 'Connected',
@@ -789,6 +821,58 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           return h('div', { style: sectionStyle }, h('div', { style: sectionTitleStyle }, t('feishuSection')), rows);
         }
 
+        // GitHub 监听管理块（round 34）：面板此前完全没有 GitHub 区块——状态卡不可点、看不到监听清单。
+        // read() 已带全量 github 状态（每仓库水位/错误），纯客户端渲染即可。
+        function GithubSection(props) {
+          var t = scoped.locale.bind(NS);
+          var gh = (props.view && props.view.github) || {};
+          var enabled = !!gh.enabled;
+          var st = gh.status || {};
+          var repos = st.repos || {};
+          var names = Object.keys(repos);
+          var resolveErrors = gh.resolveErrors || {};
+          var rows = [];
+          if (!enabled) {
+            rows.push(h('div', { key: 'off', style: { display: 'flex', gap: '12px', padding: '13px 15px', borderRadius: '10px', background: 'rgba(230,160,40,0.06)', border: '1px solid rgba(230,160,40,0.25)' } },
+              h('span', { style: { fontSize: '16px', width: '28px', height: '28px', lineHeight: '27px', textAlign: 'center', borderRadius: '50%', background: TONES.amber.bg, border: '1px solid ' + TONES.amber.border, color: TONES.amber.fg, flexShrink: 0 } }, '!'),
+              h('div', { style: { minWidth: 0 } },
+                h('div', { style: { fontSize: '13px', fontWeight: 600 } }, t('githubDisabled')),
+                h('div', { style: { fontSize: '12px', opacity: 0.7, marginTop: '3px', lineHeight: 1.6 } }, t('githubEnableHowto')),
+                h('ol', { style: { fontSize: '12px', opacity: 0.75, margin: '6px 0 0', paddingLeft: '18px', lineHeight: 1.7 } },
+                  h('li', null, t('githubEnableStep1')),
+                  h('li', null, t('githubEnableStep2'))))));
+          } else {
+            var mins = Math.round((gh.intervalMs || 300000) / 60000);
+            var chips = [
+              t('githubInterval') + '：' + fill(t('githubIntervalValue'), mins),
+              t('githubHandle') + '：' + (gh.mentionHandle || '—'),
+              t('githubAllowlist') + '：' + ((gh.loginAllowlist || []).length > 0 ? (gh.loginAllowlist || []).join(', ') : t('githubAllowlistEmpty')),
+            ];
+            rows.push(h('div', { key: 'info', style: { display: 'flex', gap: '16px', flexWrap: 'wrap', fontSize: '12px', opacity: 0.75 } },
+              chips.map(function (c, i) { return h('span', { key: i }, c); })));
+            Object.keys(resolveErrors).forEach(function (ownerKey) {
+              rows.push(h('div', { key: 're-' + ownerKey, style: { marginTop: '6px', fontSize: '12px', color: TONES.red.fg } },
+                t('githubResolveError') + ' ' + ownerKey.replace(/^owner:/, '') + ' — ' + String(resolveErrors[ownerKey]).slice(0, 140)));
+            });
+            rows.push(h('div', { key: 'lt', style: { marginTop: '10px', fontSize: '12px', fontWeight: 600, opacity: 0.65 } }, t('githubFollowedTitle')));
+            if (names.length === 0) {
+              rows.push(h('p', { key: 'empty', style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 0' } }, t('githubNoRepos')));
+            } else {
+              names.forEach(function (name) {
+                var info = repos[name] || {};
+                rows.push(h('div', { key: name, style: { marginTop: '6px', padding: '8px 10px', borderRadius: '8px', background: 'rgba(127,127,127,0.06)', border: '1px solid rgba(127,127,127,0.16)', borderLeft: '3px solid ' + (info.lastError ? TONES.red.border : TONES.blue.border) } },
+                  h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' } },
+                    h('span', { style: { fontFamily: 'monospace', fontSize: '12px', fontWeight: 600 } }, name),
+                    info.workspace ? h('span', { style: { fontSize: '11px', opacity: 0.6 } }, t('githubOwnerCol') + ' ' + info.workspace) : null,
+                    h('span', { style: { fontSize: '11px', opacity: 0.55, marginLeft: 'auto', fontFamily: 'monospace' } },
+                      t('githubWatermark') + ' #' + (info.maxNumber || 0) + (info.initialized ? '' : ' · ' + t('githubNotInited')))),
+                  info.lastError ? h('div', { style: { marginTop: '4px', fontSize: '11px', color: TONES.red.fg, wordBreak: 'break-all' } }, String(info.lastError).slice(0, 160)) : null));
+              });
+            }
+          }
+          return h('div', { id: 'hub-bot-github', style: sectionStyle }, h('div', { style: sectionTitleStyle }, t('githubSection')), rows);
+        }
+
         function HubBotPanelPage() {
           var t = scoped.locale.bind(NS);
           var vs = React.useState(null); var view = vs[0]; var setView = vs[1];
@@ -1198,7 +1282,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               h('div', { style: Object.assign({}, cardStyle, clickableCard('hub-bot-feishu')), onClick: function () { scrollToSection('hub-bot-feishu'); }, title: t('cardJumpHint') }, h('div', { style: cardTitleStyle }, t('feishuCard')), h('div', { style: cardValueStyle }, dot(feishuColor), feishuText), feishuSub ? h('div', { style: cardSubStyle }, feishuSub) : null,
                 lastDropped ? h('div', { style: Object.assign({}, cardSubStyle, { color: TONES.amber.fg, opacity: 0.85 }), title: lastDropped.message || '' },
                   t('droppedCardHint') + ' ' + relTime(t, lastDropped.at) + ' · ' + String(lastDropped.dropped).slice(0, 24)) : null),
-              h('div', { style: cardStyle }, h('div', { style: cardTitleStyle }, t('githubCard')), h('div', { style: cardValueStyle }, dot(githubColor), githubText)),
+              h('div', { style: Object.assign({}, cardStyle, clickableCard('hub-bot-github')), onClick: function () { scrollToSection('hub-bot-github'); }, title: t('cardJumpHint') }, h('div', { style: cardTitleStyle }, t('githubCard')), h('div', { style: cardValueStyle }, dot(githubColor), githubText)),
               h('div', { style: Object.assign({}, cardStyle, clickableCard('hub-bot-owners')), onClick: function () { scrollToSection('hub-bot-owners'); }, title: t('cardJumpHint') }, h('div', { style: cardTitleStyle }, t('ownersCard')), h('div', { style: cardValueStyle }, String(owners.length)), h('div', { style: cardSubStyle }, ownersSub)),
               h('div', { style: Object.assign({}, cardStyle, clickableCard('hub-bot-needs')), onClick: function () { scrollToSection('hub-bot-needs'); }, title: t('cardJumpHint') }, h('div', { style: cardTitleStyle }, t('needsCard')), h('div', { style: cardValueStyle }, dot(needs.length > 0 ? TONES.amber.fg : '#46bb6d'), String(needs.length)), h('div', { style: cardSubStyle }, needsCardSub))),
             healthItems.length ? h('div', { style: {
@@ -1455,7 +1539,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 : h('div', { style: warnStyle }, t('catalogUnavailable')),
               h('div', { style: warnStyle }, t('modelPickerHint'))),
             h('div', { id: 'hub-bot-feishu' },
-              h(FeishuSection, { view: view, onRefresh: refreshView })),
+              h(FeishuSection, { view: view, onRefresh: refreshView }),
+              h(GithubSection, { view: view })),
             h(HubBotRowConfig, { hubBotCtx: scoped, hideModel: true }),
             error ? h('div', { style: { fontSize: '12px', color: TONES.red.fg, marginTop: '8px' } }, error) : null,
             notice ? h('div', { style: { fontSize: '12px', color: TONES.green.fg, marginTop: '8px' } }, notice) : null);
