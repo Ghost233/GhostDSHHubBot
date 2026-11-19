@@ -1534,6 +1534,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                           h('span', { style: { fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: TONES.amber.bg, color: TONES.amber.fg, border: '1px solid ' + TONES.amber.border, flexShrink: 0 } }, t('healthPillRetrying')),
                           h('span', null, (r0.to || '') + ' — ' + (r0.ticketId || '—'))),
                         h('div', { style: { opacity: 0.75, marginTop: '2px' } }, t('healthDetailNext') + ': ' + (r0.nextRetryAt ? relTime(t, r0.nextRetryAt) : '—')),
+                        r0.text ? h('div', { style: { opacity: 0.6, marginTop: '3px', fontSize: '11px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: r0.text }, '「' + String(r0.text).slice(0, 80) + '」') : null,
                         r0.lastError ? h('div', { style: { opacity: 0.75, marginTop: '2px', wordBreak: 'break-all' } }, t('healthDetailLast') + ': ' + String(r0.lastError).slice(0, 140)) : null);
                     })) : null,
               // 死信详情（failed 行——重试耗尽后的最终失败，逐条可查）
@@ -1551,6 +1552,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                             h('span', null, (r0.to || '') + ' — ' + (r0.ticketId || '—') + ' · ' + r0.attempts + ' 次尝试')),
                           h('button', { style: retryBtnStyle, onClick: function () { retryOutbox(r0.id); } }, t('retryOne')),
                           h('button', { style: Object.assign({}, retryBtnStyle, { color: TONES.red.fg, borderColor: TONES.red.border }), title: t('discardOneHint'), onClick: function () { discardOutbox(r0.id); } }, t('discardOne'))),
+                        r0.text ? h('div', { style: { opacity: 0.6, marginTop: '3px', fontSize: '11px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: r0.text }, '「' + String(r0.text).slice(0, 80) + '」') : null,
                         r0.lastError ? h('div', { style: { opacity: 0.75, marginTop: '2px', wordBreak: 'break-all' } }, t('healthDetailLast') + ': ' + String(r0.lastError).slice(0, 140)) : null);
                     })) : null) : null,
              h('div', { id: 'hub-bot-needs', style: Object.assign({}, sectionStyle, needs.length > 0 ? { borderLeft: '3px solid ' + TONES.amber.border, paddingLeft: '14px' } : {}) },

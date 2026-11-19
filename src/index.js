@@ -529,12 +529,12 @@ export function apply(ctx, rawConfig) {
     const count = state => rows.filter(r => r.state === state).length
     const retrying = rows
       .filter(r => r.state === 'queued' && (r.attempts ?? 0) > 0)
-      .map(r => ({ id: r.id, ticketId: r.ticketId ?? null, to: r.to, attempts: r.attempts, nextRetryAt: r.nextRetryAt ?? null, lastError: r.lastError ?? null }))
+      .map(r => ({ id: r.id, ticketId: r.ticketId ?? null, to: r.to, attempts: r.attempts, nextRetryAt: r.nextRetryAt ?? null, lastError: r.lastError ?? null, text: String(r.body ?? r.text ?? '').slice(0, 120) }))
     const problems = rows.filter(r => r.kind === 'system-problem')
     // 死信投影（GUI 健康警告条展开用）: failed 行逐条列出——警告计数可点击查看原因，不再是个死数字。
     const failedList = rows
       .filter(r => r.state === 'failed')
-      .map(r => ({ id: r.id, ticketId: r.ticketId ?? null, to: r.to, attempts: r.attempts ?? 0, lastError: r.lastError ?? null }))
+      .map(r => ({ id: r.id, ticketId: r.ticketId ?? null, to: r.to, attempts: r.attempts ?? 0, lastError: r.lastError ?? null, text: String(r.body ?? r.text ?? '').slice(0, 120) }))
     return {
       feishu: feishu.status(),
       github: await github.status(),
