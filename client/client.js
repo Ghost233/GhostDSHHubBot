@@ -140,6 +140,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       feishuCard: '飞书',
       githubCard: 'GitHub 监听',
       ownersCard: '负责人',
+      needsCard: '待我处理',
       connected: '已连接',
       notConnected: '未连接',
       disabled: '未启用',
@@ -302,6 +303,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       feishuCard: 'Feishu',
       githubCard: 'GitHub watch',
       ownersCard: 'Owners',
+      needsCard: 'Needs me',
       connected: 'Connected',
       notConnected: 'Not connected',
       disabled: 'Disabled',
@@ -621,9 +623,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
         // 面板整页：状态卡片 + 健康警告 + 需要我处理 + 任务流 + 模型选择 + owners 表 + 设置表单。
         var cardRowStyle = { display: 'flex', gap: '12px', flexWrap: 'wrap', marginBottom: '22px' };
         var cardStyle = {
-          flex: '1 1 170px', padding: '14px 16px', borderRadius: '10px',
+          flex: '1 1 0', minWidth: '140px', padding: '14px 16px', borderRadius: '10px',
           border: '1px solid var(--dsh-border, rgba(127,127,127,0.25))',
           background: 'var(--dsh-surface-raised, rgba(127,127,127,0.06))',
+          overflow: 'hidden',
         };
         var cardTitleStyle = { fontSize: '12px', opacity: 0.65, marginBottom: '8px' };
         var cardValueStyle = { fontSize: '14px', fontWeight: 600, display: 'flex', alignItems: 'center' };
@@ -941,11 +944,20 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var lastDropped = (overview.recentTriggers || []).filter(function (tr) { return tr.dropped; })[0] || null;
           var activeSessions = owners.filter(function (o) { return !!o.sessionId; }).length;
           var ownersSub = fill(t('activeSessions'), activeSessions);
-          var cardSubStyle = { fontSize: '11px', opacity: 0.6, marginTop: '2px' };
+          var cardSubStyle = { fontSize: '11px', opacity: 0.6, marginTop: '2px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' };
 
           var tickets = overview.tickets || [];
           var needs = tickets.filter(function (tk) { return NEEDS_ME.indexOf(tk.stage) >= 0; });
           var confirmable = needs.filter(function (tk) { return tk.stage === 'person/confirm'; });
+          // 状态卡第四张（round 32）: 待办计数 + 阶段分解副标。
+          var needsStages = [];
+          needs.forEach(function (tk) {
+            var found = null;
+            for (var i = 0; i < needsStages.length; i++) if (needsStages[i].stage === tk.stage) found = needsStages[i];
+            if (!found) { found = { stage: tk.stage, label: tk.stageText || tk.stage, count: 0 }; needsStages.push(found); }
+            found.count++;
+          });
+          var needsCardSub = needs.length === 0 ? t('quiet') : needsStages.map(function (s) { return s.label + ' ' + s.count; }).join(' · ');
           var selectedCount = confirmable.filter(function (tk) { return selected[tk.id]; }).length;
           var allSelected = confirmable.length > 0 && selectedCount === confirmable.length;
           // 任务流过滤器（round 7）: 文本（消息/负责人/工单号）+ 阶段。只作用于任务流区，
@@ -1173,7 +1185,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 lastDropped ? h('div', { style: Object.assign({}, cardSubStyle, { color: TONES.amber.fg, opacity: 0.85 }), title: lastDropped.message || '' },
                   t('droppedCardHint') + ' ' + relTime(t, lastDropped.at) + ' · ' + String(lastDropped.dropped).slice(0, 24)) : null),
               h('div', { style: cardStyle }, h('div', { style: cardTitleStyle }, t('githubCard')), h('div', { style: cardValueStyle }, dot(githubColor), githubText)),
-              h('div', { style: Object.assign({}, cardStyle, clickableCard('hub-bot-owners')), onClick: function () { scrollToSection('hub-bot-owners'); }, title: t('cardJumpHint') }, h('div', { style: cardTitleStyle }, t('ownersCard')), h('div', { style: cardValueStyle }, String(owners.length)), h('div', { style: cardSubStyle }, ownersSub))),
+              h('div', { style: Object.assign({}, cardStyle, clickableCard('hub-bot-owners')), onClick: function () { scrollToSection('hub-bot-owners'); }, title: t('cardJumpHint') }, h('div', { style: cardTitleStyle }, t('ownersCard')), h('div', { style: cardValueStyle }, String(owners.length)), h('div', { style: cardSubStyle }, ownersSub)),
+              h('div', { style: Object.assign({}, cardStyle, clickableCard('hub-bot-needs')), onClick: function () { scrollToSection('hub-bot-needs'); }, title: t('cardJumpHint') }, h('div', { style: cardTitleStyle }, t('needsCard')), h('div', { style: cardValueStyle }, dot(needs.length > 0 ? TONES.amber.fg : '#46bb6d'), String(needs.length)), h('div', { style: cardSubStyle }, needsCardSub))),
             healthItems.length ? h('div', { style: {
               padding: '10px 14px', borderRadius: '8px', marginBottom: '18px', fontSize: '13px',
               background: 'rgba(230,160,40,0.1)', border: '1px solid rgba(230,160,40,0.35)', color: TONES.amber.fg,
@@ -1206,7 +1219,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                           h('button', { style: retryBtnStyle, onClick: function () { retryOutbox(r0.id); } }, t('retryOne'))),
                         r0.lastError ? h('div', { style: { opacity: 0.75, marginTop: '2px', wordBreak: 'break-all' } }, t('healthDetailLast') + ': ' + String(r0.lastError).slice(0, 140)) : null);
                     })) : null) : null,
-             h('div', { style: Object.assign({}, sectionStyle, needs.length > 0 ? { borderLeft: '3px solid ' + TONES.amber.border, paddingLeft: '14px' } : {}) },
+             h('div', { id: 'hub-bot-needs', style: Object.assign({}, sectionStyle, needs.length > 0 ? { borderLeft: '3px solid ' + TONES.amber.border, paddingLeft: '14px' } : {}) },
                h('div', { style: Object.assign({}, sectionTitleStyle, { display: 'flex', alignItems: 'center', gap: '8px' }) },
                  h('span', null, t('needsMe'),
                    needs.length > 0 ? h('span', { style: { marginLeft: '8px', fontSize: '12px', fontWeight: 400, color: TONES.amber.fg } }, '· ' + needs.length) : null),
