@@ -244,6 +244,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       copyIdBtn: '复制',
       copiedBtn: '已复制',
       copyIdHint: '复制工单号',
+      settingsDivider: '设置',
       feishuMetricsTitle: '连接质量：',
       feishuMetricsReconnects: '重连 {count} 次',
       feishuMetricsLastConnected: '最近连接',
@@ -390,6 +391,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       copyIdBtn: 'Copy',
       copiedBtn: 'Copied',
       copyIdHint: 'Copy ticket id',
+      settingsDivider: 'Settings',
       feishuMetricsTitle: 'Connection:',
       feishuMetricsReconnects: '{count} reconnects',
       feishuMetricsLastConnected: 'last connected',
@@ -430,6 +432,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
     };
     var sectionStyle = { marginBottom: '20px' };
     var sectionTitleStyle = { fontSize: '13px', fontWeight: 600, marginBottom: '10px' };
+    function sectionDivider(label, id) {
+      return h('div', { id: id, style: { display: 'flex', alignItems: 'center', gap: '12px', margin: '26px 0 14px' } },
+        h('div', { style: { flex: '0 0 auto', fontSize: '11px', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', opacity: 0.5 } }, label),
+        h('div', { style: { flex: '1 1 auto', height: '1px', background: 'var(--dsh-border, rgba(127,127,127,0.25))' } }));
+    }
     var warnStyle = { fontSize: '12px', opacity: 0.65, marginTop: '4px' };
 
     function HubBotRowConfig(props) {
@@ -1220,21 +1227,6 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                         : (tr.stageText ? stagePill(tr.stage || '', tr.stageText) : null),
                       tr.ownerLabel ? h('span', { style: { flexShrink: 0, fontSize: '12px', opacity: 0.6 } }, tr.ownerLabel) : null);
                   })),
-            h('div', { style: sectionStyle },
-              h('div', { style: sectionTitleStyle }, t('modelSection')),
-              catalog && catalog.groups
-                ? h('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', maxWidth: '560px', flexWrap: 'wrap' } },
-                    h('select', {
-                      style: Object.assign({}, inputStyle, { flex: '1 1 260px' }), value: modelChoice, disabled: modelBusy,
-                      onChange: function (ev) { setModelChoice(ev.target.value); setModelDone(false); },
-                    }, modelOptions),
-                    h('button', {
-                      onClick: saveModel, disabled: modelBusy,
-                      style: Object.assign({}, inputStyle, { width: 'auto', cursor: 'pointer', padding: '6px 16px', whiteSpace: 'nowrap' }),
-                    }, modelBusy ? t('modelApplying') : t('modelApply')),
-                    modelDone ? h('span', { style: { fontSize: '12px', color: TONES.green.fg, whiteSpace: 'nowrap' } }, t('modelApplied')) : null)
-                : h('div', { style: warnStyle }, t('catalogUnavailable')),
-              h('div', { style: warnStyle }, t('modelPickerHint'))),
             h('div', { style: sectionStyle, id: 'hub-bot-owners' },
               h('div', { style: sectionTitleStyle }, t('ownersSection'),
                 owners.length > 0 ? h('span', { style: { marginLeft: '8px', fontSize: '12px', fontWeight: 400, opacity: 0.55 } }, '· ' + owners.length) : null),
@@ -1284,6 +1276,22 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                               : null;
                           })()));
                     }))),
+            sectionDivider(t('settingsDivider'), 'hub-bot-settings'),
+            h('div', { style: sectionStyle },
+              h('div', { style: sectionTitleStyle }, t('modelSection')),
+              catalog && catalog.groups
+                ? h('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', maxWidth: '560px', flexWrap: 'wrap' } },
+                    h('select', {
+                      style: Object.assign({}, inputStyle, { flex: '1 1 260px' }), value: modelChoice, disabled: modelBusy,
+                      onChange: function (ev) { setModelChoice(ev.target.value); setModelDone(false); },
+                    }, modelOptions),
+                    h('button', {
+                      onClick: saveModel, disabled: modelBusy,
+                      style: Object.assign({}, inputStyle, { width: 'auto', cursor: 'pointer', padding: '6px 16px', whiteSpace: 'nowrap' }),
+                    }, modelBusy ? t('modelApplying') : t('modelApply')),
+                    modelDone ? h('span', { style: { fontSize: '12px', color: TONES.green.fg, whiteSpace: 'nowrap' } }, t('modelApplied')) : null)
+                : h('div', { style: warnStyle }, t('catalogUnavailable')),
+              h('div', { style: warnStyle }, t('modelPickerHint'))),
             h('div', { id: 'hub-bot-feishu' },
               h(FeishuSection, { view: view, onRefresh: refreshView })),
             h(HubBotRowConfig, { hubBotCtx: scoped, hideModel: true }),
