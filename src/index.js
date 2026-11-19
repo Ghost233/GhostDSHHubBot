@@ -580,7 +580,7 @@ export function apply(ctx, rawConfig) {
         retrying,
         failedList,
         systemProblems: problems.length,
-        recentProblems: problems.slice(-5).map(r => ({ id: r.id, ticketId: r.ticketId ?? null, body: String(r.body ?? '').slice(0, 200) })),
+        recentProblems: problems.slice(-5).map(r => ({ id: r.id, ticketId: r.ticketId ?? null, body: String(r.body ?? '').slice(0, 200), at: r.createdAt ?? null })),
       },
     }
   }

@@ -282,6 +282,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       droppedLabel: '未受理',
       healthDetailRetry: '重试中',
       healthDetailDead: '投递失败（死信）',
+      healthSysProblems: '系统问题 {n} 条（展开查看）',
+      healthDetailSys: '系统问题',
+      healthPillSys: '系统',
       retryOne: '重投',
       retryAll: '全部重投',
       discardOne: '丢弃',
@@ -529,6 +532,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       droppedLabel: 'dropped',
       healthDetailRetry: 'retrying',
       healthDetailDead: 'failed deliveries (dead letters)',
+      healthSysProblems: '{n} system problem(s) (expand to view)',
+      healthDetailSys: 'System problems',
+      healthPillSys: 'system',
       retryOne: 'Retry',
       retryAll: 'Retry all',
       discardOne: 'Discard',
@@ -889,6 +895,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           if (gh.enabled && gh.lastPollError) items.push(t('healthGithubPoll') + '：' + gh.lastPollError);
           var ob = health.outbox || {};
           if (ob.failed > 0) items.push(fill(t('healthOutboxFailed'), ob.failed));
+          if (ob.systemProblems > 0) items.push(fill(t('healthSysProblems'), ob.systemProblems));
           return items;
         }
 
@@ -1730,6 +1737,18 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                           h('button', { style: Object.assign({}, retryBtnStyle, { color: TONES.red.fg, borderColor: TONES.red.border }), title: t('discardOneHint'), onClick: function () { discardOutbox(r0.id); } }, t('discardOne'))),
                         r0.text ? h('div', { style: { opacity: 0.6, marginTop: '3px', fontSize: '11px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: r0.text }, '「' + String(r0.text).slice(0, 80) + '」') : null,
                         r0.lastError ? h('div', { style: { opacity: 0.75, marginTop: '2px', wordBreak: 'break-all' } }, t('healthDetailLast') + ': ' + String(r0.lastError).slice(0, 140)) : null);
+                    })) : null,
+              // 系统问题明细（插件自己上报的故障：死信通知、恢复失败等——红色的最高优先级信号）
+              (overview.health && overview.health.outbox && (overview.health.outbox.recentProblems || []).length > 0)
+                ? h('details', { style: { marginTop: '4px' } },
+                    h('summary', { style: { cursor: 'pointer', color: TONES.red.fg, opacity: 0.95 } }, t('healthDetailSys') + ' · ' + (overview.health.outbox.systemProblems || 0)),
+                    overview.health.outbox.recentProblems.map(function (rp) {
+                      return h('div', { key: rp.id, style: { marginTop: '6px', padding: '6px 8px', background: 'rgba(0,0,0,0.18)', borderRadius: '6px', fontSize: '12px', borderLeft: '2px solid ' + TONES.red.border } },
+                        h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+                          h('span', { style: { fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: TONES.red.bg, color: TONES.red.fg, border: '1px solid ' + TONES.red.border, flexShrink: 0 } }, t('healthPillSys')),
+                          h('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: rp.ticketId || '' }, rp.ticketId || '—'),
+                          rp.at ? h('span', { style: { marginLeft: 'auto', opacity: 0.5, fontSize: '11px', flexShrink: 0 } }, relTime(t, rp.at)) : null),
+                        h('div', { style: { opacity: 0.8, marginTop: '3px', wordBreak: 'break-word' } }, rp.body || '—')); 
                     })) : null) : null,
              h('div', { id: 'hub-bot-needs', style: Object.assign({}, sectionStyle, needs.length > 0 ? { borderLeft: '3px solid ' + TONES.amber.border, paddingLeft: '14px' } : {}) },
                h('div', { style: Object.assign({}, sectionTitleStyle, { display: 'flex', alignItems: 'center', gap: '8px' }) },
