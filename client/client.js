@@ -320,6 +320,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       expandAll: '全部展开',
       collapseAll: '全部收起',
       expandAllHint: '展开或收起任务流的全部阶段分组',
+      ownerClickHint: '点击在任务流中只看这个负责人',
       runningLabel: '已运行',
       runningHint: '进入执行阶段的时长（按最近一次状态变化起算）',
       showMoreInGroup: '展开剩余 {count} 条',
@@ -577,6 +578,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       expandAll: 'Expand all',
       collapseAll: 'Collapse all',
       expandAllHint: 'Expand or collapse every stage group in the stream',
+      ownerClickHint: 'Click to filter the stream to this owner',
       runningLabel: 'running',
       runningHint: 'Time since entering the working stage (from the last status change)',
       showMoreInGroup: 'Show {count} more',
@@ -1487,7 +1489,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               tk.trigger && tk.trigger.kind
                 ? h('span', { style: { flexShrink: 0, fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: tk.trigger.kind === 'feishu' ? 'rgba(70,150,255,0.14)' : 'rgba(150,150,150,0.14)', color: tk.trigger.kind === 'feishu' ? '#7db8ff' : 'rgba(200,200,200,0.8)', border: '1px solid ' + (tk.trigger.kind === 'feishu' ? 'rgba(70,150,255,0.3)' : 'rgba(150,150,150,0.25)') }, title: t('originHint') }, kindLabel(tk.trigger.kind))
                 : null,
-              h('span', { style: { fontWeight: 600, whiteSpace: 'nowrap' } }, tk.ownerLabel || tk.owner),
+              h('span', { style: { fontWeight: 600, whiteSpace: 'nowrap', cursor: 'pointer' }, title: t('ownerClickHint'), onClick: function (ev) { ev.stopPropagation(); setFilterOwner(tk.ownerLabel || tk.owner); scrollToSection('hub-bot-stream'); } }, tk.ownerLabel || tk.owner),
               h('span', {
                 style: { flex: 1, opacity: 0.85, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: tk.message ? 'pointer' : 'default' },
                 title: tk.message ? String(tk.message) + '\n' + t('copyMsgHint') : '',
@@ -1911,7 +1913,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                             title: t('doneExpandHint'),
                             style: { display: 'flex', alignItems: 'baseline', gap: '8px', padding: '4px 8px', borderRadius: '6px', fontSize: '12px', opacity: 0.75, cursor: 'pointer' } },
                             h('span', { style: { flexShrink: 0, color: TONES.green.fg, fontSize: '11px' } }, '✓'),
-                            tk.ownerLabel ? h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.6 } }, tk.ownerLabel) : null,
+                            tk.ownerLabel ? h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.6, cursor: 'pointer' }, title: t('ownerClickHint'), onClick: function (ev) { ev.stopPropagation(); setFilterOwner(tk.ownerLabel); scrollToSection('hub-bot-stream'); } }, tk.ownerLabel) : null,
                             h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, tk.message || '—'),
                             h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.5 } }, relTime(t, tk.updatedAt || tk.createdAt)));
                         }
@@ -2007,7 +2009,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                         : tr.dropped
                         ? h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.55, fontStyle: 'italic' } }, t('droppedLabel') + ': ' + tr.dropped)
                         : (tr.stageText ? stagePill(tr.stage || '', tr.stageText) : null),
-                      tr.ownerLabel ? h('span', { style: { flexShrink: 0, fontSize: '12px', opacity: 0.6 } }, tr.ownerLabel) : null);
+                      tr.ownerLabel ? h('span', { style: { flexShrink: 0, fontSize: '12px', opacity: 0.6, cursor: 'pointer' }, title: t('ownerClickHint'), onClick: function (ev) { ev.stopPropagation(); setFilterOwner(tr.ownerLabel); scrollToSection('hub-bot-stream'); } }, tr.ownerLabel) : null);
                   }))),
             h('div', { style: sectionStyle, id: 'hub-bot-owners' },
               h('div', { style: sectionTitleStyle }, t('ownersSection'),
