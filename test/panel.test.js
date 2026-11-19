@@ -9,6 +9,7 @@ import { mkdtempSync, rmSync, writeFileSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Store } from '../src/store.js'
+import { insertOutbox } from '../src/outbox.js'
 import { OwnerRegistry } from '../src/registry.js'
 import { Router } from '../src/router.js'
 import { resolveConfig } from '../src/config.js'
@@ -205,6 +206,22 @@ test('overview lists artifacts for working tickets too (round 45)', async () => 
     const ticket = overview.tickets.find(t => t.id === r1.ticketId)
     assert.equal(ticket.stage, 'working')
     assert.deepEqual(ticket.dirListing, listing, '进行中的票也列产物目录')
+  } finally {
+    cleanup()
+  }
+})
+
+test('overview reply projection carries the reply text snippet (round 54)', async () => {
+  const { router, registry, store, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'DSH-Workflow', cwd: '/repos/DSH-Workflow' })
+    const r1 = await router.routeToOwner({ ownerId: owner.id, message: '看一下状态' })
+    // failed 优先级最低（最差），在路由器自己的通知行之上确定性地胜出
+    insertOutbox(store, { ticketId: r1.ticketId, kind: 'reply', to: 'feishu:chat:oc_x', body: '队列空闲，三张票在跑', state: 'failed', sessionId: null, requestId: null }, () => new Date().toISOString())
+    const overview = buildOverview({ store, registry })
+    const msg = overview.recentTriggers.find(t => t.message === '看一下状态')
+    assert.equal(msg.reply?.state, 'failed')
+    assert.equal(msg.reply?.text, '队列空闲，三张票在跑', '回复正文片段随投影下发（tooltip/复制用）')
   } finally {
     cleanup()
   }

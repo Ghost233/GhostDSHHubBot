@@ -317,12 +317,13 @@ export function buildOverview({ store, registry, health, now, listDir }) {
       .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')))
     return rows[0] ?? null
   }
-  const replyStateForRow = row => ({ state: row.state ?? 'queued', id: row.id, attempts: row.attempts ?? 0, lastError: row.lastError ?? null })
+  const replyTextOf = row => String(row.body ?? row.text ?? '').slice(0, 120)
+  const replyStateForRow = row => ({ state: row.state ?? 'queued', id: row.id, attempts: row.attempts ?? 0, lastError: row.lastError ?? null, text: replyTextOf(row) })
   const replyStateFor = ticketId => {
     const rows = outboxByTicket.get(ticketId)
     if (!rows || rows.length === 0) return null
     const worst = [...rows].sort((a, b) => (REPLY_PRIORITY[a.state] ?? 9) - (REPLY_PRIORITY[b.state] ?? 9))[0]
-    return { state: worst.state ?? 'queued', id: worst.id, attempts: worst.attempts ?? 0, lastError: worst.lastError ?? null }
+    return { state: worst.state ?? 'queued', id: worst.id, attempts: worst.attempts ?? 0, lastError: worst.lastError ?? null, text: replyTextOf(worst) }
   }
   const recentTriggers = [...triggers.values()]
     .sort((a, b) => String(b.at ?? '').localeCompare(String(a.at ?? '')))

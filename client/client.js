@@ -308,6 +308,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       activeTicketsLabel: '{count} 活跃票据',
       ownerFilterHint: '点击只看这位负责人的票据',
       replySent: '已回复',
+      replyCopyHint: '点击复制回复内容',
       replyRecorded: '已注入会话',
       replyPending: '投递中',
       replyFailed: '回复投递失败',
@@ -536,6 +537,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       activeTicketsLabel: '{count} active tickets',
       ownerFilterHint: 'Click to show only this owner’s tickets',
       replySent: 'replied',
+      replyCopyHint: 'Click to copy the reply text',
       replyRecorded: 'injected',
       replyPending: 'delivering',
       replyFailed: 'reply delivery failed',
@@ -1815,10 +1817,14 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                       h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.88 } }, tr.message || '—'),
                       // 回复投递闭环指示： 已回复(绿) / 已注入(灰) / 投递中(琥珀) / 投递失败(红+行内重投)
                       tr.reply && tr.reply.state === 'sent'
-                        ? h('span', { style: { flexShrink: 0, display: 'inline-flex', alignItems: 'center', fontSize: '11px', color: TONES.green.fg } }, dot('#46bb6d'), t('replySent'))
+                        ? h('span', {
+                            style: { flexShrink: 0, display: 'inline-flex', alignItems: 'center', fontSize: '11px', color: copiedId === 'rpl:' + tr.reply.id ? TONES.green.fg : TONES.green.fg, cursor: tr.reply.text ? 'pointer' : 'default' },
+                            title: tr.reply.text ? String(tr.reply.text) + '\n' + t('replyCopyHint') : '',
+                            onClick: tr.reply.text ? function (ev) { ev.stopPropagation(); copyText(String(tr.reply.text), 'rpl:' + tr.reply.id); } : undefined,
+                          }, dot('#46bb6d'), copiedId === 'rpl:' + tr.reply.id ? t('copiedBtn') : t('replySent'))
                         : null,
                       tr.reply && tr.reply.state === 'recorded'
-                        ? h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.5 } }, t('replyRecorded'))
+                        ? h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.5 }, title: tr.reply.text || '' }, t('replyRecorded'))
                         : null,
                       tr.reply && (tr.reply.state === 'queued' || tr.reply.state === 'held')
                         ? h('span', { style: { flexShrink: 0, fontSize: '11px', color: TONES.amber.fg } }, t('replyPending'))
