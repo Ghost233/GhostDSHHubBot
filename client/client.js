@@ -166,6 +166,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       patternsEmptyWarn: '⚠ 黑名单为空——危险命令将不再被拦截确认。',
       slotsInvalid: '并发槽必须是 ≥ 1 的整数',
       reportMinInvalid: '汇报间隔必须是 ≥ 1 的整数分钟',
+      updatedAt: '数据更新于',
+      refreshBtn: '刷新',
+      refreshHint: '重新拉取状态、票据与设置',
+      autoRefreshHint: '每 15s 自动刷新',
       ownersCard: '负责人',
       needsCard: '待我处理',
       connected: '已连接',
@@ -359,6 +363,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       patternsEmptyWarn: '⚠ Empty blacklist — dangerous commands will no longer be held for confirmation.',
       slotsInvalid: 'Slots must be an integer ≥ 1',
       reportMinInvalid: 'Report interval must be an integer ≥ 1 minute',
+      updatedAt: 'updated',
+      refreshBtn: 'Refresh',
+      refreshHint: 'Reload status, tickets and settings',
+      autoRefreshHint: 'auto-refresh every 15s',
       ownersCard: 'Owners',
       needsCard: 'Needs me',
       connected: 'Connected',
@@ -968,6 +976,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var es = React.useState(null); var error = es[0]; var setError = es[1];
           var nts = React.useState(''); var notice = nts[0]; var setNotice = nts[1];
           var noticeSeq = React.useRef(0);
+          var lls = React.useState(null); var lastLoadedAt = lls[0]; var setLastLoadedAt = lls[1];
           var ms = React.useState(''); var modelChoice = ms[0]; var setModelChoice = ms[1];
           var bs = React.useState(false); var modelBusy = bs[0]; var setModelBusy = bs[1];
           var ds = React.useState(false); var modelDone = ds[0]; var setModelDone = ds[1];
@@ -989,6 +998,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             ]).then(function (r) {
               var v = unwrap(r[0]); var ow = unwrap(r[1]); var cat = unwrap(r[2]); var board = unwrap(r[3]);
               setView(v); setOwners(Array.isArray(ow) ? ow : []); setCatalog(cat); setOverview(board);
+              setLastLoadedAt(new Date().toISOString());
               var m = v.chief && v.chief.model;
               setModelChoice(m ? m.provider + '/' + m.model : '');
             }).catch(function (e) { setError(e && e.message ? e.message : String(e)); });
@@ -1364,6 +1374,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
 
           return h('div', { style: { padding: '20px 24px', overflowY: 'auto', height: '100%', boxSizing: 'border-box' } },
             h('h2', { style: { fontSize: '17px', fontWeight: 600, margin: '0 0 18px' } }, t('title')),
+            h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '14px' } },
+              h('span', { style: { fontSize: '16px', fontWeight: 700 } }, 'Hub Bot'),
+              view && view.version ? h('span', { style: { fontSize: '11px', fontFamily: 'monospace', padding: '1px 8px', borderRadius: '999px', background: 'rgba(127,127,127,0.1)', border: '1px solid rgba(127,127,127,0.2)', opacity: 0.75 } }, 'v' + view.version) : null,
+              lastLoadedAt ? h('span', { style: { fontSize: '11px', opacity: 0.55 } }, t('updatedAt') + ' ' + relTime(t, lastLoadedAt)) : null,
+              h('span', { style: { fontSize: '11px', opacity: 0.4 } }, t('autoRefreshHint')),
+              h('button', { onClick: function () { load(); }, title: t('refreshHint'), style: { marginLeft: 'auto', fontSize: '11px', padding: '3px 12px', borderRadius: '6px', cursor: 'pointer', background: 'rgba(127,127,127,0.08)', border: '1px solid rgba(127,127,127,0.22)', opacity: 0.85 } }, '\u21bb ' + t('refreshBtn'))),
             h('div', { style: cardRowStyle },
               h('div', { style: Object.assign({}, cardStyle, clickableCard('hub-bot-feishu')), onClick: function () { scrollToSection('hub-bot-feishu'); }, title: t('cardJumpHint') }, h('div', { style: cardTitleStyle }, t('feishuCard')), h('div', { style: cardValueStyle }, dot(feishuColor), feishuText), feishuSub ? h('div', { style: cardSubStyle }, feishuSub) : null,
                 lastDropped ? h('div', { style: Object.assign({}, cardSubStyle, { color: TONES.amber.fg, opacity: 0.85 }), title: lastDropped.message || '' },

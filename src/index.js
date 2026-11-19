@@ -27,6 +27,9 @@ import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import z from '@deepseek-ai/schemastery'
 import { resolveConfig } from './config.js'
+
+/** 面板头部栏展示用（round 36）：read() 视图带上插件版本。 */
+const PKG_VERSION = createRequire(import.meta.url)('../package.json').version
 import {
   SETTINGS_FILE, applySettingsOverlay, applySettingsPatch, loadSettingsOverlay, mergeSettingsOverlay,
   saveSettingsOverlay, buildOverview, buildSettingsView,
@@ -308,6 +311,7 @@ export function apply(ctx, rawConfig) {
       const svg = qrSvgFor(qr.url)
       if (svg) view.feishu.status.qr = { ...qr, svg }
     }
+    view.version = PKG_VERSION
     return view
   }
 
