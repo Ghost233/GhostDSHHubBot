@@ -31,6 +31,8 @@ description: 发布 dsh-hub-bot 插件新版本：升版本号、打包 tarball�
 - asset 上传报 DNS/网络错（uploads.github.com）：release 对象可能未留下，重跑 create
 - release 已存在缺 asset：`gh release upload vX.Y.Z <tgz>` 补传
 - 发错版本：gh release delete + 删 tag 重发
+- 发版脚本遇到工具异常/疑似没跑：**先 `job_list` 确认后台任务再重试**——v0.34.0 曾并发双跑产生重复提交对、版本号误标 0.35.0，事后变基清理 + 强推才收拾干净。重跑前还要核对 feat 提交真的含功能文件（v0.34.0 恢复教训：重复对里只有一对带 client.js，删错对会把功能删没）
+- git push 403（钥匙串身份不是 Ghost233）：用一次性凭据 `git -c credential.helper='!f() { echo username=Ghost233; echo password=$(GH_CONFIG_DIR=... gh auth token); }; f' push`
 
 ## 铁律
 
