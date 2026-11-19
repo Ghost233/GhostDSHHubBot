@@ -201,6 +201,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       catalogUnavailable: '模型目录不可用',
       refresh: '刷新',
       modelPickerHint: '修改立即生效；「跟随部署默认」使用当前 DSH 配置的默认模型。',
+      modelDefaultNow: '当前默认：{n}',
       needsMe: '需要我处理',
       quiet: '没有 — 一切安静。',
       quietHint: '没有待确认、待回答或待验收的事。新消息进来时会出现在这里。',
@@ -329,6 +330,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       chiefTitle: 'L1 workspace title (a name you set yourself is never overwritten)',
       modelSection: 'Chief model',
       modelFollow: 'Follows the deployment default',
+      modelDefaultNow: 'Current default: {n}',
       modelHint: 'Change the model in the Hub Bot panel (chief model card).',
       save: 'Save',
       saving: 'Saving…',
@@ -1383,6 +1385,14 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 })));
             });
           }
+          // 默认透明化（round 38）：「跟随部署默认」要看得见默认到底是谁。
+          var defaultModelLabel = null;
+          if (catalog && catalog.groups && catalog.default && catalog.default.provider) {
+            var dg = null;
+            catalog.groups.forEach(function (g) { if (g.id === catalog.default.provider) dg = g; });
+            var dm = dg ? (dg.models || []).find(function (m) { return m.id === catalog.default.model; }) : null;
+            defaultModelLabel = (dg ? (dg.name || dg.id) : catalog.default.provider) + ' · ' + (dm ? (dm.name || dm.id) : (catalog.default.model || '?'));
+          }
 
           return h('div', { style: { padding: '20px 24px', overflowY: 'auto', height: '100%', boxSizing: 'border-box' } },
             h('h2', { style: { fontSize: '17px', fontWeight: 600, margin: '0 0 18px' } }, t('title')),
@@ -1653,6 +1663,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     }, modelBusy ? t('modelApplying') : t('modelApply')),
                     modelDone ? h('span', { style: { fontSize: '12px', color: TONES.green.fg, whiteSpace: 'nowrap' } }, t('modelApplied')) : null)
                 : h('div', { style: warnStyle }, t('catalogUnavailable')),
+              modelChoice === '' && defaultModelLabel ? h('div', { style: Object.assign({}, warnStyle, { color: TONES.blue.fg, opacity: 0.85 }) }, fill(t('modelDefaultNow'), defaultModelLabel)) : null,
               h('div', { style: warnStyle }, t('modelPickerHint'))),
             h('div', { id: 'hub-bot-feishu' },
               h(FeishuSection, { view: view, onRefresh: refreshView }),
