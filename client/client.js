@@ -876,6 +876,14 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             var p = function (n) { return String(n).padStart(2, '0'); };
             return p(d.getHours()) + ':' + p(d.getMinutes());
         }
+        // durText(ms)：时长文本，时间线间隔与等待徽章共用一套刻度（round 64）。
+        function durText(ms, t) {
+          if (!(ms >= 0)) ms = 0;
+          if (ms < 60e3) return t('durNow');
+          if (ms < 3600e3) return fill(t('durMin'), Math.floor(ms / 60e3));
+          if (ms < 24 * 3600e3) return fill(t('durHour'), Math.floor(ms / 3600e3));
+          return fill(t('durDay'), Math.floor(ms / (24 * 3600e3)));
+        }
         function relTime(t, iso) {
           if (!iso) return '';
           var diff = Date.now() - new Date(iso).getTime();
@@ -1476,11 +1484,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     var waitMs = Date.now() - new Date(tk.updatedAt || tk.createdAt).getTime();
                     if (!(waitMs >= 0)) waitMs = 0;
                     var waitTone = waitMs >= 2 * 3600e3 ? TONES.red : waitMs >= 30 * 60e3 ? TONES.amber : TONES.gray;
-                    var dur;
-                    if (waitMs < 60e3) dur = t('durNow');
-                    else if (waitMs < 3600e3) dur = fill(t('durMin'), Math.floor(waitMs / 60e3));
-                    else if (waitMs < 24 * 3600e3) dur = fill(t('durHour'), Math.floor(waitMs / 3600e3));
-                    else dur = fill(t('durDay'), Math.floor(waitMs / (24 * 3600e3)));
+                    var dur = durText(waitMs, t);
                     return h('span', { style: { flexShrink: 0, fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: waitTone.bg, color: waitTone.fg, border: '1px solid ' + waitTone.border, whiteSpace: 'nowrap' }, title: t('waitingHint') }, t('waitingLabel') + ' ' + dur);
                   })()
                 : null,
@@ -1613,7 +1617,18 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               h('div', { style: { marginTop: '6px', paddingLeft: '4px', display: 'flex', flexDirection: 'column' } },
                 evs.map(function (ev, i) {
                   var tone = TONES[ev.tone] || TONES.gray;
-                  return h('div', { key: i, style: { display: 'flex', alignItems: 'baseline', gap: '8px', padding: '2px 0' } },
+                  var gapRow = null;
+                  if (i > 0) {
+                    var prevAt = new Date(evs[i - 1].at || '').getTime();
+                    var curAt = new Date(ev.at || '').getTime();
+                    var gapMs = (isFinite(prevAt) && isFinite(curAt)) ? curAt - prevAt : 0;
+                    if (gapMs >= 60e3) {
+                      gapRow = h('div', { key: 'g' + i, style: { display: 'flex', alignItems: 'baseline', gap: '8px', padding: '0 0 0 4px' } },
+                        h('span', { style: { flexShrink: 0, width: '8px', borderLeft: '1px dashed rgba(127,127,127,0.35)', alignSelf: 'stretch', marginLeft: '3px' } }),
+                        h('span', { style: { opacity: 0.4, fontFamily: 'monospace', fontSize: '10px' } }, '+' + durText(gapMs, t)));
+                    }
+                  }
+                  var evRow = h('div', { key: i, style: { display: 'flex', alignItems: 'baseline', gap: '8px', padding: '2px 0' } },
                     h('span', { style: { flexShrink: 0, width: '8px', height: '8px', borderRadius: '999px', background: ev.current ? tone.border : 'transparent', border: '2px solid ' + tone.border, alignSelf: 'center' } }),
                     h('span', { style: { flexShrink: 0, opacity: 0.5, fontFamily: 'monospace', fontSize: '11px', minWidth: '42px' }, title: ev.at || '' }, ev.at ? hhmm(ev.at) : '—'),
                     h('span', { style: { flexShrink: 0, color: tone.fg, fontWeight: ev.current ? 600 : 400 } }, ev.label),
@@ -1622,6 +1637,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                       title: ev.copy ? ev.copy + String.fromCharCode(10) + t('copySessionHint') : undefined,
                       onClick: ev.copy ? function (e2) { e2.preventDefault(); copyText(ev.copy, 'tl:' + ev.copy); } : undefined,
                     }, ev.detail) : null);
+                  return gapRow ? [gapRow, evRow] : evRow;
                 })),
                tk.stage !== 'person/review' && Array.isArray(tk.dirListing) && tk.dirListing.length > 0
                  ? h('div', { style: { marginTop: '8px' } },
