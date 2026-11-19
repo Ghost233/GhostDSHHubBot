@@ -313,6 +313,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       expandAll: '全部展开',
       collapseAll: '全部收起',
       expandAllHint: '展开或收起任务流的全部阶段分组',
+      copyDigestBtn: '复制待办摘要',
+      copyDigestHint: '把待办列表复制成纯文本（可贴到飞书/笔记）',
       revertBtn: '还原',
       revertHint: '放弃修改，回到已保存的值',
       copyMsgHint: '点击复制原文',
@@ -557,6 +559,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       expandAll: 'Expand all',
       collapseAll: 'Collapse all',
       expandAllHint: 'Expand or collapse every stage group in the stream',
+      copyDigestBtn: 'Copy digest',
+      copyDigestHint: 'Copy the needs-me list as plain text (paste to Feishu/notes)',
       revertBtn: 'Revert',
       revertHint: 'Discard changes and restore the saved values',
       copyMsgHint: 'Click to copy the original message',
@@ -1729,6 +1733,19 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                h('div', { style: Object.assign({}, sectionTitleStyle, { display: 'flex', alignItems: 'center', gap: '8px' }) },
                  h('span', null, t('needsMe'),
                    needs.length > 0 ? h('span', { style: { marginLeft: '8px', fontSize: '12px', fontWeight: 400, color: TONES.amber.fg } }, '· ' + needs.length) : null),
+                needs.length > 0
+                  ? h('button', {
+                      onClick: function () {
+                        var lines = [t('needsMe') + ' · ' + needs.length];
+                        needs.forEach(function (tk) {
+                          lines.push('[' + (tk.stageText || tk.stage) + '] ' + (tk.ownerLabel || tk.owner) + ' · ' + (tk.message || '') + ' · ' + relTime(t, tk.updatedAt || tk.createdAt));
+                        });
+                        copyText(lines.join(String.fromCharCode(10)), 'needs-digest');
+                      },
+                      title: t('copyDigestHint'),
+                      style: { fontSize: '11px', fontWeight: 400, padding: '2px 10px', borderRadius: '6px', cursor: 'pointer', background: 'rgba(127,127,127,0.1)', border: '1px solid rgba(127,127,127,0.2)', opacity: 0.8 },
+                    }, copiedId === 'needs-digest' ? t('copiedBtn') : t('copyDigestBtn'))
+                  : null,
                  confirmable.length >= 2
                    ? h('span', { style: { marginLeft: 'auto', display: 'inline-flex', gap: '6px', alignItems: 'center', fontWeight: 400 } },
                        h('button', {
