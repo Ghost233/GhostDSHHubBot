@@ -238,6 +238,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       healthOutboxFailed: '{n} 条投递失败',
       resolveFailed: '操作失败',
       detailToggle: '详情',
+      doneExpandHint: '点开查看完整卡片',
       feishuSection: '飞书 Bot',
       feishuBound: '已绑定',
       feishuBoundAt: '绑定于',
@@ -453,6 +454,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       healthOutboxFailed: '{n} deliveries failed',
       resolveFailed: 'Action failed',
       detailToggle: 'Details',
+      doneExpandHint: 'Click to expand the full card',
       feishuSection: 'Feishu Bot',
       feishuBound: 'Bound',
       feishuBoundAt: 'bound',
@@ -1135,6 +1137,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var sls = React.useState({}); var selected = sls[0]; var setSelected = sls[1];
           var bbs = React.useState(false); var batchBusy = bbs[0]; var setBatchBusy = bbs[1];
           var hvs = React.useState(null); var hoverTicket = hvs[0]; var setHoverTicket = hvs[1];
+          var eds = React.useState({}); var expandedDone = eds[0]; var setExpandedDone = eds[1];
           var resolve = function (tk, resolution) {
             var label = resolution === 'confirm' ? t('confirmBtn') : resolution === 'accept' ? t('acceptBtn') : resolution === 'retry' ? t('retryTicketBtn') : resolution === 'cancel' ? t('cancelTicketBtn') : t('rejectBtn');
             if (!window.confirm(label + ' — ' + (tk.pendingConfirm && tk.pendingConfirm.text ? tk.pendingConfirm.text : tk.id))) return;
@@ -1635,7 +1638,19 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     return h('details', { key: stage, open: isPerson || filterActive, style: { marginBottom: '6px' } },
                       h('summary', { style: { cursor: 'pointer', padding: '4px 0', display: 'flex', alignItems: 'center', gap: '8px' } },
                         stagePill(stage, (list[0].stageText || stage) + ' · ' + list.length)),
-                      h('div', { style: { marginTop: '8px' } }, list.map(function (tk) { return ticketRowItem(tk, false); })));
+                      h('div', { style: { marginTop: '8px' } }, list.map(function (tk) {
+                        if (tk.stage === 'done' && !expandedDone[tk.id]) {
+                          return h('div', { key: tk.id, className: 'hb-recent-row',
+                            onClick: function () { var next = {}; for (var k in expandedDone) next[k] = expandedDone[k]; next[tk.id] = true; setExpandedDone(next); },
+                            title: t('doneExpandHint'),
+                            style: { display: 'flex', alignItems: 'baseline', gap: '8px', padding: '4px 8px', borderRadius: '6px', fontSize: '12px', opacity: 0.75, cursor: 'pointer' } },
+                            h('span', { style: { flexShrink: 0, color: TONES.green.fg, fontSize: '11px' } }, '✓'),
+                            tk.ownerLabel ? h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.6 } }, tk.ownerLabel) : null,
+                            h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, tk.message || '—'),
+                            h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.5 } }, relTime(t, tk.updatedAt || tk.createdAt)));
+                        }
+                        return ticketRowItem(tk, false);
+                      })));
                   })),
             h('div', { style: sectionStyle },
               h('div', { style: Object.assign({}, sectionTitleStyle, { display: 'flex', alignItems: 'center', gap: '8px' }) },
