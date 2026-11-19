@@ -1215,10 +1215,14 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var lastDropped = (overview.recentTriggers || []).filter(function (tr) { return tr.dropped; })[0] || null;
           var activeSessions = owners.filter(function (o) { return !!o.sessionId; }).length;
           var ownersSub = fill(t('activeSessions'), activeSessions);
-          var cardSubStyle = { fontSize: '11px', opacity: 0.6, marginTop: '2px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' };
+          var cardSubStyle = { fontSize: '11px', opacity: 0.6, marginTop: '2px', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' };
 
           var tickets = overview.tickets || [];
-          var needs = tickets.filter(function (tk) { return NEEDS_ME.indexOf(tk.stage) >= 0; });
+          var NEEDS_PRIORITY = { 'person/confirm': 0, 'person/answer': 1, 'person/review': 2, failed: 3, blocked: 4 };
+          var needs = tickets.filter(function (tk) { return NEEDS_ME.indexOf(tk.stage) >= 0; })
+            .map(function (tk, i) { return { tk: tk, i: i }; })
+            .sort(function (a, b) { var d = (NEEDS_PRIORITY[a.tk.stage] !== undefined ? NEEDS_PRIORITY[a.tk.stage] : 5) - (NEEDS_PRIORITY[b.tk.stage] !== undefined ? NEEDS_PRIORITY[b.tk.stage] : 5); return d !== 0 ? d : a.i - b.i; })
+            .map(function (x) { return x.tk; });
           var confirmable = needs.filter(function (tk) { return tk.stage === 'person/confirm'; });
           // 状态卡第四张（round 32）: 待办计数 + 阶段分解副标。
           var needsStages = [];
