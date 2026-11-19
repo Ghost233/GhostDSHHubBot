@@ -175,6 +175,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       copyReportHint: '复制报告全文',
       copyPathHint: '点击复制完整路径',
       copySessionHint: '点击复制完整会话 id',
+      unsaved: '未保存',
       ownersCard: '负责人',
       needsCard: '待我处理',
       connected: '已连接',
@@ -379,6 +380,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       copyReportHint: 'Copy the full report',
       copyPathHint: 'Click to copy the full path',
       copySessionHint: 'Click to copy the full session id',
+      unsaved: 'Unsaved',
       ownersCard: 'Owners',
       needsCard: 'Needs me',
       connected: 'Connected',
@@ -609,6 +611,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           .finally(function () { setBusy(false); });
       };
 
+      // 未保存标记（round 40）：表单值与已存值不一致时给出琥珀提示，「已保存」不再误驻留。
+      var ws = view.workspaces || {};
+      var wsDirty = form.enabled !== (ws.enabled !== false)
+        || form.chiefWorkspaceId !== (ws.chiefWorkspaceId || '')
+        || form.chiefTitle !== (ws.chiefTitle || 'Hub Bot 中枢');
       var model = view.chief && view.chief.model;
       return h('div', { style: { maxWidth: '560px' } },
         h('div', { style: sectionStyle },
@@ -653,7 +660,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             onClick: save, disabled: busy,
             style: Object.assign({}, inputStyle, { width: 'auto', cursor: 'pointer', padding: '6px 16px' }),
           }, busy ? t('saving') : t('save')),
-          saved ? h('span', { style: { fontSize: '12px', opacity: 0.7 } }, t('saved')) : null,
+          saved && !wsDirty ? h('span', { style: { fontSize: '12px', opacity: 0.7 } }, t('saved')) : null,
+          wsDirty ? h('span', { style: { fontSize: '11px', padding: '1px 8px', borderRadius: '999px', background: 'rgba(230,160,40,0.14)', color: '#eba938', border: '1px solid rgba(230,160,40,0.4)', whiteSpace: 'nowrap' } }, t('unsaved')) : null,
           error ? h('span', { style: { fontSize: '12px', color: 'var(--dsh-danger, #d66)' } }, t('failed') + ': ' + error) : null));
     }
 
@@ -954,6 +962,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               .finally(function () { setBusy(false); });
           };
           var edit = function (patch) { setForm(Object.assign({}, form, patch)); setSaved(false); };
+          var v2 = props.view || {};
+          var curSlots = String((v2.concurrency && v2.concurrency.slotsPerOwner) || 3);
+          var curAuto = !!(v2.reporting && v2.reporting.auto);
+          var curMin = String(Math.round(((v2.reporting && v2.reporting.intervalMs) || 3600000) / 60000));
+          var curPatterns = ((v2.security && v2.security.dangerousPatterns) || []).join('\n');
+          var rtDirty = form.slots !== curSlots || form.reportAuto !== curAuto || form.reportMin !== curMin || form.patterns !== curPatterns;
           return h('div', { style: Object.assign({}, sectionStyle, { marginTop: '22px' }) },
             h('div', { style: sectionTitleStyle }, t('runtimeSection')),
             h('div', { style: fieldSt },
@@ -975,7 +989,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               form.patterns.trim() === '' ? h('div', { style: { fontSize: '12px', color: TONES.amber.fg, marginTop: '4px' } }, t('patternsEmptyWarn')) : null),
             h('div', { style: { display: 'flex', gap: '10px', alignItems: 'center' } },
               h('button', { onClick: save, disabled: busy, style: Object.assign({}, inputStyle, { width: 'auto', cursor: 'pointer', padding: '6px 16px' }) }, busy ? t('saving') : t('save')),
-              saved ? h('span', { style: { fontSize: '12px', opacity: 0.7 } }, t('saved')) : null,
+              saved && !rtDirty ? h('span', { style: { fontSize: '12px', opacity: 0.7 } }, t('saved')) : null,
+              rtDirty ? h('span', { style: { fontSize: '11px', padding: '1px 8px', borderRadius: '999px', background: 'rgba(230,160,40,0.14)', color: '#eba938', border: '1px solid rgba(230,160,40,0.4)', whiteSpace: 'nowrap' } }, t('unsaved')) : null,
               err ? h('span', { style: { fontSize: '12px', color: 'var(--dsh-danger, #d66)' } }, t('failed') + ': ' + err) : null));
         }
 
@@ -1380,6 +1395,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             } }, rows);
           };
 
+          var savedChoice = view && view.chief && view.chief.model ? view.chief.model.provider + '/' + view.chief.model.model : '';
+          var modelDirty = modelChoice !== savedChoice;
           var modelOptions = [h('option', { key: '', value: '' }, t('modelFollow'))];
           if (catalog && catalog.groups) {
             catalog.groups.forEach(function (g) {
@@ -1667,7 +1684,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                       onClick: saveModel, disabled: modelBusy,
                       style: Object.assign({}, inputStyle, { width: 'auto', cursor: 'pointer', padding: '6px 16px', whiteSpace: 'nowrap' }),
                     }, modelBusy ? t('modelApplying') : t('modelApply')),
-                    modelDone ? h('span', { style: { fontSize: '12px', color: TONES.green.fg, whiteSpace: 'nowrap' } }, t('modelApplied')) : null)
+                    modelDone && !modelDirty ? h('span', { style: { fontSize: '12px', color: TONES.green.fg, whiteSpace: 'nowrap' } }, t('modelApplied')) : null,
+                    modelDirty ? h('span', { style: { fontSize: '11px', padding: '1px 8px', borderRadius: '999px', background: 'rgba(230,160,40,0.14)', color: '#eba938', border: '1px solid rgba(230,160,40,0.4)', whiteSpace: 'nowrap' } }, t('unsaved')) : null)
                 : h('div', { style: warnStyle }, t('catalogUnavailable')),
               modelChoice === '' && defaultModelLabel ? h('div', { style: Object.assign({}, warnStyle, { color: TONES.blue.fg, opacity: 0.85 }) }, fill(t('modelDefaultNow'), defaultModelLabel)) : null,
               h('div', { style: warnStyle }, t('modelPickerHint'))),
