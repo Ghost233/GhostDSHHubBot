@@ -1483,6 +1483,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
 
           return h('div', { style: { padding: '20px 24px', overflowY: 'auto', height: '100%', boxSizing: 'border-box' } },
             h('h2', { style: { fontSize: '17px', fontWeight: 600, margin: '0 0 18px' } }, t('title')),
+            h('style', null, '.hb-recent-list{border:1px solid rgba(255,255,255,0.08);border-radius:10px;overflow:hidden}.hb-recent-row{transition:background 120ms ease}.hb-recent-row+.hb-recent-row{border-top:1px solid rgba(255,255,255,0.05)}.hb-recent-row:hover{background:rgba(255,255,255,0.045)}'),
             h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '14px' } },
               h('span', { style: { fontSize: '16px', fontWeight: 700 } }, 'Hub Bot'),
               view && view.version ? h('span', { style: { fontSize: '11px', fontFamily: 'monospace', padding: '1px 8px', borderRadius: '999px', background: 'rgba(127,127,127,0.1)', border: '1px solid rgba(127,127,127,0.2)', opacity: 0.75 } }, 'v' + view.version) : null,
@@ -1649,19 +1650,19 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 0' } }, t('emptyRecent'))
                 : recentFiltered.length === 0
                   ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 0' } }, t('filterNoMatch'))
-                  : recentFiltered.map(function (tr) {
-                    return h('div', { key: tr.id,
+                  : h('div', { className: 'hb-recent-list' },
+                    recentFiltered.map(function (tr) {
+                    return h('div', { key: tr.id, className: 'hb-recent-row',
                       onClick: tr.ticketId ? function () { locateTicket(tr.ticketId); } : undefined,
                       title: tr.ticketId ? t('recentLocateHint') : undefined,
                       style: {
-                      display: 'flex', alignItems: 'baseline', gap: '10px', padding: '7px 10px',
-                      borderRadius: '8px', marginBottom: '4px', background: 'rgba(255,255,255,0.03)',
-                      border: '1px solid rgba(255,255,255,0.06)', fontSize: '13px',
+                      display: 'flex', alignItems: 'baseline', gap: '8px', padding: '5px 10px',
+                      fontSize: '13px',
                       cursor: tr.ticketId ? 'pointer' : 'default',
                     } },
-                      h('span', { style: { flexShrink: 0, fontSize: '11px', padding: '1px 7px', borderRadius: '999px', background: tr.kind === 'feishu' ? 'rgba(70,150,255,0.14)' : 'rgba(150,150,150,0.14)', color: tr.kind === 'feishu' ? '#7db8ff' : 'rgba(200,200,200,0.8)', border: '1px solid ' + (tr.kind === 'feishu' ? 'rgba(70,150,255,0.3)' : 'rgba(150,150,150,0.25)') } }, kindLabel(tr.kind)),
-                      h('span', { style: { flexShrink: 0, fontSize: '12px', opacity: 0.55, minWidth: '64px' } }, tr.at ? relTime(t, tr.at) : '—'),
-                      h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, tr.message || '—'),
+                      h('span', { style: { flexShrink: 0, fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: tr.kind === 'feishu' ? 'rgba(70,150,255,0.14)' : 'rgba(150,150,150,0.14)', color: tr.kind === 'feishu' ? '#7db8ff' : 'rgba(200,200,200,0.8)', border: '1px solid ' + (tr.kind === 'feishu' ? 'rgba(70,150,255,0.3)' : 'rgba(150,150,150,0.25)') } }, kindLabel(tr.kind)),
+                      h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.5, minWidth: '56px' } }, tr.at ? relTime(t, tr.at) : '—'),
+                      h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.88 } }, tr.message || '—'),
                       // 回复投递闭环指示： 已回复(绿) / 已注入(灰) / 投递中(琥珀) / 投递失败(红+行内重投)
                       tr.reply && tr.reply.state === 'sent'
                         ? h('span', { style: { flexShrink: 0, display: 'inline-flex', alignItems: 'center', fontSize: '11px', color: TONES.green.fg } }, dot('#46bb6d'), t('replySent'))
@@ -1684,7 +1685,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                         ? h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.55, fontStyle: 'italic' } }, t('droppedLabel') + ': ' + tr.dropped)
                         : (tr.stageText ? stagePill(tr.stage || '', tr.stageText) : null),
                       tr.ownerLabel ? h('span', { style: { flexShrink: 0, fontSize: '12px', opacity: 0.6 } }, tr.ownerLabel) : null);
-                  })),
+                  }))),
             h('div', { style: sectionStyle, id: 'hub-bot-owners' },
               h('div', { style: sectionTitleStyle }, t('ownersSection'),
                 owners.length > 0 ? h('span', { style: { marginLeft: '8px', fontSize: '12px', fontWeight: 400, opacity: 0.55 } }, '· ' + owners.length) : null),
