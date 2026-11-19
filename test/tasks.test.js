@@ -74,12 +74,14 @@ test('transition matrix is total: every stage pair is either a listed edge or re
   // Spot-check the mandated edges (#66): lifecycle paths the evidence must walk.
   for (const [from, to] of [['idle', 'working'], ['working', 'person/review'], ['person/review', 'done'],
     ['working', 'blocked'], ['blocked', 'working'], ['failed', 'working'], ['person/answer', 'working'],
-    ['person/confirm', 'done'], ['working', 'failed'], ['queued', 'working'], ['person/review', 'working']]) {
+    ['person/confirm', 'done'], ['working', 'failed'], ['queued', 'working'], ['person/review', 'working'],
+    ['idle', 'done'], ['queued', 'done']]) { // round 43: 面板取消未开始的任务
     assert.ok(TRANSITIONS[from].includes(to), from + ' → ' + to + ' must be legal')
   }
-  // And the mandated non-edges: done is terminal; acceptance only from person/review.
+  // And the mandated non-edges: done is terminal; acceptance only from person/review (+ 面板取消 person/confirm
+  // 与未开始的 idle/queued，round 43)。已开始执行的任务仍不能直接 done。
   assert.deepEqual(TRANSITIONS['done'], [])
-  for (const from of STAGES.filter(s => s !== 'person/review' && s !== 'person/confirm')) {
+  for (const from of STAGES.filter(s => s !== 'person/review' && s !== 'person/confirm' && s !== 'idle' && s !== 'queued')) {
     assert.ok(!TRANSITIONS[from].includes('done'), from + ' must not reach done directly')
   }
 })

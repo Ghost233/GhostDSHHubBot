@@ -48,8 +48,9 @@ export const STAGE_TEXT = {
  */
 export const TRANSITIONS = {
   // idle/queued → person/confirm: 危险命令黑名单在注入前挂起 (spec「Policy」安全兜底) — 票未投递先转等确认。
-  'idle': ['working', 'failed', 'person/confirm'],
-  'queued': ['working', 'failed', 'person/confirm'],
+  // → done：面板取消（round 43）——还没开始的任务允许直接关闭，不算验收通过（confirmOutcome 只在 person/confirm 取消时记录）。
+  'idle': ['working', 'failed', 'person/confirm', 'done'],
+  'queued': ['working', 'failed', 'person/confirm', 'done'],
   'working': ['person/review', 'person/answer', 'person/confirm', 'blocked', 'failed', 'queued'],
   'person/answer': ['working', 'blocked', 'failed'],
   'person/confirm': ['working', 'done', 'blocked', 'failed'],

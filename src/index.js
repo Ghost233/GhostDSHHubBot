@@ -564,7 +564,21 @@ export function apply(ctx, rawConfig) {
   const resolveTicket = async body => {
     const ticketId = requireString(body, 'ticketId')
     const resolution = requireString(body, 'resolution')
-    if (!['confirm', 'reject', 'answer', 'accept', 'retry'].includes(resolution)) throw new HttpError(400, 'resolution must be "confirm", "reject", "answer", "accept" or "retry"')
+    if (!['confirm', 'reject', 'answer', 'accept', 'retry', 'cancel'].includes(resolution)) throw new HttpError(400, 'resolution must be "confirm", "reject", "answer", "accept", "retry" or "cancel"')
+    // 取消（round 43）: idle/queued 票还没开始执行，允许直接关闭（done）。已开始的一律走 reject/失败路径。
+    if (resolution === 'cancel') {
+      const ticket0 = hub.router.getTicket(ticketId)
+      if (!ticket0) throw new HttpError(404, 'unknown ticket "' + ticketId + '"')
+      if (ticket0.stage !== 'idle' && ticket0.stage !== 'queued') {
+        throw new HttpError(400, 'cancel applies only to idle or queued tickets (current stage: ' + ticket0.stage + ')')
+      }
+      try {
+        hub.router.tasks.cancel(ticketId, { by: 'user', reason: optionalString(body, 'message') ?? '面板取消' })
+      } catch (error) {
+        throw new HttpError(400, error?.message ?? 'cancel failed')
+      }
+      return { ticketId, stage: 'done' }
+    }
     // 重试（round 42）: blocked/failed 票走与 answer 同一条「无 resolution 追问」路径——
     // 状态机自己把票恢复成 working 并注入重试说明。仅限这两个终态，其他阶段不许越权复活。
     if (resolution === 'retry') {

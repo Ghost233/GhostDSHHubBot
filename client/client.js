@@ -278,6 +278,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       recentLocateHint: '点击在任务流中定位这张票',
       acceptBtn: '验收通过',
       retryTicketBtn: '重新尝试',
+      cancelTicketBtn: '取消任务',
+      cancelDone: '已取消，任务关闭',
       retryDone: '已要求重试，任务恢复执行',
       reworkBtn: '打回重做',
       reworkPlaceholder: '打回意见…（Enter 发送，票回进行中）',
@@ -490,6 +492,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       recentLocateHint: 'Click to locate this ticket in the stream',
       acceptBtn: 'Accept',
       retryTicketBtn: 'Retry',
+      cancelTicketBtn: 'Cancel task',
+      cancelDone: 'Cancelled — the task is closed',
       retryDone: 'Retry requested — the ticket is running again',
       reworkBtn: 'Rework',
       reworkPlaceholder: 'Rework note… (Enter sends, ticket resumes)',
@@ -1130,14 +1134,14 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var bbs = React.useState(false); var batchBusy = bbs[0]; var setBatchBusy = bbs[1];
           var hvs = React.useState(null); var hoverTicket = hvs[0]; var setHoverTicket = hvs[1];
           var resolve = function (tk, resolution) {
-            var label = resolution === 'confirm' ? t('confirmBtn') : resolution === 'accept' ? t('acceptBtn') : resolution === 'retry' ? t('retryTicketBtn') : t('rejectBtn');
+            var label = resolution === 'confirm' ? t('confirmBtn') : resolution === 'accept' ? t('acceptBtn') : resolution === 'retry' ? t('retryTicketBtn') : resolution === 'cancel' ? t('cancelTicketBtn') : t('rejectBtn');
             if (!window.confirm(label + ' — ' + (tk.pendingConfirm && tk.pendingConfirm.text ? tk.pendingConfirm.text : tk.id))) return;
             setResolving(tk.id + ':' + resolution); setError(null);
             scoped.remote.hubBotSettings.resolveTicket({ ticketId: tk.id, resolution: resolution })
               .then(function (raw) {
                 // 错误信封（round 42）：网关把 RemoteError 解析成 {ok:false,error} 而非 reject——不检查就会误报成功。
                 if (raw && raw.ok === false) { setError(t('resolveFailed') + ': ' + (raw.error && raw.error.message ? raw.error.message : 'unknown')); return; }
-                var doneKey = resolution === 'confirm' ? 'confirmDone' : resolution === 'accept' ? 'acceptDone' : resolution === 'retry' ? 'retryDone' : 'rejectDone';
+                var doneKey = resolution === 'confirm' ? 'confirmDone' : resolution === 'accept' ? 'acceptDone' : resolution === 'retry' ? 'retryDone' : resolution === 'cancel' ? 'cancelDone' : 'rejectDone';
                 flashNotice(t(doneKey));
                 load();
               })
@@ -1351,6 +1355,14 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                   onClick: function () { resolve(tk, 'reject'); }, disabled: resolving !== null,
                   style: Object.assign({}, inputStyle, { width: 'auto', padding: '4px 18px', cursor: 'pointer', background: 'rgba(220,80,80,0.12)', border: '1px solid ' + TONES.red.border, color: TONES.red.fg }),
                 }, resolving === tk.id + ':reject' ? '…' : t('rejectBtn'))));
+            }
+            // 取消（round 43）: idle/queued 票还没开始执行，可以直接关闭——任务流（只读区）里也放行。
+            if (tk.stage === 'idle' || tk.stage === 'queued') {
+              rows.push(h('div', { key: 'cancel', style: { marginTop: '8px', display: 'flex', gap: '8px' } },
+                h('button', {
+                  onClick: function () { resolve(tk, 'cancel'); }, disabled: resolving !== null,
+                  style: Object.assign({}, inputStyle, { width: 'auto', padding: '4px 18px', cursor: 'pointer', background: 'rgba(220,80,80,0.12)', border: '1px solid ' + TONES.red.border, color: TONES.red.fg }),
+                }, resolving === tk.id + ':cancel' ? '…' : t('cancelTicketBtn'))));
             }
             // 重新尝试（round 42）: blocked/failed 票一键回到 working（状态机注入重试说明）。
             if (withActions && (tk.stage === 'blocked' || tk.stage === 'failed')) {
