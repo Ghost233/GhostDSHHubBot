@@ -564,7 +564,17 @@ export function apply(ctx, rawConfig) {
   const resolveTicket = async body => {
     const ticketId = requireString(body, 'ticketId')
     const resolution = requireString(body, 'resolution')
-    if (!['confirm', 'reject', 'answer', 'accept'].includes(resolution)) throw new HttpError(400, 'resolution must be "confirm", "reject", "answer" or "accept"')
+    if (!['confirm', 'reject', 'answer', 'accept', 'retry'].includes(resolution)) throw new HttpError(400, 'resolution must be "confirm", "reject", "answer", "accept" or "retry"')
+    // 重试（round 42）: blocked/failed 票走与 answer 同一条「无 resolution 追问」路径——
+    // 状态机自己把票恢复成 working 并注入重试说明。仅限这两个终态，其他阶段不许越权复活。
+    if (resolution === 'retry') {
+      const ticket0 = hub.router.getTicket(ticketId)
+      if (!ticket0) throw new HttpError(404, 'unknown ticket "' + ticketId + '"')
+      if (ticket0.stage !== 'blocked' && ticket0.stage !== 'failed') {
+        throw new HttpError(400, 'retry applies only to blocked or failed tickets (current stage: ' + ticket0.stage + ')')
+      }
+      return await hub.router.routeToOwner({ ownerId: ticket0.owner, ticketId, message: optionalString(body, 'message') ?? '面板要求重试' })
+    }
     if (resolution === 'answer') {
       const text = requireString(body, 'message')
       const ticket0 = hub.router.getTicket(ticketId)

@@ -24,7 +24,8 @@ description: 发布 dsh-hub-bot 插件新版本：升版本号、打包 tarball�
 6. **client 半侧改动的额外核验**（v0.1.5 设置页不出现的教训）：dev 实例重启后必须过浏览器实证，不能只看 API——① console 无 `pending (waiting for services: ...)`：client.js 的 `exports.inject` 只写 **cordis 服务 key**（slots/locale/remote），包名永远等不到；② `ctx.remote.<自有 namespace>` 可用：**自有 Remote 命名空间必须客户端 `$mount`**（dsh-api-remotes 只预挂官方静态清单），codec 要过三道校验（mode 'strict' + 非空 typeSymbol + create() 工厂，v0.1.6 曾漏 typeSymbol 崩在 validateCodec）；③ 配置按钮出现、表单渲染真实值、保存后 overlay 落盘三点齐全才算完——「真实值」必须用一个**已知非默认值**对照（如 overlay 里已配的 chief.model），防止 fallback 默认值蒙混过关（v0.1.6 实证时 remote 返回其实一直带 {ok,value} envelope，表单全靠默认值裸奔，直到 v0.2.0 面板合并用 24 项模型目录才暴露——手写 contribution 需在客户端对结果做防御性拆包）。
 
 7. **按钮必须点到底**（v0.12.0 retryOutbox 静默失效的教训）：渲染出来 ≠ 能用。任何按钮/交互必须真实点击并验证副作用落库（DB 状态变化），不能只看 UI 无报错。Remote 方法**带参数调用时**，客户端贡献描述符必须声明 `parameters: [{ name, source: 'json', codec, strictCodec }]`——零参声明的方法带参调用会被网关静默吞掉（按钮渲染正常、点击无报错无响应无异常，只有 host 侧探针日志能定位）。
-8. **清理**：删本地 tgz（不提交）
+8. **Remote 错误要落到用户眼前**：throw RemoteError 必须带第三参 `details`（至少 `{}`）——省略后网关系列化的 error 缺 details，客户端 parseConnectionResponse 直接抛「invalid server-response failure」，真实错误永远消失。且网关在失败时 resolve 错误信封 `{ok:false,error}` 而非 reject——客户端每个 `.then` 都必须先查 `raw.ok === false` 再弹成功通知（round 42 误报成功通知的根因）。浏览器端验证按钮归属：按卡片边界（如 style.borderLeftWidth 的 3px 卡）祖先匹配，不要纯文本深度爬升——会爬进共享容器命中别的卡。
+9. **清理**：删本地 tgz（不提交）
 
 ## 失败处理
 

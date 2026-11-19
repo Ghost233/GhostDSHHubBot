@@ -277,6 +277,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       answerBtn: '回复',
       recentLocateHint: '点击在任务流中定位这张票',
       acceptBtn: '验收通过',
+      retryTicketBtn: '重新尝试',
+      retryDone: '已要求重试，任务恢复执行',
       reworkBtn: '打回重做',
       reworkPlaceholder: '打回意见…（Enter 发送，票回进行中）',
       cardJumpHint: '点击跳到对应区域',
@@ -487,6 +489,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       answerBtn: 'Reply',
       recentLocateHint: 'Click to locate this ticket in the stream',
       acceptBtn: 'Accept',
+      retryTicketBtn: 'Retry',
+      retryDone: 'Retry requested — the ticket is running again',
       reworkBtn: 'Rework',
       reworkPlaceholder: 'Rework note… (Enter sends, ticket resumes)',
       cardJumpHint: 'Click to jump to the section',
@@ -1079,6 +1083,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             var req = idOrNull === null ? { all: true } : { id: idOrNull };
             scoped.remote.hubBotSettings.retryOutbox(req)
               .then(function (raw) {
+                if (raw && raw.ok === false) { setError((raw.error && raw.error.message) || 'retry failed'); return; }
                 var res = unwrap(raw);
                 flashNotice(fill(t('retriedNotice'), (res && res.retried) || 0));
                 load();
@@ -1089,6 +1094,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             var req = idOrNull === null ? { all: true } : { id: idOrNull };
             scoped.remote.hubBotSettings.discardOutbox(req)
               .then(function (raw) {
+                if (raw && raw.ok === false) { setError((raw.error && raw.error.message) || 'discard failed'); return; }
                 var res = unwrap(raw);
                 flashNotice(fill(t('discardedNotice'), (res && res.discarded) || 0));
                 load();
@@ -1124,12 +1130,14 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var bbs = React.useState(false); var batchBusy = bbs[0]; var setBatchBusy = bbs[1];
           var hvs = React.useState(null); var hoverTicket = hvs[0]; var setHoverTicket = hvs[1];
           var resolve = function (tk, resolution) {
-            var label = resolution === 'confirm' ? t('confirmBtn') : resolution === 'accept' ? t('acceptBtn') : t('rejectBtn');
+            var label = resolution === 'confirm' ? t('confirmBtn') : resolution === 'accept' ? t('acceptBtn') : resolution === 'retry' ? t('retryTicketBtn') : t('rejectBtn');
             if (!window.confirm(label + ' — ' + (tk.pendingConfirm && tk.pendingConfirm.text ? tk.pendingConfirm.text : tk.id))) return;
             setResolving(tk.id + ':' + resolution); setError(null);
             scoped.remote.hubBotSettings.resolveTicket({ ticketId: tk.id, resolution: resolution })
-              .then(function () {
-                var doneKey = resolution === 'confirm' ? 'confirmDone' : resolution === 'accept' ? 'acceptDone' : 'rejectDone';
+              .then(function (raw) {
+                // 错误信封（round 42）：网关把 RemoteError 解析成 {ok:false,error} 而非 reject——不检查就会误报成功。
+                if (raw && raw.ok === false) { setError(t('resolveFailed') + ': ' + (raw.error && raw.error.message ? raw.error.message : 'unknown')); return; }
+                var doneKey = resolution === 'confirm' ? 'confirmDone' : resolution === 'accept' ? 'acceptDone' : resolution === 'retry' ? 'retryDone' : 'rejectDone';
                 flashNotice(t(doneKey));
                 load();
               })
@@ -1168,7 +1176,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             if (!text) return;
             setResolving(tk.id + ':answer'); setError(null);
             scoped.remote.hubBotSettings.resolveTicket({ ticketId: tk.id, resolution: 'answer', message: text })
-              .then(function () {
+              .then(function (raw) {
+                if (raw && raw.ok === false) { setError((raw.error && raw.error.message) || 'answer failed'); return; }
                 var next = Object.assign({}, answers); delete next[tk.id]; setAnswers(next);
                 flashNotice(t('answerDone'));
                 load();
@@ -1342,6 +1351,14 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                   onClick: function () { resolve(tk, 'reject'); }, disabled: resolving !== null,
                   style: Object.assign({}, inputStyle, { width: 'auto', padding: '4px 18px', cursor: 'pointer', background: 'rgba(220,80,80,0.12)', border: '1px solid ' + TONES.red.border, color: TONES.red.fg }),
                 }, resolving === tk.id + ':reject' ? '…' : t('rejectBtn'))));
+            }
+            // 重新尝试（round 42）: blocked/failed 票一键回到 working（状态机注入重试说明）。
+            if (withActions && (tk.stage === 'blocked' || tk.stage === 'failed')) {
+              rows.push(h('div', { key: 'retry', style: { marginTop: '8px', display: 'flex', gap: '8px' } },
+                h('button', {
+                  onClick: function () { resolve(tk, 'retry'); }, disabled: resolving !== null,
+                  style: Object.assign({}, inputStyle, { width: 'auto', padding: '4px 18px', cursor: 'pointer', background: 'rgba(80,140,255,0.15)', border: '1px solid ' + TONES.blue.border, color: TONES.blue.fg }),
+                }, resolving === tk.id + ':retry' ? '…' : t('retryTicketBtn'))));
             }
             if (withActions && tk.stage === 'person/answer') {
               rows.push(h('div', { key: 'ans', style: { marginTop: '8px', display: 'flex', gap: '8px' } },

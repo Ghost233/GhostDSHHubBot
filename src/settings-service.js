@@ -49,7 +49,7 @@ export class HubBotSettingsService extends TypertRemoteService {
       return await this.deps.applySettings(patch)
     } catch (error) {
       if (error?.name === 'SettingsError' || error?.statusCode === 400) {
-        throw new RemoteError('settings/invalid', error.message ?? 'invalid settings patch')
+        throw new RemoteError('settings/invalid', error.message ?? 'invalid settings patch', {})
       }
       throw error
     }
@@ -103,7 +103,7 @@ export class HubBotSettingsService extends TypertRemoteService {
     try {
       return await this.deps.retryOutbox(request ?? {})
     } catch (error) {
-      if (error?.statusCode === 404 || error?.statusCode === 400) throw new RemoteError('outbox/invalid', error?.message ?? 'invalid retry request')
+      if (error?.statusCode === 404 || error?.statusCode === 400) throw new RemoteError('outbox/invalid', error?.message ?? 'invalid retry request', {})
       throw error
     }
   }
@@ -113,7 +113,7 @@ export class HubBotSettingsService extends TypertRemoteService {
     try {
       return await this.deps.discardOutbox(request ?? {})
     } catch (error) {
-      if (error?.statusCode === 404 || error?.statusCode === 400) throw new RemoteError('outbox/invalid', error?.message ?? 'invalid discard request')
+      if (error?.statusCode === 404 || error?.statusCode === 400) throw new RemoteError('outbox/invalid', error?.message ?? 'invalid discard request', {})
       throw error
     }
   }
@@ -134,7 +134,7 @@ export class HubBotSettingsService extends TypertRemoteService {
       return await this.deps.startFeishuRegister()
     } catch (error) {
       if (error?.name === 'SettingsError' || error?.statusCode === 400) {
-        throw new RemoteError('feishu/unavailable', error.message ?? 'feishu register unavailable')
+        throw new RemoteError('feishu/unavailable', error.message ?? 'feishu register unavailable', {})
       }
       throw error
     }
@@ -146,7 +146,7 @@ export class HubBotSettingsService extends TypertRemoteService {
       return await this.deps.resolveTicket(request ?? {})
     } catch (error) {
       if (error?.name === 'SettingsError' || error?.statusCode === 400 || error?.statusCode === 404 || error?.name === 'RouterError') {
-        throw new RemoteError('ticket/invalid', error.message ?? 'invalid ticket resolution')
+        throw new RemoteError('ticket/invalid', error.message ?? 'invalid ticket resolution', {})
       }
       throw error
     }
