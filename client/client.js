@@ -241,6 +241,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       healthPillRetrying: '重试中',
       healthPillDead: '死信',
       filterAllOwners: '全部负责人',
+      copyIdBtn: '复制',
+      copiedBtn: '已复制',
+      copyIdHint: '复制工单号',
       feishuMetricsTitle: '连接质量：',
       feishuMetricsReconnects: '重连 {count} 次',
       feishuMetricsLastConnected: '最近连接',
@@ -384,6 +387,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       healthPillRetrying: 'retrying',
       healthPillDead: 'dead',
       filterAllOwners: 'All owners',
+      copyIdBtn: 'Copy',
+      copiedBtn: 'Copied',
+      copyIdHint: 'Copy ticket id',
       feishuMetricsTitle: 'Connection:',
       feishuMetricsReconnects: '{count} reconnects',
       feishuMetricsLastConnected: 'last connected',
@@ -744,6 +750,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var fss = React.useState(''); var filterStage = fss[0]; var setFilterStage = fss[1];
           var fos = React.useState(''); var filterOwner = fos[0]; var setFilterOwner = fos[1];
           var rks = React.useState(''); var recentKind = rks[0]; var setRecentKind = rks[1];
+          var cps = React.useState(''); var copiedId = cps[0]; var setCopiedId = cps[1];
           var rds = React.useState(false); var recentDroppedOnly = rds[0]; var setRecentDroppedOnly = rds[1];
 
           var load = function () {
@@ -882,6 +889,24 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             var el = document.getElementById('hub-bot-stream');
             if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
           };
+          var copyTicketId = function (id) {
+            var done = function () { setCopiedId(id); setTimeout(function () { setCopiedId(''); }, 1200); };
+            try {
+              if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(id).then(done, function () { legacyCopy(id); done(); });
+                return;
+              }
+            } catch (e) { /* fall through */ }
+            legacyCopy(id); done();
+          };
+          var legacyCopy = function (text) {
+            try {
+              var ta = document.createElement('textarea');
+              ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+              document.body.appendChild(ta); ta.select(); document.execCommand('copy');
+              document.body.removeChild(ta);
+            } catch (e) { /* 剪贴板不可达就算了 */ }
+          };
           var filterActive = !!filterText || !!filterStage || !!filterOwner;
           var scrollToSection = function (id) {
             var el = document.getElementById(id);
@@ -1015,7 +1040,17 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     h('span', { style: { flexShrink: 0, color: tone.fg, fontWeight: ev.current ? 600 : 400 } }, ev.label),
                     ev.detail ? h('span', { style: { opacity: 0.65, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, ev.detail) : null);
                 })),
-              h('div', { style: { marginTop: '4px', opacity: 0.5, fontFamily: 'monospace', fontSize: '11px' } }, tk.id)));
+               h('div', { style: { marginTop: '4px', display: 'flex', alignItems: 'center', gap: '8px' } },
+                 h('span', { style: { opacity: 0.5, fontFamily: 'monospace', fontSize: '11px' } }, tk.id),
+                 h('button', {
+                   onClick: function (ev) { ev.preventDefault(); copyTicketId(tk.id); },
+                   title: t('copyIdHint'),
+                   style: { fontSize: '10px', padding: '0 7px', borderRadius: '5px', cursor: 'pointer',
+                     background: copiedId === tk.id ? 'rgba(70,180,100,0.14)' : 'rgba(127,127,127,0.1)',
+                     color: copiedId === tk.id ? TONES.green.fg : 'inherit',
+                     border: '1px solid ' + (copiedId === tk.id ? TONES.green.border : 'rgba(127,127,127,0.25)'),
+                     opacity: copiedId === tk.id ? 1 : 0.6 },
+                 }, copiedId === tk.id ? t('copiedBtn') : t('copyIdBtn')))));
             var stageTone = TONES[STAGE_TONE[tk.stage] || 'gray'];
             return h('div', { key: tk.id, style: {
               padding: '10px 12px', borderRadius: '8px', marginBottom: '8px',
