@@ -316,6 +316,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       expandAll: '全部展开',
       collapseAll: '全部收起',
       expandAllHint: '展开或收起任务流的全部阶段分组',
+      runningLabel: '已运行',
+      runningHint: '进入执行阶段的时长（按最近一次状态变化起算）',
       showMoreInGroup: '展开剩余 {count} 条',
       barFilterHint: '点击筛选该阶段',
       copyDigestBtn: '复制待办摘要',
@@ -567,6 +569,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       expandAll: 'Expand all',
       collapseAll: 'Collapse all',
       expandAllHint: 'Expand or collapse every stage group in the stream',
+      runningLabel: 'running',
+      runningHint: 'Time since entering the working stage (from the last status change)',
       showMoreInGroup: 'Show {count} more',
       barFilterHint: 'Click to filter this stage',
       copyDigestBtn: 'Copy digest',
@@ -1489,6 +1493,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     var waitTone = waitMs >= 2 * 3600e3 ? TONES.red : waitMs >= 30 * 60e3 ? TONES.amber : TONES.gray;
                     var dur = durText(waitMs, t);
                     return h('span', { style: { flexShrink: 0, fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: waitTone.bg, color: waitTone.fg, border: '1px solid ' + waitTone.border, whiteSpace: 'nowrap' }, title: t('waitingHint') }, t('waitingLabel') + ' ' + dur);
+                  })()
+                : null,
+              tk.stage === 'working'
+                ? (function () {
+                    var runMs = Date.now() - new Date(tk.updatedAt || tk.createdAt).getTime();
+                    if (!(runMs >= 0)) runMs = 0;
+                    return h('span', { style: { flexShrink: 0, fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: TONES.blue.bg, color: TONES.blue.fg, border: '1px solid ' + TONES.blue.border, whiteSpace: 'nowrap' }, title: t('runningHint') }, t('runningLabel') + ' ' + durText(runMs, t));
                   })()
                 : null,
               h('span', { style: { fontSize: '12px', opacity: 0.55, whiteSpace: 'nowrap' } }, relTime(t, tk.updatedAt))));
