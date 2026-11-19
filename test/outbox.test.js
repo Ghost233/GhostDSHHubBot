@@ -10,7 +10,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Store } from '../src/store.js'
-import { OutboxRunner, retryOutboxRows, insertOutbox } from '../src/outbox.js'
+import { OutboxRunner, retryOutboxRows, discardOutboxRows, insertOutbox } from '../src/outbox.js'
 
 function fixture(opts = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'hub-bot-outbox-'))
@@ -346,5 +346,31 @@ test('retryOutboxRows: targeted retry only touches the named row; legacy failed 
     const second = after.find(r => r.id === rows[1].id)
     assert.equal(first.state, 'queued', '旧死信回落 queued')
     assert.equal(second.state, 'failed', '未点名的不动')
+  } finally { cleanup() }
+})
+
+test('discardOutboxRows removes only failed rows and returns the count (round 41)', () => {
+  const { store, cleanup } = fixture()
+  try {
+    const rows = [
+      insertOutbox(store, { state: 'queued', kind: 'reply', to: 'a', text: 'x' }),
+      insertOutbox(store, { state: 'recorded', kind: 'reply', to: 'a', text: 'y' }),
+      insertOutbox(store, { state: 'queued', kind: 'reply', to: 'b', text: 'z' }),
+    ]
+    for (const row of [rows[0], rows[1]]) {
+      store.db.prepare('UPDATE outbox SET value = ? WHERE id = ?').run(
+        JSON.stringify({ ...row, state: 'failed', attempts: 3, lastError: 'x' }), row.id)
+    }
+    // 单条：点名哪条删哪条，另一条死信与活行都保留
+    assert.equal(discardOutboxRows(store, [rows[0].id]), 1)
+    let after = store.db.prepare('SELECT id, value FROM outbox').all().map(r => ({ id: r.id, ...JSON.parse(String(r.value)) }))
+    assert.deepEqual(after.map(r => r.id).sort(), [rows[1].id, rows[2].id].sort())
+    assert.equal(after.find(r => r.id === rows[2].id).state, 'queued', '活行绝不被误删')
+    // 全部：剩余死信清空
+    assert.equal(discardOutboxRows(store, null), 1)
+    after = store.db.prepare('SELECT id FROM outbox').all()
+    assert.deepEqual(after.map(r => r.id), [rows[2].id])
+    // 不存在/非 failed 的 id → 0
+    assert.equal(discardOutboxRows(store, ['out-missing', rows[2].id]), 0)
   } finally { cleanup() }
 })

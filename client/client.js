@@ -77,6 +77,19 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           }],
           result: anyCodec('dsh-hub-bot#json-result'),
         },
+        'hubBotSettings/discardOutbox': {
+          service: 'hubBotSettings',
+          description: 'Discard dead-letter outbox rows: {id} for one row, {all:true} for all.',
+          invocation: { kind: 'direct' },
+          parameters: [{
+            name: 'request',
+            source: 'json',
+            description: '{ id } for one row or { all: true } for every dead letter.',
+            codec: anyCodec('dsh-hub-bot#json-request'),
+            strictCodec: anyCodec('dsh-hub-bot#json-request'),
+          }],
+          result: anyCodec('dsh-hub-bot#json-result'),
+        },
         'hubBotSettings/modelCatalog': {
           service: 'hubBotSettings',
           description: 'Model catalog for the chief-model picker.',
@@ -251,6 +264,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       healthDetailDead: '投递失败（死信）',
       retryOne: '重投',
       retryAll: '全部重投',
+      discardOne: '丢弃',
+      discardAll: '清空死信',
+      discardOneHint: '确认不再投递，删除这条死信',
+      discardAllHint: '确认全部不再投递，删除所有死信',
+      discardAllConfirm: '确定清空全部死信？这些回执将不再投递。',
+      discardedNotice: '已清空 {count} 条死信',
       filterPlaceholder: '筛选消息 / 负责人 / 工单号…',
       filterAllStages: '全部阶段',
       filterNoMatch: '没有匹配的票据',
@@ -455,6 +474,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       healthDetailDead: 'failed deliveries (dead letters)',
       retryOne: 'Retry',
       retryAll: 'Retry all',
+      discardOne: 'Discard',
+      discardAll: 'Discard all',
+      discardOneHint: 'Never deliver again; delete this dead letter',
+      discardAllHint: 'Never deliver again; delete every dead letter',
+      discardAllConfirm: 'Discard every dead letter? These replies will never be delivered.',
+      discardedNotice: 'Discarded {count} dead letter(s)',
       filterPlaceholder: 'Filter message / owner / ticket id…',
       filterAllStages: 'All stages',
       filterNoMatch: 'No tickets match',
@@ -1060,6 +1085,16 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               })
               .catch(function (e) { setError(e && e.message ? e.message : String(e)); });
           };
+          var discardOutbox = function (idOrNull) {
+            var req = idOrNull === null ? { all: true } : { id: idOrNull };
+            scoped.remote.hubBotSettings.discardOutbox(req)
+              .then(function (raw) {
+                var res = unwrap(raw);
+                flashNotice(fill(t('discardedNotice'), (res && res.discarded) || 0));
+                load();
+              })
+              .catch(function (e) { setError(e && e.message ? e.message : String(e)); });
+          };
           var retryBtnStyle = {
             font: 'inherit', fontSize: '11px', padding: '2px 8px', borderRadius: '5px', cursor: 'pointer',
             border: '1px solid rgba(230,160,40,0.5)', background: 'transparent', color: 'inherit', opacity: 0.9,
@@ -1454,14 +1489,16 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 ? h('details', { style: { marginTop: '4px' } },
                     h('summary', { style: { cursor: 'pointer', color: TONES.red.fg, opacity: 0.9 } }, t('healthDetailDead') + ' · ' + overview.health.outbox.failedList.length),
                     h('div', { style: { marginTop: '4px' } },
-                      h('button', { style: retryBtnStyle, onClick: function (ev) { ev.preventDefault(); retryOutbox(null); } }, t('retryAll'))),
+                      h('button', { style: retryBtnStyle, onClick: function (ev) { ev.preventDefault(); retryOutbox(null); } }, t('retryAll')),
+                      h('button', { style: Object.assign({}, retryBtnStyle, { color: TONES.red.fg, borderColor: TONES.red.border }), title: t('discardAllHint'), onClick: function (ev) { ev.preventDefault(); if (window.confirm(t('discardAllConfirm'))) discardOutbox(null); } }, t('discardAll'))),
                     overview.health.outbox.failedList.map(function (r0) {
                       return h('div', { key: r0.id, style: { marginTop: '6px', padding: '6px 8px', background: 'rgba(0,0,0,0.18)', borderRadius: '6px', fontSize: '12px', borderLeft: '2px solid ' + TONES.red.border } },
                         h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px' } },
                           h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: '8px', minWidth: 0 } },
                             h('span', { style: { fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: TONES.red.bg, color: TONES.red.fg, border: '1px solid ' + TONES.red.border, flexShrink: 0 } }, t('healthPillDead')),
                             h('span', null, (r0.to || '') + ' — ' + (r0.ticketId || '—') + ' · ' + r0.attempts + ' 次尝试')),
-                          h('button', { style: retryBtnStyle, onClick: function () { retryOutbox(r0.id); } }, t('retryOne'))),
+                          h('button', { style: retryBtnStyle, onClick: function () { retryOutbox(r0.id); } }, t('retryOne')),
+                          h('button', { style: Object.assign({}, retryBtnStyle, { color: TONES.red.fg, borderColor: TONES.red.border }), title: t('discardOneHint'), onClick: function () { discardOutbox(r0.id); } }, t('discardOne'))),
                         r0.lastError ? h('div', { style: { opacity: 0.75, marginTop: '2px', wordBreak: 'break-all' } }, t('healthDetailLast') + ': ' + String(r0.lastError).slice(0, 140)) : null);
                     })) : null) : null,
              h('div', { id: 'hub-bot-needs', style: Object.assign({}, sectionStyle, needs.length > 0 ? { borderLeft: '3px solid ' + TONES.amber.border, paddingLeft: '14px' } : {}) },

@@ -56,6 +56,19 @@ export function retryOutboxRows(store, ids = null) {
   return retried
 }
 
+/**
+ * 死信丢弃（round 41）：确认不在乎的失败回执从 outbox 删除——重投治「还想送」，丢弃治「别再来」。
+ * 返回删除的行数。只碰 failed 行，queued/recorded 等活行绝不被误删。
+ */
+export function discardOutboxRows(store, ids = null) {
+  const rows = store.db.prepare('SELECT id, value FROM outbox').all()
+    .map(r => JSON.parse(String(r.value)))
+    .filter(row => row.state === 'failed' && (ids === null || ids.includes(row.id)))
+  const del = store.db.prepare('DELETE FROM outbox WHERE id = ?')
+  for (const row of rows) del.run(row.id)
+  return rows.length
+}
+
 export function updateOutboxRow(store, row) {
   store.db.prepare('UPDATE outbox SET value = ? WHERE id = ?').run(JSON.stringify(row), row.id)
 }

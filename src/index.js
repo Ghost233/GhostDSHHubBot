@@ -34,7 +34,7 @@ import {
   SETTINGS_FILE, applySettingsOverlay, applySettingsPatch, loadSettingsOverlay, mergeSettingsOverlay,
   saveSettingsOverlay, buildOverview, buildSettingsView,
 } from './panel.js'
-import { retryOutboxRows } from './outbox.js'
+import { discardOutboxRows, retryOutboxRows } from './outbox.js'
 import { Store, SCHEMA_VERSION } from './store.js'
 import { Hub, setHub } from './hub.js'
 import { FeishuSource } from './feishu.js'
@@ -360,6 +360,7 @@ export function apply(ctx, rawConfig) {
     listWorkspaces: forwardDep('listWorkspaces'),
     readSessionTitles: forwardDep('readSessionTitles'),
     retryOutbox: forwardDep('retryOutbox'),
+    discardOutbox: forwardDep('discardOutbox'),
   })
   // 填充真实实现——转发层延迟解引用；devApi 未配置时管理面方法本就不该可用（行为与现状一致）。
   Object.assign(serviceDeps, {
@@ -369,6 +370,7 @@ export function apply(ctx, rawConfig) {
     modelCatalog: () => sessions.modelCatalog(),
     // 关联式归位选择器（turn 108）: DSH 工作区枚举。registry 服务缺席（老 DSH）→ 空数组，选择器降级为「自动」。
     retryOutbox: body => retryOutbox(body),
+    discardOutbox: body => discardOutbox(body),
     listWorkspaces: () => (safeGetService(ctx, 'workspaceRegistry')?.list?.() ?? []).map(w => ({ workspaceId: String(w.id), title: w.title ?? null, path: w.path ?? null, sessionIds: Array.isArray(w.sessionIds) ? [...w.sessionIds] : [] })),
     // 会话标题投影（round 27）: 负责人卡片显示绑定会话的标题，不再只是 8 位 id。
     // 标题不在 sessionController.list 条目里——正确来源是 sessionQuery.readTitleSnapshots
@@ -587,6 +589,15 @@ export function apply(ctx, rawConfig) {
     return { retried }
   }
 
+  // 死信丢弃（round 41）: {id} 单条 / {all:true} 全部；确认不在乎的失败回执直接删除。
+  const discardOutbox = body => {
+    if (body?.all === true) return { discarded: discardOutboxRows(store, null) }
+    const id = requireString(body, 'id')
+    const discarded = discardOutboxRows(store, [id])
+    if (discarded === 0) throw new HttpError(404, 'no failed outbox row "' + id + '"')
+    return { discarded }
+  }
+
   const unregister = ctx.webServer.register({
     kind: 'prefix',
     path: '/hub-bot',
@@ -700,6 +711,8 @@ export function apply(ctx, rawConfig) {
           json(res, 200, await resolveTicket(await readBody(req)))
         } else if (route === 'outbox/retry' && method === 'POST') {
           json(res, 200, retryOutbox(await readBody(req)))
+        } else if (route === 'outbox/discard' && method === 'POST') {
+          json(res, 200, discardOutbox(await readBody(req)))
         } else {
           throw new HttpError(404, 'Unknown operation: ' + method + ' ' + route)
         }

@@ -108,6 +108,16 @@ export class HubBotSettingsService extends TypertRemoteService {
     }
   }
 
+  /** 死信丢弃（round 41）: {id} 单条 / {all:true} 全部；返回 {discarded}。 */
+  async discardOutbox(request) {
+    try {
+      return await this.deps.discardOutbox(request ?? {})
+    } catch (error) {
+      if (error?.statusCode === 404 || error?.statusCode === 400) throw new RemoteError('outbox/invalid', error?.message ?? 'invalid discard request')
+      throw error
+    }
+  }
+
   async modelCatalog() {
     const value = await this.deps.modelCatalog()
     return value === undefined ? null : JSON.parse(JSON.stringify(value))
@@ -149,6 +159,7 @@ markRemote(HubBotSettingsService, 'listOwners', {})
 markRemote(HubBotSettingsService, 'modelCatalog', {})
 markRemote(HubBotSettingsService, 'listWorkspaces', {})
 markRemote(HubBotSettingsService, 'retryOutbox', {})
+markRemote(HubBotSettingsService, 'discardOutbox', {})
 markRemote(HubBotSettingsService, 'overview', {})
 markRemote(HubBotSettingsService, 'resolveTicket', {})
 markRemote(HubBotSettingsService, 'startFeishuRegister', {})
