@@ -310,6 +310,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       replySent: '已回复',
       replyCopyHint: '点击复制回复内容',
       waitingLabel: '已等待',
+      expandAll: '全部展开',
+      collapseAll: '全部收起',
+      expandAllHint: '展开或收起任务流的全部阶段分组',
       clearFilters: '清除筛选',
       clearFiltersHint: '清空本区的全部筛选条件',
       waitingHint: '从进入当前阶段起算；灰 <30 分钟，琥珀 <2 小时，红色更久',
@@ -548,6 +551,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       replySent: 'replied',
       replyCopyHint: 'Click to copy the reply text',
       waitingLabel: 'waiting',
+      expandAll: 'Expand all',
+      collapseAll: 'Collapse all',
+      expandAllHint: 'Expand or collapse every stage group in the stream',
       clearFilters: 'Clear filters',
       clearFiltersHint: 'Reset every filter in this section',
       waitingHint: 'Time in the current stage; gray <30m, amber <2h, red beyond',
@@ -1271,6 +1277,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var bbs = React.useState(false); var batchBusy = bbs[0]; var setBatchBusy = bbs[1];
           var hvs = React.useState(null); var hoverTicket = hvs[0]; var setHoverTicket = hvs[1];
           var eds = React.useState({}); var expandedDone = eds[0]; var setExpandedDone = eds[1];
+          var aos = React.useState(false); var allOpen = aos[0]; var setAllOpen = aos[1];
           var resolve = function (tk, resolution) {
             var label = resolution === 'confirm' ? t('confirmBtn') : resolution === 'accept' ? t('acceptBtn') : resolution === 'retry' ? t('retryTicketBtn') : resolution === 'cancel' ? t('cancelTicketBtn') : t('rejectBtn');
             if (!window.confirm(label + ' — ' + (tk.pendingConfirm && tk.pendingConfirm.text ? tk.pendingConfirm.text : tk.id))) return;
@@ -1788,7 +1795,16 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                           title: t('clearFiltersHint'),
                           style: { fontSize: '11px', padding: '3px 10px', borderRadius: '999px', cursor: 'pointer', background: 'rgba(127,127,127,0.08)', border: '1px solid rgba(127,127,127,0.25)', opacity: 0.75, whiteSpace: 'nowrap' },
                         }, '× ' + t('clearFilters'))
-                      : null),
+                      : null,
+                    h('button', {
+                      onClick: function () {
+                        var next = !allOpen; setAllOpen(next);
+                        var sec = document.getElementById('hub-bot-stream');
+                        if (sec) [...sec.querySelectorAll('details')].forEach(function (d) { d.open = next; });
+                      },
+                      title: t('expandAllHint'),
+                      style: { marginLeft: 'auto', fontSize: '11px', padding: '3px 10px', borderRadius: '999px', cursor: 'pointer', background: 'rgba(127,127,127,0.08)', border: '1px solid rgba(127,127,127,0.25)', opacity: 0.75, whiteSpace: 'nowrap' },
+                    }, allOpen ? '▴ ' + t('collapseAll') : '▾ ' + t('expandAll'))),
               filtered.length === 0 && tickets.length > 0
                 ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 10px' } }, t('filterNoMatch'))
                 : STAGE_ORDER.map(function (stage) {
