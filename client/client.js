@@ -313,6 +313,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       expandAll: '全部展开',
       collapseAll: '全部收起',
       expandAllHint: '展开或收起任务流的全部阶段分组',
+      revertBtn: '还原',
+      revertHint: '放弃修改，回到已保存的值',
       copyMsgHint: '点击复制原文',
       clearFilters: '清除筛选',
       clearFiltersHint: '清空本区的全部筛选条件',
@@ -555,6 +557,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       expandAll: 'Expand all',
       collapseAll: 'Collapse all',
       expandAllHint: 'Expand or collapse every stage group in the stream',
+      revertBtn: 'Revert',
+      revertHint: 'Discard changes and restore the saved values',
       copyMsgHint: 'Click to copy the original message',
       clearFilters: 'Clear filters',
       clearFiltersHint: 'Reset every filter in this section',
@@ -758,6 +762,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           }, busy ? t('saving') : t('save')),
           saved && !wsDirty ? h('span', { style: { fontSize: '12px', opacity: 0.7 } }, t('saved')) : null,
           wsDirty ? h('span', { style: { fontSize: '11px', padding: '1px 8px', borderRadius: '999px', background: 'rgba(230,160,40,0.14)', color: '#eba938', border: '1px solid rgba(230,160,40,0.4)', whiteSpace: 'nowrap' } }, t('unsaved')) : null,
+          wsDirty ? h('button', { onClick: function () { setForm({ enabled: ws.enabled !== false, chiefWorkspaceId: ws.chiefWorkspaceId || '', chiefTitle: ws.chiefTitle || 'Hub Bot 中枢' }); setSaved(false); }, disabled: busy, title: t('revertHint'), style: { fontSize: '11px', padding: '4px 12px', borderRadius: '6px', cursor: 'pointer', background: 'transparent', border: '1px solid rgba(230,160,40,0.4)', color: '#eba938' } }, t('revertBtn')) : null,
           error ? h('span', { style: { fontSize: '12px', color: 'var(--dsh-danger, #d66)' } }, t('failed') + ': ' + error) : null));
     }
 
@@ -1128,6 +1133,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               h('button', { onClick: save, disabled: busy, style: Object.assign({}, inputStyle, { width: 'auto', cursor: 'pointer', padding: '6px 16px' }) }, busy ? t('saving') : t('save')),
               saved && !rtDirty ? h('span', { style: { fontSize: '12px', opacity: 0.7 } }, t('saved')) : null,
               rtDirty ? h('span', { style: { fontSize: '11px', padding: '1px 8px', borderRadius: '999px', background: 'rgba(230,160,40,0.14)', color: '#eba938', border: '1px solid rgba(230,160,40,0.4)', whiteSpace: 'nowrap' } }, t('unsaved')) : null,
+              rtDirty ? h('button', { onClick: function () { setForm({ slots: curSlots, reportAuto: curAuto, reportMin: curMin, patterns: curPatterns }); setSaved(false); }, disabled: busy, title: t('revertHint'), style: { fontSize: '11px', padding: '4px 12px', borderRadius: '6px', cursor: 'pointer', background: 'transparent', border: '1px solid rgba(230,160,40,0.4)', color: '#eba938' } }, t('revertBtn')) : null,
               err ? h('span', { style: { fontSize: '12px', color: 'var(--dsh-danger, #d66)' } }, t('failed') + ': ' + err) : null));
         }
 
@@ -2013,6 +2019,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     modelDirty ? h('span', { style: { fontSize: '11px', padding: '1px 8px', borderRadius: '999px', background: 'rgba(230,160,40,0.14)', color: '#eba938', border: '1px solid rgba(230,160,40,0.4)', whiteSpace: 'nowrap' } }, t('unsaved')) : null)
                 : h('div', { style: warnStyle }, t('catalogUnavailable')),
               modelChoice === '' && defaultModelLabel ? h('div', { style: Object.assign({}, warnStyle, { color: TONES.blue.fg, opacity: 0.85 }) }, fill(t('modelDefaultNow'), defaultModelLabel)) : null,
+                    modelDirty ? h('button', { onClick: function () { setModelChoice(savedChoice); }, disabled: modelBusy, title: t('revertHint'), style: { fontSize: '11px', padding: '4px 12px', borderRadius: '6px', cursor: 'pointer', background: 'transparent', border: '1px solid rgba(230,160,40,0.4)', color: '#eba938' } }, t('revertBtn')) : null,
               h('div', { style: warnStyle }, t('modelPickerHint'))),
             h('div', { id: 'hub-bot-feishu' },
               h(FeishuSection, { view: view, onRefresh: refreshView }),
