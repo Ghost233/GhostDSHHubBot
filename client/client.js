@@ -313,6 +313,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       expandAll: '全部展开',
       collapseAll: '全部收起',
       expandAllHint: '展开或收起任务流的全部阶段分组',
+      barFilterHint: '点击筛选该阶段',
       copyDigestBtn: '复制待办摘要',
       copyDigestHint: '把待办列表复制成纯文本（可贴到飞书/笔记）',
       revertBtn: '还原',
@@ -559,6 +560,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       expandAll: 'Expand all',
       collapseAll: 'Collapse all',
       expandAllHint: 'Expand or collapse every stage group in the stream',
+      barFilterHint: 'Click to filter this stage',
       copyDigestBtn: 'Copy digest',
       copyDigestHint: 'Copy the needs-me list as plain text (paste to Feishu/notes)',
       revertBtn: 'Revert',
@@ -1995,7 +1997,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                               var tone = TONES[STAGE_TONE[st] || 'gray'];
                               var sample = null;
                               for (var si = 0; si < mine.length; si++) if (mine[si].stage === st) { sample = mine[si]; break; }
-                              return h('span', { key: st, title: (sample && sample.stageText ? sample.stageText : st) + ' x ' + byStage[st], style: { flex: byStage[st] + ' 1 0', minWidth: '10px', background: tone.border } });
+                              return h('span', { key: st, title: (sample && sample.stageText ? sample.stageText : st) + ' x ' + byStage[st] + ' · ' + t('barFilterHint'), style: { flex: byStage[st] + ' 1 0', minWidth: '10px', background: tone.border, cursor: 'pointer' }, onClick: function (ev) { ev.stopPropagation(); setFilterOwner(label); setFilterStage(st); scrollToSection('hub-bot-stream'); } });
                             }));
                         })(),
                         h('div', { style: { display: 'flex', alignItems: 'center', gap: '12px', fontSize: '12px' } },
