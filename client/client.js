@@ -253,6 +253,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       batchFailed: '{count} 条批量操作失败',
       droppedCardHint: '最近未受理',
       retriedNotice: '已重投 {count} 条，回到投递队列',
+      confirmDone: '已确认，继续执行',
+      rejectDone: '已拒绝，任务转被卡住',
+      acceptDone: '已验收通过',
+      batchConfirmed: '已批量确认 {count} 条',
+      batchRejected: '已批量拒绝 {count} 条',
+      answerDone: '已回复，任务继续',
       feishuMetricsTitle: '连接质量：',
       feishuMetricsReconnects: '重连 {count} 次',
       feishuMetricsLastConnected: '最近连接',
@@ -408,6 +414,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       batchFailed: '{count} batch operations failed',
       droppedCardHint: 'Last dropped',
       retriedNotice: 'Requeued {count} row(s) to the delivery queue',
+      confirmDone: 'Confirmed, resuming',
+      rejectDone: 'Rejected, ticket blocked',
+      acceptDone: 'Accepted',
+      batchConfirmed: 'Confirmed {count} ticket(s)',
+      batchRejected: 'Rejected {count} ticket(s)',
+      answerDone: 'Replied, ticket resumed',
       feishuMetricsTitle: 'Connection:',
       feishuMetricsReconnects: '{count} reconnects',
       feishuMetricsLastConnected: 'last connected',
@@ -855,7 +867,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             if (!window.confirm(label + ' — ' + (tk.pendingConfirm && tk.pendingConfirm.text ? tk.pendingConfirm.text : tk.id))) return;
             setResolving(tk.id + ':' + resolution); setError(null);
             scoped.remote.hubBotSettings.resolveTicket({ ticketId: tk.id, resolution: resolution })
-              .then(function () { load(); })
+              .then(function () {
+                var doneKey = resolution === 'confirm' ? 'confirmDone' : resolution === 'accept' ? 'acceptDone' : 'rejectDone';
+                flashNotice(t(doneKey));
+                load();
+              })
               .catch(function (e) { setError(t('resolveFailed') + ': ' + (e && e.message ? e.message : String(e))); })
               .finally(function () { setResolving(null); });
           };
@@ -880,6 +896,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             chain.then(function () {
               setSelected({}); setBatchBusy(false);
               if (failed > 0) setError(fill(t('batchFailed'), failed));
+              else flashNotice(fill(t(resolution === 'confirm' ? 'batchConfirmed' : 'batchRejected'), ids.length));
               load();
             });
           };
@@ -892,6 +909,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             scoped.remote.hubBotSettings.resolveTicket({ ticketId: tk.id, resolution: 'answer', message: text })
               .then(function () {
                 var next = Object.assign({}, answers); delete next[tk.id]; setAnswers(next);
+                flashNotice(t('answerDone'));
                 load();
               })
               .catch(function (e) { setError(t('resolveFailed') + ': ' + (e && e.message ? e.message : String(e))); })
