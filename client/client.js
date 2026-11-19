@@ -1815,6 +1815,23 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                               h('span', { style: { flexShrink: 0, width: '6px', height: '6px', borderRadius: '999px', background: TONES.blue.border } }),
                               h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.75 } }, current.message || '—'))
                           : null,
+                        (function () {
+                          // 活跃票阶段迷你条 (round 52): 一眼看出这个负责人在跑/卡/等的构成。
+                          var byStage = {}; var order = [];
+                          mine.forEach(function (tk) {
+                            if (tk.stage === 'done') return;
+                            if (!byStage[tk.stage]) { byStage[tk.stage] = 0; order.push(tk.stage); }
+                            byStage[tk.stage] += 1;
+                          });
+                          if (order.length === 0) return null;
+                          return h('div', { style: { display: 'flex', height: '6px', borderRadius: '999px', overflow: 'hidden', marginBottom: '8px', gap: '2px' } },
+                            order.map(function (st) {
+                              var tone = TONES[STAGE_TONE[st] || 'gray'];
+                              var sample = null;
+                              for (var si = 0; si < mine.length; si++) if (mine[si].stage === st) { sample = mine[si]; break; }
+                              return h('span', { key: st, title: (sample && sample.stageText ? sample.stageText : st) + ' x ' + byStage[st], style: { flex: byStage[st] + ' 1 0', minWidth: '10px', background: tone.border } });
+                            }));
+                        })(),
                         h('div', { style: { display: 'flex', alignItems: 'center', gap: '12px', fontSize: '12px' } },
                           h('span', { style: { display: 'inline-flex', alignItems: 'center', minWidth: 0 }, title: (o.sessionTitle ? o.sessionTitle + ' — ' : '') + (o.sessionId || '') || undefined },
                             o.sessionId ? dot('#46bb6d') : dot('rgba(140,140,140,0.6)'),
