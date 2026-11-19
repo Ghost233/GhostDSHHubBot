@@ -64,6 +64,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           parameters: [],
           result: anyCodec('dsh-hub-bot#json-result'),
         },
+        'hubBotSettings/selfTest': {
+          service: 'hubBotSettings',
+          description: 'Panel self-test: simulate one Feishu message through the real pipeline (a real reply is delivered).',
+          invocation: { kind: 'direct' },
+          parameters: [],
+          result: anyCodec('dsh-hub-bot#json-result'),
+        },
         'hubBotSettings/retryOutbox': {
           service: 'hubBotSettings',
           description: 'Retry failed (dead-letter) outbox deliveries: {id} for one row, {all:true} for all.',
@@ -194,6 +201,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       copyPathHint: '点击复制完整路径',
       copySessionHint: '点击复制完整会话 id',
       unsaved: '未保存',
+      selfTestBtn: '自检',
+      selfTestHint: '模拟一条飞书消息走完整链路（会向你的飞书发一条真实回复）',
+      selfTestConfirm: '自检会向你的飞书会话发送一条真实回复。确认继续？',
+      selfTestInjected: '自检消息已注入 chief 会话，等待回复…',
+      selfTestPassed: '自检通过：回复已送达飞书',
+      selfTestDropped: '自检消息被策略丢弃',
+      selfTestTimeout: '自检超时：chief 未回复（会话可能被归档，或模型不可用）',
       ownersCard: '负责人',
       needsCard: '待我处理',
       connected: '已连接',
@@ -416,6 +430,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       copyPathHint: 'Click to copy the full path',
       copySessionHint: 'Click to copy the full session id',
       unsaved: 'Unsaved',
+      selfTestBtn: 'Self-test',
+      selfTestHint: 'Simulate a Feishu message through the full pipeline (a REAL reply lands in your Feishu)',
+      selfTestConfirm: 'The self-test sends a REAL reply to your bound Feishu chat. Continue?',
+      selfTestInjected: 'Self-test message injected into the chief session, waiting for the reply…',
+      selfTestPassed: 'Self-test passed: reply delivered to Feishu',
+      selfTestDropped: 'Self-test message dropped by policy',
+      selfTestTimeout: 'Self-test timed out: the chief did not reply (session may be archived or the model unavailable)',
       ownersCard: 'Owners',
       needsCard: 'Needs me',
       connected: 'Connected',
@@ -1092,6 +1113,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var nts = React.useState(''); var notice = nts[0]; var setNotice = nts[1];
           var noticeSeq = React.useRef(0);
           var lls = React.useState(null); var lastLoadedAt = lls[0]; var setLastLoadedAt = lls[1];
+          var sts2 = React.useState(false); var selfTestBusy = sts2[0]; var setSelfTestBusy = sts2[1];
           var ms = React.useState(''); var modelChoice = ms[0]; var setModelChoice = ms[1];
           var bs = React.useState(false); var modelBusy = bs[0]; var setModelBusy = bs[1];
           var ds = React.useState(false); var modelDone = ds[0]; var setModelDone = ds[1];
@@ -1124,6 +1146,46 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             var seq = ++noticeSeq.current;
             setNotice(text);
             setTimeout(function () { if (noticeSeq.current === seq) setNotice(''); }, 3500);
+          };
+          // 面板「自检」 (round 53): 注入模拟飞书消息后轮询 overview，等到 reply=sent 或超时。
+          var pollSelfTest = function (attempt) {
+            scoped.remote.hubBotSettings.overview().then(function (raw) {
+              var ov = unwrap(raw);
+              var found = null;
+              (ov.recentTriggers || []).forEach(function (tr) { if (!found && String(tr.id).indexOf('om_selftest-') === 0) found = tr; });
+              if (found && found.reply && found.reply.state === 'sent') {
+                setSelfTestBusy(false);
+                flashNotice(t('selfTestPassed'));
+                load();
+              } else if (found && found.dropped) {
+                setSelfTestBusy(false);
+                setError(t('selfTestDropped') + ': ' + found.dropped);
+              } else if (attempt >= 14) {
+                setSelfTestBusy(false);
+                setError(t('selfTestTimeout'));
+                load();
+              } else {
+                setTimeout(function () { pollSelfTest(attempt + 1); }, 2500);
+              }
+            }).catch(function () {
+              if (attempt >= 14) { setSelfTestBusy(false); setError(t('selfTestTimeout')); }
+              else setTimeout(function () { pollSelfTest(attempt + 1); }, 2500);
+            });
+          };
+          var runSelfTest = function () {
+            if (!window.confirm(t('selfTestConfirm'))) return;
+            setSelfTestBusy(true);
+            setError(null);
+            scoped.remote.hubBotSettings.selfTest()
+              .then(function (raw) {
+                unwrap(raw);
+                flashNotice(t('selfTestInjected'));
+                setTimeout(function () { pollSelfTest(0); }, 2500);
+              })
+              .catch(function (e) {
+                setSelfTestBusy(false);
+                setError(e && e.message ? e.message : String(e));
+              });
           };
           // 自动刷新（round 7）: 每 15s 拉一次 overview——新消息/票据状态变化不用手动刷新页面。
           // 只刷 overview 不刷 view: RowConfig 的表单正在编辑时不能被远端值覆盖。
@@ -1562,7 +1624,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               view && view.version ? h('span', { style: { fontSize: '11px', fontFamily: 'monospace', padding: '1px 8px', borderRadius: '999px', background: 'rgba(127,127,127,0.1)', border: '1px solid rgba(127,127,127,0.2)', opacity: 0.75 } }, 'v' + view.version) : null,
               lastLoadedAt ? h('span', { style: { fontSize: '11px', opacity: 0.55 } }, t('updatedAt') + ' ' + relTime(t, lastLoadedAt)) : null,
               h('span', { style: { fontSize: '11px', opacity: 0.4 } }, t('autoRefreshHint')),
-              h('button', { onClick: function () { load(); }, title: t('refreshHint'), style: { marginLeft: 'auto', fontSize: '11px', padding: '3px 12px', borderRadius: '6px', cursor: 'pointer', background: 'rgba(127,127,127,0.08)', border: '1px solid rgba(127,127,127,0.22)', opacity: 0.85 } }, '\u21bb ' + t('refreshBtn'))),
+              h('button', { onClick: runSelfTest, disabled: selfTestBusy, title: t('selfTestHint'), style: { marginLeft: 'auto', fontSize: '11px', padding: '3px 12px', borderRadius: '6px', cursor: 'pointer', background: 'rgba(70,150,255,0.1)', border: '1px solid rgba(70,150,255,0.3)', color: '#7db8ff', opacity: selfTestBusy ? 0.5 : 0.9 } }, selfTestBusy ? t('saving') : t('selfTestBtn')),
+              h('button', { onClick: function () { load(); }, title: t('refreshHint'), style: { fontSize: '11px', padding: '3px 12px', borderRadius: '6px', cursor: 'pointer', background: 'rgba(127,127,127,0.08)', border: '1px solid rgba(127,127,127,0.22)', opacity: 0.85 } }, '\u21bb ' + t('refreshBtn'))),
             h('div', { style: cardRowStyle },
               h('div', { style: Object.assign({}, cardStyle, clickableCard('hub-bot-feishu')), onClick: function () { scrollToSection('hub-bot-feishu'); }, title: t('cardJumpHint') }, h('div', { style: cardTitleStyle }, t('feishuCard')), h('div', { style: cardValueStyle }, dot(feishuColor), feishuText), feishuSub ? h('div', { style: cardSubStyle }, feishuSub) : null,
                 lastDropped ? h('div', { style: Object.assign({}, cardSubStyle, { color: TONES.amber.fg, opacity: 0.85 }), title: lastDropped.message || '' },

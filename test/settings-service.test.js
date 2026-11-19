@@ -90,6 +90,19 @@ test('unexpected errors propagate unchanged', async () => {
   await assert.rejects(() => service.update({}), error => error === boom)
 })
 
+test('selfTest forwards to the dep (round 53)', async () => {
+  const { service } = makeService({ selfTest: async () => ({ injected: true, triggerId: 'feishu-om_selftest-1', sessionId: 's1' }) })
+  const out = await service.selfTest()
+  assert.equal(out.triggerId, 'feishu-om_selftest-1')
+})
+
+test('selfTest maps 400s to RemoteError with details (round 53)', async () => {
+  const err = new Error('no feishu chat on record yet')
+  err.statusCode = 400
+  const { service } = makeService({ selfTest: async () => { throw err } })
+  await assert.rejects(() => service.selfTest(), (e) => e.code === 'self-test/unavailable' && e.details !== undefined)
+})
+
 test('listOwners projects registry rows to plain JSON', async () => {
   const rows = [{
     id: 'chief', role: 'chief', kind: 'repo', workspace: 'Ghost233HomeRepo',

@@ -118,6 +118,16 @@ export class HubBotSettingsService extends TypertRemoteService {
     }
   }
 
+  /** 面板「自检」 (round 53): 模拟飞书消息走完整链路的直通方法。 */
+  async selfTest() {
+    try {
+      return await this.deps.selfTest()
+    } catch (error) {
+      if (error?.statusCode === 400) throw new RemoteError('self-test/unavailable', error.message ?? 'self-test unavailable', {})
+      throw error
+    }
+  }
+
   async modelCatalog() {
     const value = await this.deps.modelCatalog()
     return value === undefined ? null : JSON.parse(JSON.stringify(value))
@@ -160,6 +170,7 @@ markRemote(HubBotSettingsService, 'modelCatalog', {})
 markRemote(HubBotSettingsService, 'listWorkspaces', {})
 markRemote(HubBotSettingsService, 'retryOutbox', {})
 markRemote(HubBotSettingsService, 'discardOutbox', {})
+markRemote(HubBotSettingsService, 'selfTest', {})
 markRemote(HubBotSettingsService, 'overview', {})
 markRemote(HubBotSettingsService, 'resolveTicket', {})
 markRemote(HubBotSettingsService, 'startFeishuRegister', {})

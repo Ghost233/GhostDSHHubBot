@@ -349,6 +349,37 @@ export function apply(ctx, rawConfig) {
   // 独立于 devApi——管理 API 关掉时 GUI 设置页照常工作。
   // #53 转发 deps：cordis service 注册全局唯一，热重载时旧 service 实例可能残留（dispose 不保证注销）——
   // 它的 deps 若捕获旧 fiber 闭包，重载后调用会撞上 inactive context。转发层让任何残留实例都落到最新实现。
+  /**
+   * 面板「自检」 (round 53): 构造一条模拟 im.message.receive_v1 事件，走真实 normalize → 策略 → trigger →
+   * chief 注入链路；chief 经 reply_source 回投 outbox，由投递循环真实发到用户飞书。
+   * chatId/openId 取最近一条真实 trigger——保证回复落进用户确实存在的会话。
+   */
+  const selfTest = async () => {
+    if (!config.feishu.enabled) throw new HttpError(400, 'feishu is not enabled')
+    const rows = store.db.prepare('SELECT value FROM trigger ORDER BY at DESC LIMIT 50').all()
+    let chatId = null; let openId = null
+    for (const r of rows) {
+      try {
+        const v = JSON.parse(String(r.value))
+        if (v?.source?.chatId) { chatId = v.source.chatId; openId = v.source?.openId ?? null; break }
+      } catch { /* 跳过坏行 */ }
+    }
+    if (!chatId) throw new HttpError(400, 'no feishu chat on record yet — send the bot one real message first')
+    const ts = Date.now()
+    const event = {
+      sender: { sender_type: 'user', sender_id: { open_id: openId ?? 'ou_selftest' } },
+      message: {
+        message_id: 'om_selftest-' + ts,
+        chat_id: chatId,
+        chat_type: 'p2p',
+        message_type: 'text',
+        content: JSON.stringify({ text: '自检：Hub Bot 端到端连通性测试 ' + ts }),
+      },
+    }
+    const result = await feishu.handleEvent(event)
+    return { ...result, chatId, at: new Date().toISOString() }
+  }
+
   const serviceDeps = {}
   const forwardDep = name => (...args) => serviceDeps[name](...args)
   new HubBotSettingsService(ctx, {
@@ -363,6 +394,7 @@ export function apply(ctx, rawConfig) {
     readSessionTitles: forwardDep('readSessionTitles'),
     retryOutbox: forwardDep('retryOutbox'),
     discardOutbox: forwardDep('discardOutbox'),
+    selfTest: forwardDep('selfTest'),
   })
   // 填充真实实现——转发层延迟解引用；devApi 未配置时管理面方法本就不该可用（行为与现状一致）。
   Object.assign(serviceDeps, {
@@ -373,6 +405,7 @@ export function apply(ctx, rawConfig) {
     // 关联式归位选择器（turn 108）: DSH 工作区枚举。registry 服务缺席（老 DSH）→ 空数组，选择器降级为「自动」。
     retryOutbox: body => retryOutbox(body),
     discardOutbox: body => discardOutbox(body),
+    selfTest,
     listWorkspaces: () => (safeGetService(ctx, 'workspaceRegistry')?.list?.() ?? []).map(w => ({ workspaceId: String(w.id), title: w.title ?? null, path: w.path ?? null, sessionIds: Array.isArray(w.sessionIds) ? [...w.sessionIds] : [] })),
     // 会话标题投影（round 27）: 负责人卡片显示绑定会话的标题，不再只是 8 位 id。
     // 标题不在 sessionController.list 条目里——正确来源是 sessionQuery.readTitleSnapshots
@@ -461,6 +494,7 @@ export function apply(ctx, rawConfig) {
     await ctx.sessionPersistence.flush()
     return { ...value, requestId }
   }
+
 
   /** Tool registrations made by /decorate, keyed by Session so they release when the Session's Agent is disposed. */
   const decorations = new Map()
@@ -697,6 +731,9 @@ export function apply(ctx, rawConfig) {
           // Dev proof aid: inject one mock im.message.receive_v1 event through the real normalization/policy path.
           const body = await readBody(req)
           json(res, 200, await feishu.handleEvent(body.event ?? body))
+        } else if (route === 'self-test' && method === 'POST') {
+          // 面板「自检」(round 53): 模拟一条飞书消息走完整链路（真实回复会发到用户飞书）。
+          json(res, 200, await selfTest())
         } else if (route === 'github/status' && method === 'GET') {
           // 面板健康视图: 逐仓库开关、水位线与最近一次轮询错误。
           json(res, 200, await github.status())

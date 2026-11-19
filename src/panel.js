@@ -297,12 +297,27 @@ export function buildOverview({ store, registry, health, now, listDir }) {
   // failed > held/queued > sent > recorded，让失败永远浮在最上面。
   const REPLY_PRIORITY = { failed: 0, held: 1, queued: 1, sent: 2, recorded: 3 }
   const outboxByTicket = new Map()
+  // 直接回复（chief 未建票）outbox 行 ticketId 为空——按 feishu:chat:<chatId> 另建索引归位到 trigger (round 53)。
+  const replyRowsByChat = new Map()
   for (const row of readAll('outbox')) {
+    if (row.kind === 'reply' && row.to && String(row.to).startsWith('feishu:chat:')) {
+      const chatList = replyRowsByChat.get(row.to) ?? []
+      chatList.push(row)
+      replyRowsByChat.set(row.to, chatList)
+    }
     if (!row.ticketId) continue
     const list = outboxByTicket.get(row.ticketId) ?? []
     list.push(row)
     outboxByTicket.set(row.ticketId, list)
   }
+  const directReplyFor = trigger => {
+    if (trigger.kind !== 'feishu' || !trigger.source?.chatId) return null
+    const rows = (replyRowsByChat.get('feishu:chat:' + trigger.source.chatId) ?? [])
+      .filter(r => String(r.createdAt ?? '') >= String(trigger.at ?? ''))
+      .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')))
+    return rows[0] ?? null
+  }
+  const replyStateForRow = row => ({ state: row.state ?? 'queued', id: row.id, attempts: row.attempts ?? 0, lastError: row.lastError ?? null })
   const replyStateFor = ticketId => {
     const rows = outboxByTicket.get(ticketId)
     if (!rows || rows.length === 0) return null
@@ -314,6 +329,7 @@ export function buildOverview({ store, registry, health, now, listDir }) {
     .slice(0, 12)
     .map(t => {
       const tk = ticketByTriggerId.get(t.id)
+      const direct = tk ? null : directReplyFor(t)
       return {
         id: t.id,
         kind: t.kind ?? null,
@@ -324,7 +340,7 @@ export function buildOverview({ store, registry, health, now, listDir }) {
         ownerLabel: tk?.ownerLabel ?? null,
         stage: tk?.stage ?? null,
         stageText: tk?.stageText ?? null,
-        reply: tk?.id ? replyStateFor(tk.id) : null,
+        reply: tk?.id ? replyStateFor(tk.id) : (direct ? replyStateForRow(direct) : null),
       }
     })
   return {
