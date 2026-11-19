@@ -200,6 +200,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       feishuPermsTitle: '权限申明（授权时将申请）',
       feishuBindFailed: '发起绑定失败',
       feishuDisabled: '飞书未启用（配置里 feishu.enabled 未开）',
+      feishuEnableHowto: '启用后，你可以在飞书里给 Hub Bot 发消息、远程收状态汇报。',
+      feishuEnableStep1: '编辑 DSH profile 的 cordis.patch.yml，把 hub-bot 配置的 feishu.enabled 改为 true',
+      feishuEnableStep2: '重启 DSH 实例（配置改动需要重启生效），回到这里扫码绑定',
       recentSection: '最近消息',
       emptyRecent: '还没有消息进来',
       kindFeishu: '飞书',
@@ -363,6 +366,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       feishuPermsTitle: 'Permissions (requested at authorization)',
       feishuBindFailed: 'Failed to start binding',
       feishuDisabled: 'Feishu disabled (feishu.enabled is off in config)',
+      feishuEnableHowto: 'Once enabled, you can message Hub Bot in Feishu and receive status reports remotely.',
+      feishuEnableStep1: 'Edit cordis.patch.yml of the DSH profile: set feishu.enabled to true in the hub-bot config',
+      feishuEnableStep2: 'Restart the DSH instance (config changes require a restart), then scan the QR code here to bind',
       recentSection: 'Recent messages',
       emptyRecent: 'No inbound messages yet',
       kindFeishu: 'Feishu',
@@ -726,7 +732,15 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var perms = fs.permissions || [];
           var rows = [];
           if (!enabled) {
-            rows.push(h('p', { key: 'off', style: { fontSize: '13px', opacity: 0.6, margin: 0 } }, t('feishuDisabled')));
+            // 未启用不只是状态——给一条可以照做的启用路径（配置改动需重启实例生效）。
+            rows.push(h('div', { key: 'off', style: { display: 'flex', gap: '12px', padding: '13px 15px', borderRadius: '10px', background: 'rgba(230,160,40,0.06)', border: '1px solid rgba(230,160,40,0.25)' } },
+              h('span', { style: { fontSize: '16px', width: '28px', height: '28px', lineHeight: '27px', textAlign: 'center', borderRadius: '50%', background: TONES.amber.bg, border: '1px solid ' + TONES.amber.border, color: TONES.amber.fg, flexShrink: 0 } }, '!'),
+              h('div', { style: { minWidth: 0 } },
+                h('div', { style: { fontSize: '13px', fontWeight: 600 } }, t('feishuDisabled')),
+                h('div', { style: { fontSize: '12px', opacity: 0.7, marginTop: '3px', lineHeight: 1.6 } }, t('feishuEnableHowto')),
+                h('ol', { style: { fontSize: '12px', opacity: 0.75, margin: '6px 0 0', paddingLeft: '18px', lineHeight: 1.7 } },
+                  h('li', null, t('feishuEnableStep1')),
+                  h('li', null, t('feishuEnableStep2'))))));
           } else if (bound) {
             rows.push(h('div', { key: 'card', style: { display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' } },
               dot(fs.bot.connected ? '#46bb6d' : '#e06060'),
