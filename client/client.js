@@ -833,6 +833,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var as2 = React.useState({}); var answers = as2[0]; var setAnswers = as2[1];
           var sls = React.useState({}); var selected = sls[0]; var setSelected = sls[1];
           var bbs = React.useState(false); var batchBusy = bbs[0]; var setBatchBusy = bbs[1];
+          var hvs = React.useState(null); var hoverTicket = hvs[0]; var setHoverTicket = hvs[1];
           var resolve = function (tk, resolution) {
             var label = resolution === 'confirm' ? t('confirmBtn') : resolution === 'accept' ? t('acceptBtn') : t('rejectBtn');
             if (!window.confirm(label + ' — ' + (tk.pendingConfirm && tk.pendingConfirm.text ? tk.pendingConfirm.text : tk.id))) return;
@@ -1100,11 +1101,18 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                      opacity: copiedId === tk.id ? 1 : 0.6 },
                  }, copiedId === tk.id ? t('copiedBtn') : t('copyIdBtn')))));
             var stageTone = TONES[STAGE_TONE[tk.stage] || 'gray'];
-            return h('div', { key: tk.id, style: {
+            var isHover = hoverTicket === tk.id;
+            return h('div', {
+              key: tk.id,
+              onMouseEnter: function () { setHoverTicket(tk.id); },
+              onMouseLeave: function () { setHoverTicket(null); },
+              style: {
               padding: '10px 12px', borderRadius: '8px', marginBottom: '8px',
               border: '1px solid var(--dsh-border, rgba(127,127,127,0.2))',
               borderLeft: '3px solid ' + stageTone.border,
               background: 'var(--dsh-surface-raised, rgba(127,127,127,0.04))',
+              boxShadow: isHover ? '0 0 0 1.5px rgba(120,170,255,0.55)' : 'none',
+              transition: 'box-shadow 120ms ease',
             } }, rows);
           };
 
