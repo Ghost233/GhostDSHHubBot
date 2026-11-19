@@ -174,6 +174,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       copyReportBtn: '复制',
       copyReportHint: '复制报告全文',
       copyPathHint: '点击复制完整路径',
+      copySessionHint: '点击复制完整会话 id',
       ownersCard: '负责人',
       needsCard: '待我处理',
       connected: '已连接',
@@ -377,6 +378,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       copyReportBtn: 'Copy',
       copyReportHint: 'Copy the full report',
       copyPathHint: 'Click to copy the full path',
+      copySessionHint: 'Click to copy the full session id',
       ownersCard: 'Owners',
       needsCard: 'Needs me',
       connected: 'Connected',
@@ -1328,7 +1330,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             var evs = [];
             if (tk.createdAt) evs.push({ at: tk.createdAt, tone: 'muted', label: t('tlCreated'), detail: tk.authorization ? tk.authorization.actor + ' · ' + tk.authorization.source : null });
             (tk.assignments || []).forEach(function (a) {
-              if (a.at) evs.push({ at: a.at, tone: 'blue', label: t('tlAssign'), detail: a.sessionId ? String(a.sessionId).replace(/^session-/, '').slice(0, 8) : null });
+              if (a.at) evs.push({ at: a.at, tone: 'blue', label: t('tlAssign'), detail: a.sessionId ? String(a.sessionId).replace(/^session-/, '').slice(0, 8) : null, copy: a.sessionId || null });
               if (a.endedAt) evs.push({ at: a.endedAt, tone: 'muted', label: t('tlAssignEnd'), detail: a.endReason || null });
             });
             if (tk.question && tk.question.at) evs.push({ at: tk.question.at, tone: 'amber', label: t('tlQuestion'), detail: tk.question.text });
@@ -1345,7 +1347,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     h('span', { style: { flexShrink: 0, width: '8px', height: '8px', borderRadius: '999px', background: ev.current ? tone.border : 'transparent', border: '2px solid ' + tone.border, alignSelf: 'center' } }),
                     h('span', { style: { flexShrink: 0, opacity: 0.5, fontFamily: 'monospace', fontSize: '11px', minWidth: '42px' }, title: ev.at || '' }, ev.at ? hhmm(ev.at) : '—'),
                     h('span', { style: { flexShrink: 0, color: tone.fg, fontWeight: ev.current ? 600 : 400 } }, ev.label),
-                    ev.detail ? h('span', { style: { opacity: 0.65, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, ev.detail) : null);
+                    ev.detail ? h('span', {
+                      style: { opacity: 0.65, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: ev.copy ? 'pointer' : 'default', color: ev.copy && copiedId === 'tl:' + ev.copy ? TONES.green.fg : undefined },
+                      title: ev.copy ? ev.copy + String.fromCharCode(10) + t('copySessionHint') : undefined,
+                      onClick: ev.copy ? function (e2) { e2.preventDefault(); copyText(ev.copy, 'tl:' + ev.copy); } : undefined,
+                    }, ev.detail) : null);
                 })),
                h('div', { style: { marginTop: '4px', display: 'flex', alignItems: 'center', gap: '8px' } },
                  h('span', { style: { opacity: 0.5, fontFamily: 'monospace', fontSize: '11px' } }, tk.id),
