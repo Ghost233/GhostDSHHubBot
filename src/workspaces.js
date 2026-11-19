@@ -31,10 +31,12 @@ export class WorkspacePlacer {
    * @param {{ warn: (...args: any[]) => void }} deps.logger
    * @param {(path: string) => void} [deps.mkdir] - 测试替身；默认 mkdirSync recursive。
    */
-  constructor({ workspaceController, homeRepo, workspaces, logger, mkdir, registryList }) {
+  constructor({ workspaceController, homeRepo, workspaces, logger, mkdir, registryList, archivedList }) {
     this.ws = workspaceController ?? null
     /** 工作区枚举（关联式归位用）: () => [{id, path, title}...]；缺省时关联模式不可用。 */
     this.registryList = registryList ?? (() => [])
+    /** 已归档会话清单: () => string[]；缺省时自愈退化为「不检查」。 */
+    this.archivedList = archivedList ?? (() => [])
     this.homeRepo = homeRepo
     // workspaces.enabled=false 时整体关闭归位（全部返回 null → 回退 cwd 创建）。
     this.cfg = workspaces ?? { enabled: true, chiefPath: null, chiefTitle: 'Hub Bot 中枢' }
@@ -43,6 +45,27 @@ export class WorkspacePlacer {
   }
 
   get available() { return this.ws != null && this.cfg.enabled !== false }
+
+  /**
+   * 归档自愈: DSH 的 archived-session gate 会拒绝归档会话的每次 pre-step（turn 直接以 blocked 结束、
+   * 无模型请求、无报错）——负责人会话是 bot 的基础设施，被归档等于 bot 被静音。发现即解归档，失败只告警。
+   * @param {string} sessionId
+   * @param {string} [label] - 日志里的人类可读归属（chief / owner id）。
+   * @returns {Promise<boolean>} 是否执行了 unarchive。
+   */
+  async ensureUnarchived(sessionId, label = sessionId) {
+    if (!this.ws || !sessionId) return false
+    try {
+      const archived = this.archivedList()
+      if (!Array.isArray(archived) || !archived.includes(sessionId)) return false
+      await this.ws.unarchiveSession({ sessionId })
+      this.logger.warn('hub-bot workspace: %s session %s was ARCHIVED — unarchived (archiving a bot session silences it)', label, sessionId)
+      return true
+    } catch (error) {
+      this.logger.warn('hub-bot workspace: unarchive of %s (%s) failed: %s', label, sessionId, error instanceof Error ? error.message : error)
+      return false
+    }
+  }
 
   /** chief 专属工作区：返回 { workspaceId, path }；不可用/失败 → null（调用方回退 cwd 创建）。 */
   async chiefWorkspace() {

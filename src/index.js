@@ -219,7 +219,7 @@ export function apply(ctx, rawConfig) {
   }
   // GUI 工作区 (#52): ctx.get 动态探测（不放 inject 声明——旧版 DSH 无该服务时插件仍须可加载）。
   // 会话只能「出生即归位」（create({ workspaceId })）——已创建会话无任何归位 API（cwd 严格校验）。
-  const placer = new WorkspacePlacer({ workspaceController: safeGetService(ctx, 'workspaceController'), homeRepo: config.homeRepo, workspaces: config.workspaces, logger: ctx.logger, registryList: () => safeGetService(ctx, 'workspaceRegistry')?.list?.() ?? [] })
+  const placer = new WorkspacePlacer({ workspaceController: safeGetService(ctx, 'workspaceController'), homeRepo: config.homeRepo, workspaces: config.workspaces, logger: ctx.logger, registryList: () => safeGetService(ctx, 'workspaceRegistry')?.list?.() ?? [], archivedList: () => { try { return safeGetService(ctx, 'workspaceRegistry')?.archivedSessionIds ?? [] } catch { return [] } } })
   const hub = new Hub({ store, config, sessions, onSystemProblem: p => ctx.logger.warn('hub-bot system problem: %s (ticket %s, row %s)', p.reason, p.ticketId, p.rowId), placer })
   const chief = hub.registry.ensureChief({ cwd: config.homeRepo, workspace: basename(config.homeRepo) })
   setHub(hub)
@@ -250,6 +250,8 @@ export function apply(ctx, rawConfig) {
     await placer.chiefWorkspace()
     for (const owner of hub.registry.list()) {
       if (owner.role !== 'chief') await placer.ownerWorkspace(owner)
+      // 归档自愈 (round 51): 已绑定的负责人会话若被归档，启动时解开——归档 = DSH gate 拒跑 = bot 被静音。
+      if (owner.sessionId) await placer.ensureUnarchived(owner.sessionId, owner.id)
     }
   })().catch(error => ctx.logger.warn('hub-bot workspace warmup failed (non-fatal): %s', error?.message ?? error))
   void hub.router.tick().catch(error => ctx.logger.warn('hub-bot delivery resume failed: %s', error?.message ?? error))

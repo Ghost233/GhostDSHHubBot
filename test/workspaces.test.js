@@ -9,6 +9,30 @@ import { WorkspacePlacer, CHIEF_WORKSPACE_DIR } from '../src/workspaces.js'
 const CHIEF_WORKSPACE_TITLE = 'Hub Bot 中枢' // config.js 默认值的镜像
 
 const silent = { warn: () => {} }
+
+test('ensureUnarchived: unarchives an archived owner session and no-ops otherwise (round 51)', async () => {
+  const ctrl = fakeController()
+  ctrl.unarchiveSession = async ({ sessionId }) => { ctrl.calls.push(['unarchive', sessionId]) }
+  const warns = []
+  const p = new WorkspacePlacer({ workspaceController: ctrl, homeRepo: '/repo', logger: { warn: (...a) => warns.push(a.join(' ')) }, archivedList: () => ['s1', 's2'] })
+  assert.equal(await p.ensureUnarchived('s2', 'chief'), true)
+  assert.deepEqual(ctrl.calls, [['unarchive', 's2']])
+  assert.ok(warns.some(w => w.includes('ARCHIVED')))
+  // not archived → no call
+  assert.equal(await p.ensureUnarchived('s3', 'repo-x'), false)
+  assert.deepEqual(ctrl.calls, [['unarchive', 's2']])
+})
+
+test('ensureUnarchived: controller errors are swallowed; no controller → no-op (round 51)', async () => {
+  const ctrl = fakeController()
+  ctrl.unarchiveSession = async () => { throw new Error('no-such-session') }
+  const warns = []
+  const p = new WorkspacePlacer({ workspaceController: ctrl, homeRepo: '/repo', logger: { warn: (...a) => warns.push(a.join(' ')) }, archivedList: () => ['s1'] })
+  assert.equal(await p.ensureUnarchived('s1', 'chief'), false)
+  assert.ok(warns.some(w => w.includes('unarchive') && w.includes('chief')))
+  const bare = new WorkspacePlacer({ workspaceController: undefined, homeRepo: '/repo', logger: silent })
+  assert.equal(await bare.ensureUnarchived('s1', 'chief'), false)
+})
 const memoryStore = () => {
   const map = new Map()
   return { get: k => map.get(k), set: (k, v) => map.set(k, v), map }

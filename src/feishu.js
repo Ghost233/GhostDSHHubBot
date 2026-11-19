@@ -359,6 +359,9 @@ export class FeishuSource {
       this.registry.bindSession(chief.id, created.sessionId)
       chief.sessionId = created.sessionId // registry 实现可换行而非原地改——本方法内以返回值为准
     }
+    // 归档自愈 (round 51): 已绑定会话被归档 → DSH 的 archived-session gate 拒跑（turn 直接 blocked、无请求无报错）。
+    // 负责人会话是 bot 的基础设施，注入前发现即解（placer 内部失败只告警）。
+    if (this.placer) await this.placer.ensureUnarchived(chief.sessionId, 'chief')
     // 总管模型对齐 (面板「总管模型」): 配置存在则每次注入前对齐——面板改模型后下一条消息即生效；
     // 配置为 null (跟随部署默认) 时不打扰会话。对齐失败不阻塞消息（模型路由故障由 turn 错误自然呈现）。
     const wanted = this.chiefConfig?.model ?? null

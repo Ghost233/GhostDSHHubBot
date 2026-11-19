@@ -271,7 +271,11 @@ export class Router {
 
   /** Lazily binds an owner Session: create only when the registry names none. */
   async #ensureSession(owner) {
-    if (owner.sessionId) return { owner, sessionId: owner.sessionId, created: false }
+    if (owner.sessionId) {
+      // 归档自愈 (round 51): 已绑定会话被归档 → DSH gate 拒跑（turn blocked 无报错）。发现即解，失败只告警。
+      if (this.placer) await this.placer.ensureUnarchived(owner.sessionId, owner.id)
+      return { owner, sessionId: owner.sessionId, created: false }
+    }
     // GUI 工作区 (#52): 出生即归位——create({ workspaceId }) 是唯一让会话进工作区的路径（cwd 自动 =
     // 工作区 path：owner 仓库工作区 path 本就等于 owner.cwd；chief 专属工作区落在 homeRepo/.hub-bot/chief）。
     // placer 不可用或失败 → null → 回退 cwd 创建，主链路不受展示层影响。
