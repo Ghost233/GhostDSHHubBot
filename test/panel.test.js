@@ -211,6 +211,23 @@ test('overview lists artifacts for working tickets too (round 45)', async () => 
   }
 })
 
+test('overview counts unprocessed triggers older than 5 minutes (round 67)', async () => {
+  const { store, registry, cleanup } = fixture()
+  try {
+    const now = '2026-11-19T12:00:00.000Z'
+    const put = (id, at, chatId, extra = {}) => store.db
+      .prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)')
+      .run(id, JSON.stringify({ id, kind: 'feishu', message: id, at, source: { chatId }, ...extra }), at)
+    put('trg-old-unhandled', '2026-11-19T11:00:00.000Z', 'chat-y')              // 无票据无回复且超时 → 计数
+    put('trg-young-unhandled', '2026-11-19T11:59:00.000Z', 'chat-z')            // 太新 → 不计
+    put('trg-dropped', '2026-11-19T11:00:00.000Z', 'chat-w', { dropped: 'unsupported' }) // dropped → 不计
+    put('trg-replied', '2026-11-19T11:00:00.000Z', 'chat-x')                    // 有直接回复 → 不计
+    insertOutbox(store, { kind: 'reply', state: 'sent', to: 'feishu:chat:chat-x', body: '收到' }, () => '2026-11-19T11:01:00.000Z')
+    const overview = buildOverview({ store, registry, now: () => now, health: {} })
+    assert.equal(overview.unprocessedTriggers, 1, '只有又老又没人理的触发被计数')
+  } finally { cleanup() }
+})
+
 test('overview reply projection carries the reply text snippet (round 54)', async () => {
   const { router, registry, store, cleanup } = fixture()
   try {

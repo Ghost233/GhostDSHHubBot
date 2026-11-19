@@ -344,11 +344,23 @@ export function buildOverview({ store, registry, health, now, listDir }) {
         reply: tk?.id ? replyStateFor(tk.id) : (direct ? replyStateForRow(direct) : null),
       }
     })
+  // 未受理信号：非 dropped、无票据、无回复、且已超过 5 分钟的触发——
+  // 消息进来了却什么都没发生（生产 archived-chief 事故的可见化）。
+  const nowMs = Date.parse((now ?? (() => new Date().toISOString()))()) || Date.now()
+  const unprocessedTriggers = [...triggers.values()].filter(t => {
+    if (t.dropped) return false
+    if (ticketByTriggerId.has(t.id)) return false
+    if (directReplyFor(t)) return false
+    const atMs = Date.parse(t.at ?? '')
+    if (!Number.isFinite(atMs)) return false
+    return nowMs - atMs > 5 * 60 * 1000
+  }).length
   return {
     generatedAt: (now ?? (() => new Date().toISOString()))(),
     owners,
     tickets,
     recentTriggers,
+    unprocessedTriggers,
     health: health ?? {},
   }
 }
