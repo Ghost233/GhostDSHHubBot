@@ -1312,7 +1312,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                           color: recentDroppedOnly ? TONES.amber.fg : 'inherit',
                           border: '1px solid ' + (recentDroppedOnly ? TONES.amber.border : 'rgba(127,127,127,0.2)'),
                           opacity: recentDroppedOnly ? 1 : 0.7 },
-                      }, t('filterDroppedOnly'))
+                      }, t('filterDroppedOnly') + ' · ',
+                         h('span', { style: { fontWeight: 600 } }, String(recent.filter(function (tr) { return tr.dropped; }).length)))
                     : null)),
               recent.length === 0
                 ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 0' } }, t('emptyRecent'))
