@@ -355,6 +355,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       lastActivity: '最近活动',
       filterAllKinds: '全部',
       filterDroppedOnly: '仅看未受理',
+      filterUnprocessedOnly: '仅看未处理',
       healthPillRetrying: '重试中',
       healthPillDead: '死信',
       filterAllOwners: '全部负责人',
@@ -613,6 +614,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       lastActivity: 'active',
       filterAllKinds: 'All',
       filterDroppedOnly: 'Dropped only',
+      filterUnprocessedOnly: 'Unprocessed only',
       healthPillRetrying: 'retrying',
       healthPillDead: 'dead',
       filterAllOwners: 'All owners',
@@ -1195,6 +1197,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var rks = React.useState(''); var recentKind = rks[0]; var setRecentKind = rks[1];
           var cps = React.useState(''); var copiedId = cps[0]; var setCopiedId = cps[1];
           var rds = React.useState(false); var recentDroppedOnly = rds[0]; var setRecentDroppedOnly = rds[1];
+          var rus = React.useState(false); var recentUnprocOnly = rus[0]; var setRecentUnprocOnly = rus[1];
 
           var load = function () {
             setError(null);
@@ -1443,9 +1446,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var recentFiltered = recent.filter(function (tr) {
             if (recentKind && tr.kind !== recentKind) return false;
             if (recentDroppedOnly && !tr.dropped) return false;
+            if (recentUnprocOnly && !tr.unprocessed) return false;
             return true;
           });
-          var recentFilterActive = recentKind !== '' || recentDroppedOnly;
+          var recentFilterActive = recentKind !== '' || recentDroppedOnly || recentUnprocOnly;
           var kindLabel = function (k) { return k === 'feishu' ? t('kindFeishu') : k === 'github' ? t('kindGitHub') : t('kindRoute'); };
           // 消息 → 票据定位（round 8）: 点一条最近消息 = 按工单号过滤任务流并滚过去。
           var locateTicket = function (ticketId) {
@@ -1958,9 +1962,20 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                       }, t('filterDroppedOnly') + ' · ',
                          h('span', { style: { fontWeight: 600 } }, String(recent.filter(function (tr) { return tr.dropped; }).length)))
                     : null,
+                  recent.some(function (tr) { return tr.unprocessed; })
+                    ? h('button', {
+                        onClick: function () { setRecentUnprocOnly(!recentUnprocOnly); },
+                        style: { fontSize: '11px', fontWeight: 400, padding: '1px 10px', borderRadius: '999px', cursor: 'pointer',
+                          background: recentUnprocOnly ? 'rgba(220,80,80,0.16)' : 'rgba(127,127,127,0.08)',
+                          color: recentUnprocOnly ? TONES.red.fg : 'inherit',
+                          border: '1px solid ' + (recentUnprocOnly ? TONES.red.border : 'rgba(127,127,127,0.2)'),
+                          opacity: recentUnprocOnly ? 1 : 0.7 },
+                      }, t('filterUnprocessedOnly') + ' · ',
+                         h('span', { style: { fontWeight: 600 } }, String(recent.filter(function (tr) { return tr.unprocessed; }).length)))
+                    : null,
                   recentFilterActive
                     ? h('button', {
-                        onClick: function () { setRecentKind(''); setRecentDroppedOnly(false); },
+                        onClick: function () { setRecentKind(''); setRecentDroppedOnly(false); setRecentUnprocOnly(false); },
                         title: t('clearFiltersHint'),
                         style: { fontSize: '11px', fontWeight: 400, padding: '1px 10px', borderRadius: '999px', cursor: 'pointer', background: 'rgba(127,127,127,0.08)', border: '1px solid rgba(127,127,127,0.25)', opacity: 0.75 },
                       }, '× ' + t('clearFilters'))
