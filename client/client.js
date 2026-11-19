@@ -310,6 +310,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       replySent: '已回复',
       replyCopyHint: '点击复制回复内容',
       waitingLabel: '已等待',
+      clearFilters: '清除筛选',
+      clearFiltersHint: '清空本区的全部筛选条件',
       waitingHint: '从进入当前阶段起算；灰 <30 分钟，琥珀 <2 小时，红色更久',
       durNow: '刚刚',
       durMin: '{n} 分钟',
@@ -546,6 +548,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       replySent: 'replied',
       replyCopyHint: 'Click to copy the reply text',
       waitingLabel: 'waiting',
+      clearFilters: 'Clear filters',
+      clearFiltersHint: 'Reset every filter in this section',
       waitingHint: 'Time in the current stage; gray <30m, amber <2h, red beyond',
       durNow: 'just now',
       durMin: '{n}m',
@@ -1761,6 +1765,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                       style: Object.assign({}, inputStyle, { flex: '1 1 200px', width: 'auto', padding: '4px 10px', fontSize: '12px' }),
                       value: filterText, placeholder: t('filterPlaceholder'),
                       onChange: function (ev) { setFilterText(ev.target.value); },
+                      onKeyDown: function (ev) { if (ev.key === 'Escape') { setFilterText(''); setFilterStage(''); setFilterOwner(''); } },
                     }),
                     h('select', {
                       style: Object.assign({}, inputStyle, { width: 'auto', padding: '4px 10px', fontSize: '12px' }),
@@ -1776,6 +1781,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                           value: filterOwner, onChange: function (ev) { setFilterOwner(ev.target.value); },
                         }, [h('option', { key: '', value: '' }, t('filterAllOwners'))].concat(
                           presentOwners.map(function (label) { return h('option', { key: label, value: label }, label); })))
+                      : null,
+                    filterActive
+                      ? h('button', {
+                          onClick: function () { setFilterText(''); setFilterStage(''); setFilterOwner(''); },
+                          title: t('clearFiltersHint'),
+                          style: { fontSize: '11px', padding: '3px 10px', borderRadius: '999px', cursor: 'pointer', background: 'rgba(127,127,127,0.08)', border: '1px solid rgba(127,127,127,0.25)', opacity: 0.75, whiteSpace: 'nowrap' },
+                        }, '× ' + t('clearFilters'))
                       : null),
               filtered.length === 0 && tickets.length > 0
                 ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 10px' } }, t('filterNoMatch'))
@@ -1827,6 +1839,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                           opacity: recentDroppedOnly ? 1 : 0.7 },
                       }, t('filterDroppedOnly') + ' · ',
                          h('span', { style: { fontWeight: 600 } }, String(recent.filter(function (tr) { return tr.dropped; }).length)))
+                    : null,
+                  recentFilterActive
+                    ? h('button', {
+                        onClick: function () { setRecentKind(''); setRecentDroppedOnly(false); },
+                        title: t('clearFiltersHint'),
+                        style: { fontSize: '11px', fontWeight: 400, padding: '1px 10px', borderRadius: '999px', cursor: 'pointer', background: 'rgba(127,127,127,0.08)', border: '1px solid rgba(127,127,127,0.25)', opacity: 0.75 },
+                      }, '× ' + t('clearFilters'))
                     : null)),
               recent.length === 0
                 ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 0' } }, t('emptyRecent'))
