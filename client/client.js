@@ -1356,9 +1356,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                             : null),
                         h('div', { style: { fontSize: '12px', opacity: 0.6, marginBottom: '8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: dir }, shortPath(dir)),
                         h('div', { style: { display: 'flex', alignItems: 'center', gap: '12px', fontSize: '12px' } },
-                          h('span', { style: { display: 'inline-flex', alignItems: 'center' }, title: o.sessionId || undefined },
+                          h('span', { style: { display: 'inline-flex', alignItems: 'center', minWidth: 0 }, title: (o.sessionTitle ? o.sessionTitle + ' — ' : '') + (o.sessionId || '') || undefined },
                             o.sessionId ? dot('#46bb6d') : dot('rgba(140,140,140,0.6)'),
-                            h('span', { style: { opacity: 0.7, fontFamily: 'monospace' } }, o.sessionId ? String(o.sessionId).replace(/^session-/, '').slice(0, 8) : t('sessionNone'))),
+                            h('span', { style: { opacity: 0.7, fontFamily: o.sessionTitle ? 'inherit' : 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '130px' } },
+                              o.sessionTitle || (o.sessionId ? String(o.sessionId).replace(/^session-/, '').slice(0, 8) : t('sessionNone')))),
                           h('span', { style: { opacity: 0.7 } }, fill(t('activeTicketsLabel'), active)),
                           (function () {
                             var lastAt = null;

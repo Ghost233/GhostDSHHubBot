@@ -354,6 +354,7 @@ export function apply(ctx, rawConfig) {
     resolveTicket: forwardDep('resolveTicket'),
     startFeishuRegister: forwardDep('startFeishuRegister'),
     listWorkspaces: forwardDep('listWorkspaces'),
+    readSessionTitles: forwardDep('readSessionTitles'),
     retryOutbox: forwardDep('retryOutbox'),
   })
   // 填充真实实现——转发层延迟解引用；devApi 未配置时管理面方法本就不该可用（行为与现状一致）。
@@ -365,6 +366,25 @@ export function apply(ctx, rawConfig) {
     // 关联式归位选择器（turn 108）: DSH 工作区枚举。registry 服务缺席（老 DSH）→ 空数组，选择器降级为「自动」。
     retryOutbox: body => retryOutbox(body),
     listWorkspaces: () => (safeGetService(ctx, 'workspaceRegistry')?.list?.() ?? []).map(w => ({ workspaceId: String(w.id), title: w.title ?? null, path: w.path ?? null, sessionIds: Array.isArray(w.sessionIds) ? [...w.sessionIds] : [] })),
+    // 会话标题投影（round 27）: 负责人卡片显示绑定会话的标题，不再只是 8 位 id。
+    // 标题不在 sessionController.list 条目里——正确来源是 sessionQuery.readTitleSnapshots
+    // （dsh-session-query 的 title 折叠）。服务缺席/失败 → 空表，卡片退化为短 id，不阻塞。
+    readSessionTitles: async sessionIds => {
+      try {
+        const query = safeGetService(ctx, 'sessionQuery')
+        if (!query?.readTitleSnapshots || !Array.isArray(sessionIds) || sessionIds.length === 0) return {}
+        const settled = await query.readTitleSnapshots(sessionIds)
+        const out = {}
+        for (const r of settled ?? []) {
+          const v = r?.value ?? r
+          // title 快照是对象（{title: 文本, messageSeqs, source, eventSeq, updatedAt}），字符串兜底兼容。
+          const raw = v?.title
+          const text = typeof raw === 'string' ? raw : (raw && typeof raw.title === 'string' ? raw.title : null)
+          if (v?.session?.id && text) out[v.session.id] = text
+        }
+        return out
+      } catch { return {} }
+    },
     overview: async () => buildOverview({ store, registry: hub.registry, health: await buildHealth() }),
     resolveTicket: request => resolveTicket(request),
     startFeishuRegister: () => {

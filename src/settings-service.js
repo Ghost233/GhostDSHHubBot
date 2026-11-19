@@ -69,6 +69,12 @@ export class HubBotSettingsService extends TypertRemoteService {
         }
       }
     } catch { /* 反查失败不阻塞列表 */ }
+    // 会话标题（round 27）: 反查绑定会话的标题，卡片上「这个负责人在哪个会话里干活」一眼可读。
+    let sessionTitles = {}
+    try {
+      const ids = rows.map(r => r.sessionId).filter(Boolean)
+      sessionTitles = (await this.deps.readSessionTitles?.(ids)) ?? {}
+    } catch { /* 标题缺席退化为短 id */ }
     return rows.map(row => ({
       id: row.id,
       role: row.role ?? null,
@@ -76,6 +82,7 @@ export class HubBotSettingsService extends TypertRemoteService {
       workspace: row.workspace ?? null,
       cwd: row.cwd ?? null,
       sessionId: row.sessionId ?? null,
+      sessionTitle: (row.sessionId && sessionTitles[row.sessionId]) || null,
       status: row.status ?? null,
       createdAt: row.createdAt ?? null,
       dshWorkspace: (row.sessionId && sessionToWorkspace.get(row.sessionId)) ?? null,

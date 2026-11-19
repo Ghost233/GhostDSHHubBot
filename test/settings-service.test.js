@@ -100,7 +100,7 @@ test('listOwners projects registry rows to plain JSON', async () => {
   assert.deepEqual(await service.listOwners(), [{
     id: 'chief', role: 'chief', kind: 'repo', workspace: 'Ghost233HomeRepo',
     cwd: '/Volumes/x/Ghost233HomeRepo', sessionId: 'session-1', status: 'bound',
-    createdAt: '2026-11-18T00:00:00.000Z', dshWorkspace: null,
+    createdAt: '2026-11-18T00:00:00.000Z', dshWorkspace: null, sessionTitle: null,
   }])
 })
 
@@ -121,6 +121,37 @@ test('listOwners reverse-maps sessions to their DSH workspace (turn 109)', async
   assert.deepEqual(result[0].dshWorkspace, { workspaceId: 'ws-chief', title: '我的中枢' })
   assert.deepEqual(result[1].dshWorkspace, { workspaceId: 'ws-x', title: 'Repo X' })
   assert.equal(result[2].dshWorkspace, null, '无会话 → null')
+})
+
+test('listOwners decorates rows with the bound session title (round 27)', async () => {
+  const rows = [
+    { id: 'chief', role: 'chief', sessionId: 'session-1', status: 'bound' },
+    { id: 'repo-x', role: 'owner', sessionId: 'session-9', status: 'bound' },
+    { id: 'repo-y', role: 'owner', sessionId: null, status: 'created' },
+  ]
+  const { service } = makeService({
+    listOwners: () => rows,
+    // 真实部署里 readTitleSnapshots 的 title 是快照对象；index.js 的 dep 已归一化为纯文本，
+    // 这里按 dep 的契约（sessionId → 文本）mock。
+    readSessionTitles: async ids => {
+      const map = { 'session-1': '查看当前状态', 'session-9': '排查 GhostNexus' }
+      const out = {}
+      for (const id of ids) if (map[id]) out[id] = map[id]
+      return out
+    },
+  })
+  const result = await service.listOwners()
+  assert.equal(result[0].sessionTitle, '查看当前状态')
+  assert.equal(result[1].sessionTitle, '排查 GhostNexus')
+  assert.equal(result[2].sessionTitle, null, '无会话 → null')
+})
+
+test('listOwners tolerates a missing or failing listSessions dep', async () => {
+  const rows = [{ id: 'chief', role: 'chief', sessionId: 'session-1', status: 'bound' }]
+  const a = makeService({ listOwners: () => rows })
+  assert.equal((await a.service.listOwners())[0].sessionTitle, null, 'dep 缺席 → null')
+  const b = makeService({ listOwners: () => rows, readSessionTitles: async () => { throw new Error('boom') } })
+  assert.equal((await b.service.listOwners())[0].sessionTitle, null, 'dep 抛错 → null 不阻塞')
 })
 
 test('modelCatalog passes the catalog through untouched', async () => {
