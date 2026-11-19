@@ -251,6 +251,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       batchReject: '拒绝所选 · {count}',
       batchRunning: '执行中…',
       batchFailed: '{count} 条批量操作失败',
+      droppedCardHint: '最近未受理',
       feishuMetricsTitle: '连接质量：',
       feishuMetricsReconnects: '重连 {count} 次',
       feishuMetricsLastConnected: '最近连接',
@@ -404,6 +405,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       batchReject: 'Reject selected · {count}',
       batchRunning: 'Running…',
       batchFailed: '{count} batch operations failed',
+      droppedCardHint: 'Last dropped',
       feishuMetricsTitle: 'Connection:',
       feishuMetricsReconnects: '{count} reconnects',
       feishuMetricsLastConnected: 'last connected',
@@ -901,6 +903,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var githubColor = !github.enabled ? 'rgba(140,140,140,0.6)' : '#6b97ff';
           // 副标（turn 109 信息密度）: 飞书卡显示 bot 名；负责人卡显示活跃会话数。
           var feishuSub = feishuOn && fs.bot && fs.bot.name ? fs.bot.name : null;
+          // 未受理消息可见性（round 26）: 状态卡直接提示最近一条 dropped，省得翻到最近消息区才发现。
+          var lastDropped = (overview.recentTriggers || []).filter(function (tr) { return tr.dropped; })[0] || null;
           var activeSessions = owners.filter(function (o) { return !!o.sessionId; }).length;
           var ownersSub = fill(t('activeSessions'), activeSessions);
           var cardSubStyle = { fontSize: '11px', opacity: 0.6, marginTop: '2px' };
@@ -1131,7 +1135,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           return h('div', { style: { padding: '20px 24px', overflowY: 'auto', height: '100%', boxSizing: 'border-box' } },
             h('h2', { style: { fontSize: '17px', fontWeight: 600, margin: '0 0 18px' } }, t('title')),
             h('div', { style: cardRowStyle },
-              h('div', { style: Object.assign({}, cardStyle, clickableCard('hub-bot-feishu')), onClick: function () { scrollToSection('hub-bot-feishu'); }, title: t('cardJumpHint') }, h('div', { style: cardTitleStyle }, t('feishuCard')), h('div', { style: cardValueStyle }, dot(feishuColor), feishuText), feishuSub ? h('div', { style: cardSubStyle }, feishuSub) : null),
+              h('div', { style: Object.assign({}, cardStyle, clickableCard('hub-bot-feishu')), onClick: function () { scrollToSection('hub-bot-feishu'); }, title: t('cardJumpHint') }, h('div', { style: cardTitleStyle }, t('feishuCard')), h('div', { style: cardValueStyle }, dot(feishuColor), feishuText), feishuSub ? h('div', { style: cardSubStyle }, feishuSub) : null,
+                lastDropped ? h('div', { style: Object.assign({}, cardSubStyle, { color: TONES.amber.fg, opacity: 0.85 }), title: lastDropped.message || '' },
+                  t('droppedCardHint') + ' ' + relTime(t, lastDropped.at) + ' · ' + String(lastDropped.dropped).slice(0, 24)) : null),
               h('div', { style: cardStyle }, h('div', { style: cardTitleStyle }, t('githubCard')), h('div', { style: cardValueStyle }, dot(githubColor), githubText)),
               h('div', { style: Object.assign({}, cardStyle, clickableCard('hub-bot-owners')), onClick: function () { scrollToSection('hub-bot-owners'); }, title: t('cardJumpHint') }, h('div', { style: cardTitleStyle }, t('ownersCard')), h('div', { style: cardValueStyle }, String(owners.length)), h('div', { style: cardSubStyle }, ownersSub))),
             healthItems.length ? h('div', { style: {
