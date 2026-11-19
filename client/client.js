@@ -252,6 +252,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       batchRunning: '执行中…',
       batchFailed: '{count} 条批量操作失败',
       droppedCardHint: '最近未受理',
+      retriedNotice: '已重投 {count} 条，回到投递队列',
       feishuMetricsTitle: '连接质量：',
       feishuMetricsReconnects: '重连 {count} 次',
       feishuMetricsLastConnected: '最近连接',
@@ -406,6 +407,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       batchRunning: 'Running…',
       batchFailed: '{count} batch operations failed',
       droppedCardHint: 'Last dropped',
+      retriedNotice: 'Requeued {count} row(s) to the delivery queue',
       feishuMetricsTitle: 'Connection:',
       feishuMetricsReconnects: '{count} reconnects',
       feishuMetricsLastConnected: 'last connected',
@@ -763,6 +765,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var cs = React.useState(null); var catalog = cs[0]; var setCatalog = cs[1];
           var os2 = React.useState(null); var overview = os2[0]; var setOverview = os2[1];
           var es = React.useState(null); var error = es[0]; var setError = es[1];
+          var nts = React.useState(''); var notice = nts[0]; var setNotice = nts[1];
+          var noticeSeq = React.useRef(0);
           var ms = React.useState(''); var modelChoice = ms[0]; var setModelChoice = ms[1];
           var bs = React.useState(false); var modelBusy = bs[0]; var setModelBusy = bs[1];
           var ds = React.useState(false); var modelDone = ds[0]; var setModelDone = ds[1];
@@ -789,6 +793,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             }).catch(function (e) { setError(e && e.message ? e.message : String(e)); });
           };
           React.useEffect(load, []);
+          // 成功提示条（round 28）: 动作成功也要看得见——3.5s 自动消，序号防旧定时器清掉新提示。
+          var flashNotice = function (text) {
+            var seq = ++noticeSeq.current;
+            setNotice(text);
+            setTimeout(function () { if (noticeSeq.current === seq) setNotice(''); }, 3500);
+          };
           // 自动刷新（round 7）: 每 15s 拉一次 overview——新消息/票据状态变化不用手动刷新页面。
           // 只刷 overview 不刷 view: RowConfig 的表单正在编辑时不能被远端值覆盖。
           // 页面藏进后台（document.hidden）时暂停，失败静默——下一轮自然会再试。
@@ -805,7 +815,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var retryOutbox = function (idOrNull) {
             var req = idOrNull === null ? { all: true } : { id: idOrNull };
             scoped.remote.hubBotSettings.retryOutbox(req)
-              .then(function () { load(); })
+              .then(function (raw) {
+                var res = unwrap(raw);
+                flashNotice(fill(t('retriedNotice'), (res && res.retried) || 0));
+                load();
+              })
               .catch(function (e) { setError(e && e.message ? e.message : String(e)); });
           };
           var retryBtnStyle = {
@@ -1391,7 +1405,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             h('div', { id: 'hub-bot-feishu' },
               h(FeishuSection, { view: view, onRefresh: refreshView })),
             h(HubBotRowConfig, { hubBotCtx: scoped, hideModel: true }),
-            error ? h('div', { style: { fontSize: '12px', color: TONES.red.fg, marginTop: '8px' } }, error) : null);
+            error ? h('div', { style: { fontSize: '12px', color: TONES.red.fg, marginTop: '8px' } }, error) : null,
+            notice ? h('div', { style: { fontSize: '12px', color: TONES.green.fg, marginTop: '8px' } }, notice) : null);
         }
         scoped.effect(function () {
           return scoped.slots.inject('sidebar.panellist', function () {
