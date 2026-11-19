@@ -1188,6 +1188,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var noticeSeq = React.useRef(0);
           var lls = React.useState(null); var lastLoadedAt = lls[0]; var setLastLoadedAt = lls[1];
           var sts2 = React.useState(false); var selfTestBusy = sts2[0]; var setSelfTestBusy = sts2[1];
+          var sts3 = React.useState(null); var selfTestState = sts3[0]; var setSelfTestState = sts3[1];
           var ms = React.useState(''); var modelChoice = ms[0]; var setModelChoice = ms[1];
           var bs = React.useState(false); var modelBusy = bs[0]; var setModelBusy = bs[1];
           var ds = React.useState(false); var modelDone = ds[0]; var setModelDone = ds[1];
@@ -1230,13 +1231,16 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               (ov.recentTriggers || []).forEach(function (tr) { if (!found && String(tr.id).indexOf('om_selftest-') === 0) found = tr; });
               if (found && found.reply && found.reply.state === 'sent') {
                 setSelfTestBusy(false);
+                setSelfTestState('passed');
                 flashNotice(t('selfTestPassed'));
                 load();
               } else if (found && found.dropped) {
                 setSelfTestBusy(false);
+                setSelfTestState('dropped');
                 setError(t('selfTestDropped') + ': ' + found.dropped);
               } else if (attempt >= 14) {
                 setSelfTestBusy(false);
+                setSelfTestState('timeout');
                 setError(t('selfTestTimeout'));
                 load();
               } else {
@@ -1250,6 +1254,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var runSelfTest = function () {
             if (!window.confirm(t('selfTestConfirm'))) return;
             setSelfTestBusy(true);
+            setSelfTestState(null);
             setError(null);
             scoped.remote.hubBotSettings.selfTest()
               .then(function (raw) {
@@ -1739,7 +1744,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               view && view.version ? h('span', { style: { fontSize: '11px', fontFamily: 'monospace', padding: '1px 8px', borderRadius: '999px', background: 'rgba(127,127,127,0.1)', border: '1px solid rgba(127,127,127,0.2)', opacity: 0.75 } }, 'v' + view.version) : null,
               lastLoadedAt ? h('span', { style: { fontSize: '11px', opacity: 0.55 } }, t('updatedAt') + ' ' + relTime(t, lastLoadedAt)) : null,
               h('span', { style: { fontSize: '11px', opacity: 0.4 } }, t('autoRefreshHint')),
-              h('button', { onClick: runSelfTest, disabled: selfTestBusy, title: t('selfTestHint'), style: { marginLeft: 'auto', fontSize: '11px', padding: '3px 12px', borderRadius: '6px', cursor: 'pointer', background: 'rgba(70,150,255,0.1)', border: '1px solid rgba(70,150,255,0.3)', color: '#7db8ff', opacity: selfTestBusy ? 0.5 : 0.9 } }, selfTestBusy ? t('saving') : t('selfTestBtn')),
+              h('button', { onClick: runSelfTest, disabled: selfTestBusy, title: t('selfTestHint'), style: { marginLeft: 'auto', fontSize: '11px', padding: '3px 12px', borderRadius: '6px', cursor: 'pointer',
+                background: selfTestState === 'passed' ? TONES.green.bg : (selfTestState ? TONES.red.bg : 'rgba(70,150,255,0.1)'),
+                border: '1px solid ' + (selfTestState === 'passed' ? TONES.green.border : (selfTestState ? TONES.red.border : 'rgba(70,150,255,0.3)')),
+                color: selfTestState === 'passed' ? TONES.green.fg : (selfTestState ? TONES.red.fg : '#7db8ff'),
+                opacity: selfTestBusy ? 0.5 : 0.9 } }, selfTestBusy ? t('saving') : (selfTestState === 'passed' ? '✓ ' + t('selfTestBtn') : (selfTestState ? '✗ ' + t('selfTestBtn') : t('selfTestBtn')))),
               h('button', { onClick: function () { load(); }, title: t('refreshHint'), style: { fontSize: '11px', padding: '3px 12px', borderRadius: '6px', cursor: 'pointer', background: 'rgba(127,127,127,0.08)', border: '1px solid rgba(127,127,127,0.22)', opacity: 0.85 } }, '\u21bb ' + t('refreshBtn'))),
             h('div', { style: cardRowStyle },
               h('div', { style: Object.assign({}, cardStyle, clickableCard('hub-bot-feishu')), onClick: function () { scrollToSection('hub-bot-feishu'); }, title: t('cardJumpHint') }, h('div', { style: cardTitleStyle }, t('feishuCard')), h('div', { style: cardValueStyle }, dot(feishuColor), feishuText), feishuSub ? h('div', { style: cardSubStyle }, feishuSub) : null,
@@ -1919,7 +1928,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                             style: { display: 'flex', alignItems: 'baseline', gap: '8px', padding: '4px 8px', borderRadius: '6px', fontSize: '12px', opacity: 0.75, cursor: 'pointer' } },
                             h('span', { style: { flexShrink: 0, color: TONES.green.fg, fontSize: '11px' } }, '✓'),
                             tk.ownerLabel ? h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.6, cursor: 'pointer' }, title: t('ownerClickHint'), onClick: function (ev) { ev.stopPropagation(); setFilterOwner(tk.ownerLabel); scrollToSection('hub-bot-stream'); } }, tk.ownerLabel) : null,
-                            h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, tk.message || '—'),
+                            h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: tk.message || '' }, tk.message || '—'),
                             h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.5 } }, relTime(t, tk.updatedAt || tk.createdAt)));
                         }
                         return ticketRowItem(tk, false);
@@ -1997,7 +2006,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     } },
                       h('span', { style: { flexShrink: 0, fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: tr.kind === 'feishu' ? 'rgba(70,150,255,0.14)' : 'rgba(150,150,150,0.14)', color: tr.kind === 'feishu' ? '#7db8ff' : 'rgba(200,200,200,0.8)', border: '1px solid ' + (tr.kind === 'feishu' ? 'rgba(70,150,255,0.3)' : 'rgba(150,150,150,0.25)') } }, kindLabel(tr.kind)),
                       h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.5, minWidth: '56px' } }, tr.at ? relTime(t, tr.at) : '—'),
-                      h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.88 } }, tr.message || '—'),
+                      h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.88 }, title: tr.message || '' }, tr.message || '—'),
                       // 回复投递闭环指示： 已回复(绿) / 已注入(灰) / 投递中(琥珀) / 投递失败(红+行内重投)
                       tr.reply && tr.reply.state === 'sent'
                         ? h('span', {
