@@ -1712,6 +1712,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                       var mine = tickets.filter(function (tk) { return tk.owner === o.id; });
                       var active = mine.filter(function (tk) { return tk.stage !== 'done'; }).length;
                       var verdict = mine.filter(function (tk) { return NEEDS_ME.indexOf(tk.stage) >= 0; }).length;
+                      var current = null;
+                      for (var ci = 0; ci < mine.length; ci++) { if (mine[ci].stage === 'working') { current = mine[ci]; break; } }
                       var roleTone = o.role === 'chief' ? TONES.amber : o.kind === 'temp' ? TONES.gray : TONES.blue;
                       var label = o.dshWorkspace && o.dshWorkspace.title ? o.dshWorkspace.title : (o.workspace || o.id);
                       return h('div', {
@@ -1736,6 +1738,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                         h('div', { onClick: function (ev) { ev.stopPropagation(); if (dir) copyText(dir, 'cwd:' + o.id); }, style: { fontSize: '12px', opacity: 0.6, marginBottom: '8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: dir ? 'pointer' : 'default', display: 'flex', alignItems: 'center', gap: '6px' }, title: dir ? dir + String.fromCharCode(10) + t('copyPathHint') : '' },
                           h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis' } }, shortPath(dir)),
                           copiedId === 'cwd:' + o.id ? h('span', { style: { color: TONES.green.fg, flexShrink: 0 } }, t('copiedBtn')) : null),
+                        current
+                          ? h('div', { style: { fontSize: '12px', marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '6px' }, title: current.message || '' },
+                              h('span', { style: { flexShrink: 0, width: '6px', height: '6px', borderRadius: '999px', background: TONES.blue.border } }),
+                              h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.75 } }, current.message || '—'))
+                          : null,
                         h('div', { style: { display: 'flex', alignItems: 'center', gap: '12px', fontSize: '12px' } },
                           h('span', { style: { display: 'inline-flex', alignItems: 'center', minWidth: 0 }, title: (o.sessionTitle ? o.sessionTitle + ' — ' : '') + (o.sessionId || '') || undefined },
                             o.sessionId ? dot('#46bb6d') : dot('rgba(140,140,140,0.6)'),
