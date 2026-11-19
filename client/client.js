@@ -155,6 +155,17 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       githubOwnerCol: '负责人',
       githubNotInited: '未初始化',
       githubResolveError: '负责人解析失败：',
+      runtimeSection: '运行参数',
+      slotsLabel: '每负责人并发槽',
+      slotsHint: '同一负责人最多并行处理的票据数（默认 3）。改大提速但会话更杂，改小更稳。',
+      reportAutoLabel: '例行自动汇报',
+      reportEveryLabel: '分钟一次',
+      reportHint: '开启后，chief 按间隔汇总各负责人状态并回投到飞书。',
+      patternsLabel: '危险命令黑名单',
+      patternsHint: '命中以下正则的注入会挂起等待你确认。每行一条正则。',
+      patternsEmptyWarn: '⚠ 黑名单为空——危险命令将不再被拦截确认。',
+      slotsInvalid: '并发槽必须是 ≥ 1 的整数',
+      reportMinInvalid: '汇报间隔必须是 ≥ 1 的整数分钟',
       ownersCard: '负责人',
       needsCard: '待我处理',
       connected: '已连接',
@@ -337,6 +348,17 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       githubOwnerCol: 'owner',
       githubNotInited: 'not initialized',
       githubResolveError: 'Owner resolution failed:',
+      runtimeSection: 'Runtime',
+      slotsLabel: 'Concurrency slots per owner',
+      slotsHint: 'How many tickets one owner may process in parallel (default 3). Higher is faster but busier.',
+      reportAutoLabel: 'Periodic auto report',
+      reportEveryLabel: 'minutes',
+      reportHint: 'When on, the chief summarizes owner states and posts back to Feishu on this interval.',
+      patternsLabel: 'Dangerous command blacklist',
+      patternsHint: 'Injected commands matching these regexes are held for your confirmation. One per line.',
+      patternsEmptyWarn: '⚠ Empty blacklist — dangerous commands will no longer be held for confirmation.',
+      slotsInvalid: 'Slots must be an integer ≥ 1',
+      reportMinInvalid: 'Report interval must be an integer ≥ 1 minute',
       ownersCard: 'Owners',
       needsCard: 'Needs me',
       connected: 'Connected',
@@ -871,6 +893,70 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             }
           }
           return h('div', { id: 'hub-bot-github', style: sectionStyle }, h('div', { style: sectionTitleStyle }, t('githubSection')), rows);
+        }
+
+        // 运行参数（round 35）：白名单里可写但面板没有 UI 的三组——并发槽、例行汇报、危险命令黑名单。
+        function RuntimeSection(props) {
+          var t = scoped.locale.bind(NS);
+          var fieldSt = { display: 'flex', flexDirection: 'column', gap: '4px', marginBottom: '12px' };
+          var labelSt = { fontSize: '12px', opacity: 0.75 };
+          var warnSt = { fontSize: '12px', opacity: 0.65, marginTop: '4px' };
+          var fs = React.useState({ slots: '3', reportAuto: false, reportMin: '60', patterns: '' });
+          var form = fs[0]; var setForm = fs[1];
+          var bs = React.useState(false); var busy = bs[0]; var setBusy = bs[1];
+          var ss = React.useState(false); var saved = ss[0]; var setSaved = ss[1];
+          var es = React.useState(null); var err = es[0]; var setErr = es[1];
+          React.useEffect(function () {
+            var v = props.view;
+            if (!v) return;
+            setForm({
+              slots: String((v.concurrency && v.concurrency.slotsPerOwner) || 3),
+              reportAuto: !!(v.reporting && v.reporting.auto),
+              reportMin: String(Math.round(((v.reporting && v.reporting.intervalMs) || 3600000) / 60000)),
+              patterns: ((v.security && v.security.dangerousPatterns) || []).join('\n'),
+            });
+          }, [props.view]);
+          var save = function () {
+            var slots = parseInt(form.slots, 10);
+            var mins = parseInt(form.reportMin, 10);
+            if (!Number.isSafeInteger(slots) || slots < 1) { setErr(t('slotsInvalid')); return; }
+            if (!Number.isSafeInteger(mins) || mins < 1) { setErr(t('reportMinInvalid')); return; }
+            var patterns = form.patterns.split('\n').map(function (s) { return s.trim(); }).filter(Boolean);
+            setBusy(true); setSaved(false); setErr(null);
+            scoped.remote.hubBotSettings.update({
+              concurrency: { slotsPerOwner: slots },
+              reporting: { auto: form.reportAuto, intervalMs: mins * 60000 },
+              security: { dangerousPatterns: patterns },
+            }).then(function (raw) {
+              setSaved(true);
+              if (props.onSaved) props.onSaved();
+            }).catch(function (e) { setErr(e && e.message ? e.message : String(e)); })
+              .finally(function () { setBusy(false); });
+          };
+          var edit = function (patch) { setForm(Object.assign({}, form, patch)); setSaved(false); };
+          return h('div', { style: Object.assign({}, sectionStyle, { marginTop: '22px' }) },
+            h('div', { style: sectionTitleStyle }, t('runtimeSection')),
+            h('div', { style: fieldSt },
+              h('label', { style: labelSt }, t('slotsLabel')),
+              h('input', { type: 'number', min: 1, step: 1, value: form.slots, onChange: function (ev) { edit({ slots: ev.target.value }); }, style: Object.assign({}, inputStyle, { width: '120px' }) }),
+              h('div', { style: warnSt }, t('slotsHint'))),
+            h('div', { style: fieldSt },
+              h('label', { style: Object.assign({}, labelSt, { display: 'flex', gap: '8px', alignItems: 'center' }) },
+                h('input', { type: 'checkbox', checked: form.reportAuto, onChange: function (ev) { edit({ reportAuto: ev.target.checked }); } }),
+                h('span', null, t('reportAutoLabel'))),
+              h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } },
+                h('input', { type: 'number', min: 1, step: 1, value: form.reportMin, disabled: !form.reportAuto, onChange: function (ev) { edit({ reportMin: ev.target.value }); }, style: Object.assign({}, inputStyle, { width: '120px' }, form.reportAuto ? {} : { opacity: 0.5 }) }),
+                h('span', { style: { fontSize: '12px', opacity: 0.65 } }, t('reportEveryLabel'))),
+              h('div', { style: warnSt }, t('reportHint'))),
+            h('div', { style: fieldSt },
+              h('label', { style: labelSt }, t('patternsLabel')),
+              h('textarea', { rows: 5, value: form.patterns, onChange: function (ev) { edit({ patterns: ev.target.value }); }, placeholder: '^\s*rm\s+-rf\s+/', style: Object.assign({}, inputStyle, { fontFamily: 'monospace', fontSize: '12px', resize: 'vertical' }) }),
+              h('div', { style: warnSt }, t('patternsHint')),
+              form.patterns.trim() === '' ? h('div', { style: { fontSize: '12px', color: TONES.amber.fg, marginTop: '4px' } }, t('patternsEmptyWarn')) : null),
+            h('div', { style: { display: 'flex', gap: '10px', alignItems: 'center' } },
+              h('button', { onClick: save, disabled: busy, style: Object.assign({}, inputStyle, { width: 'auto', cursor: 'pointer', padding: '6px 16px' }) }, busy ? t('saving') : t('save')),
+              saved ? h('span', { style: { fontSize: '12px', opacity: 0.7 } }, t('saved')) : null,
+              err ? h('span', { style: { fontSize: '12px', color: 'var(--dsh-danger, #d66)' } }, t('failed') + ': ' + err) : null));
         }
 
         function HubBotPanelPage() {
@@ -1542,6 +1628,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               h(FeishuSection, { view: view, onRefresh: refreshView }),
               h(GithubSection, { view: view })),
             h(HubBotRowConfig, { hubBotCtx: scoped, hideModel: true }),
+            h(RuntimeSection, { view: view, onSaved: refreshView }),
             error ? h('div', { style: { fontSize: '12px', color: TONES.red.fg, marginTop: '8px' } }, error) : null,
             notice ? h('div', { style: { fontSize: '12px', color: TONES.green.fg, marginTop: '8px' } }, notice) : null);
         }
