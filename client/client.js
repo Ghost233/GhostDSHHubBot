@@ -313,6 +313,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       expandAll: '全部展开',
       collapseAll: '全部收起',
       expandAllHint: '展开或收起任务流的全部阶段分组',
+      copyMsgHint: '点击复制原文',
       clearFilters: '清除筛选',
       clearFiltersHint: '清空本区的全部筛选条件',
       waitingHint: '从进入当前阶段起算；灰 <30 分钟，琥珀 <2 小时，红色更久',
@@ -554,6 +555,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       expandAll: 'Expand all',
       collapseAll: 'Collapse all',
       expandAllHint: 'Expand or collapse every stage group in the stream',
+      copyMsgHint: 'Click to copy the original message',
       clearFilters: 'Clear filters',
       clearFiltersHint: 'Reset every filter in this section',
       waitingHint: 'Time in the current stage; gray <30m, amber <2h, red beyond',
@@ -1443,7 +1445,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 ? h('span', { style: { flexShrink: 0, fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: tk.trigger.kind === 'feishu' ? 'rgba(70,150,255,0.14)' : 'rgba(150,150,150,0.14)', color: tk.trigger.kind === 'feishu' ? '#7db8ff' : 'rgba(200,200,200,0.8)', border: '1px solid ' + (tk.trigger.kind === 'feishu' ? 'rgba(70,150,255,0.3)' : 'rgba(150,150,150,0.25)') }, title: t('originHint') }, kindLabel(tk.trigger.kind))
                 : null,
               h('span', { style: { fontWeight: 600, whiteSpace: 'nowrap' } }, tk.ownerLabel || tk.owner),
-              h('span', { style: { flex: 1, opacity: 0.85, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: tk.message || '' }, tk.message || '（无原文）'),
+              h('span', {
+                style: { flex: 1, opacity: 0.85, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: tk.message ? 'pointer' : 'default' },
+                title: tk.message ? String(tk.message) + '\n' + t('copyMsgHint') : '',
+                onClick: tk.message ? function () { copyText(String(tk.message), 'msg:' + tk.id); } : undefined,
+              }, tk.message || '（无原文）'),
+              copiedId === 'msg:' + tk.id ? h('span', { style: { flexShrink: 0, fontSize: '11px', color: TONES.green.fg } }, t('copiedBtn')) : null,
               tk.recoveryPending ? h('span', { title: t('recoveringHint') }, stagePill('queued', t('recovering'))) : null,
               withActions && NEEDS_ME.indexOf(tk.stage) >= 0
                 ? (function () {
@@ -1835,6 +1842,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 h('span', { style: { marginLeft: 'auto', display: 'inline-flex', gap: '6px', flexWrap: 'wrap' } },
                   ['', 'feishu', 'github', 'route'].map(function (k) {
                     var on = recentKind === k;
+                    var kindCount = k === '' ? recent.length : recent.filter(function (tr) { return tr.kind === k; }).length;
+                    if (k !== '' && kindCount === 0) return null;
                     return h('button', {
                       key: k || 'all',
                       onClick: function () { setRecentKind(k); },
@@ -1843,7 +1852,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                         color: on ? '#7db8ff' : 'inherit',
                         border: '1px solid ' + (on ? 'rgba(70,150,255,0.4)' : 'rgba(127,127,127,0.2)'),
                         opacity: on ? 1 : 0.7 },
-                    }, k === '' ? t('filterAllKinds') : kindLabel(k));
+                    }, (k === '' ? t('filterAllKinds') : kindLabel(k)) + ' · ' + kindCount);
                   }),
                   recent.some(function (tr) { return tr.dropped; })
                     ? h('button', {
