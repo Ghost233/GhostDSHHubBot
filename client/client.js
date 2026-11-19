@@ -292,6 +292,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       replyPending: '投递中',
       replyFailed: '回复投递失败',
       artifactsLabel: '产物目录（负责人工作区）',
+      artifactsWorkingLabel: '工作区产物（进行中）',
       confirmActionInject: '确认后：原样投递挂起的注入（会话无人值守执行）',
       confirmActionFork: '确认后：fork 当前会话并在副本上续作（原会话保留）',
       confirmFullText: '查看完整挂起内容',
@@ -506,6 +507,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       replyPending: 'delivering',
       replyFailed: 'reply delivery failed',
       artifactsLabel: 'Artifacts (owner workspace)',
+      artifactsWorkingLabel: 'Workspace artifacts (in progress)',
       confirmActionInject: 'On confirm: deliver the held injection verbatim (unattended)',
       confirmActionFork: 'On confirm: fork the session and continue on the copy (original kept)',
       confirmFullText: 'View the full held content',
@@ -1432,6 +1434,19 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                       onClick: ev.copy ? function (e2) { e2.preventDefault(); copyText(ev.copy, 'tl:' + ev.copy); } : undefined,
                     }, ev.detail) : null);
                 })),
+               tk.stage !== 'person/review' && Array.isArray(tk.dirListing) && tk.dirListing.length > 0
+                 ? h('div', { style: { marginTop: '8px' } },
+                     h('div', { style: { fontSize: '11px', opacity: 0.55, marginBottom: '4px' } }, t('artifactsWorkingLabel')),
+                     h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px', maxHeight: '88px', overflowY: 'auto' } },
+                       tk.dirListing.map(function (name, i) {
+                         var isDir = name.endsWith('/');
+                         return h('span', { key: i, style: {
+                           fontFamily: 'monospace', fontSize: '11px', padding: '1px 7px', borderRadius: '5px',
+                           background: 'rgba(127,127,127,0.08)', border: '1px solid rgba(127,127,127,0.16)',
+                           color: isDir ? TONES.blue.fg : 'inherit', opacity: isDir ? 1 : 0.8,
+                         } }, name);
+                       })))
+                 : null,
                h('div', { style: { marginTop: '4px', display: 'flex', alignItems: 'center', gap: '8px' } },
                  h('span', { style: { opacity: 0.5, fontFamily: 'monospace', fontSize: '11px' } }, tk.id),
                  h('button', {

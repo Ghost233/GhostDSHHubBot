@@ -195,6 +195,21 @@ test('overview answers the three questions from ticket faces: state / doing / ou
   }
 })
 
+test('overview lists artifacts for working tickets too (round 45)', async () => {
+  const { router, registry, store, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'DSH-Workflow', cwd: '/repos/DSH-Workflow' })
+    const r1 = await router.routeToOwner({ ownerId: owner.id, message: '持续改造中' })
+    const listing = ['src/', 'wip-notes.md']
+    const overview = buildOverview({ store, registry, listDir: () => listing })
+    const ticket = overview.tickets.find(t => t.id === r1.ticketId)
+    assert.equal(ticket.stage, 'working')
+    assert.deepEqual(ticket.dirListing, listing, '进行中的票也列产物目录')
+  } finally {
+    cleanup()
+  }
+})
+
 test('overview skips directory listings for recycled owners (目录已删除)', async () => {
   const { router, registry, store, cleanup } = fixture()
   try {

@@ -282,8 +282,9 @@ export function buildOverview({ store, registry, health, now, listDir }) {
       report: t.report ?? null,
       dirListing: null,
     }
-    // 结果在哪: list artifacts only for review-stage tickets whose owner directory still exists (recycled 已删).
-    if (t.stage === 'person/review' && owner && !owner.recycled) {
+    // 结果在哪: list artifacts for review/working tickets whose owner directory still exists (recycled 已删).
+    // review 行内展示，working 收进详情折叠——干活干到一半也能瞄一眼产物。
+    if ((t.stage === 'person/review' || t.stage === 'working') && owner && !owner.recycled) {
       row.dirListing = (listDir ?? listDirCapped)(owner.cwd)
     }
     return row
