@@ -309,6 +309,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       ownerFilterHint: '点击只看这位负责人的票据',
       replySent: '已回复',
       replyCopyHint: '点击复制回复内容',
+      waitingLabel: '已等待',
+      waitingHint: '从进入当前阶段起算；灰 <30 分钟，琥珀 <2 小时，红色更久',
+      durNow: '刚刚',
+      durMin: '{n} 分钟',
+      durHour: '{n} 小时',
+      durDay: '{n} 天',
       originHint: '这条任务的来源渠道',
       replyRecorded: '已注入会话',
       replyPending: '投递中',
@@ -539,6 +545,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       ownerFilterHint: 'Click to show only this owner’s tickets',
       replySent: 'replied',
       replyCopyHint: 'Click to copy the reply text',
+      waitingLabel: 'waiting',
+      waitingHint: 'Time in the current stage; gray <30m, amber <2h, red beyond',
+      durNow: 'just now',
+      durMin: '{n}m',
+      durHour: '{n}h',
+      durDay: '{n}d',
       originHint: 'Origin channel of this task',
       replyRecorded: 'injected',
       replyPending: 'delivering',
@@ -1422,6 +1434,19 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               h('span', { style: { fontWeight: 600, whiteSpace: 'nowrap' } }, tk.ownerLabel || tk.owner),
               h('span', { style: { flex: 1, opacity: 0.85, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: tk.message || '' }, tk.message || '（无原文）'),
               tk.recoveryPending ? h('span', { title: t('recoveringHint') }, stagePill('queued', t('recovering'))) : null,
+              withActions && NEEDS_ME.indexOf(tk.stage) >= 0
+                ? (function () {
+                    var waitMs = Date.now() - new Date(tk.updatedAt || tk.createdAt).getTime();
+                    if (!(waitMs >= 0)) waitMs = 0;
+                    var waitTone = waitMs >= 2 * 3600e3 ? TONES.red : waitMs >= 30 * 60e3 ? TONES.amber : TONES.gray;
+                    var dur;
+                    if (waitMs < 60e3) dur = t('durNow');
+                    else if (waitMs < 3600e3) dur = fill(t('durMin'), Math.floor(waitMs / 60e3));
+                    else if (waitMs < 24 * 3600e3) dur = fill(t('durHour'), Math.floor(waitMs / 3600e3));
+                    else dur = fill(t('durDay'), Math.floor(waitMs / (24 * 3600e3)));
+                    return h('span', { style: { flexShrink: 0, fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: waitTone.bg, color: waitTone.fg, border: '1px solid ' + waitTone.border, whiteSpace: 'nowrap' }, title: t('waitingHint') }, t('waitingLabel') + ' ' + dur);
+                  })()
+                : null,
               h('span', { style: { fontSize: '12px', opacity: 0.55, whiteSpace: 'nowrap' } }, relTime(t, tk.updatedAt))));
             if (tk.pendingConfirm) rows.push(h('div', { key: 'pc', style: { marginTop: '6px', fontSize: '13px', color: TONES.amber.fg } }, t('pendingConfirmLabel') + tk.pendingConfirm.text));
             // 确认语义透明化： 危险注入挂起 → 确认=原样投递；fork 提案（无 action）→ 确认=fork 副本续作。
