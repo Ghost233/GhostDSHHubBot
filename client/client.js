@@ -162,6 +162,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       githubHandle: 'Mention 句柄',
       githubAllowlist: '允许触发者',
       githubAllowlistEmpty: '未配置（默认仅 gh 登录用户）',
+      githubSettingsTitle: '监听参数',
+      githubMinLabel: '轮询间隔（分钟）',
+      githubMinHint: 'GitHub 认证限额 5000 次/小时；间隔越短越实时，但越耗额度（最小 1 分钟）',
+      githubAllowlistLabel: '允许触发的 GitHub 账号（每行一个；留空 = 仅 gh 登录用户）',
+      githubMinInvalid: '轮询间隔必须是 ≥1 的整数（分钟）',
       githubFollowedTitle: '监听清单（跟随负责人注册表自动推导）',
       githubNoRepos: '暂无监听仓库',
       githubWatermark: '水位',
@@ -379,6 +384,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       githubHandle: 'Mention handle',
       githubAllowlist: 'Allowed authors',
       githubAllowlistEmpty: 'not set (defaults to the gh login)',
+      githubSettingsTitle: 'Poll settings',
+      githubMinLabel: 'Poll interval (minutes)',
+      githubMinHint: 'GitHub auth quota is 5000 calls/hour; shorter is fresher but burns quota (min 1 minute)',
+      githubAllowlistLabel: 'GitHub logins allowed to trigger (one per line; empty = the gh login only)',
+      githubMinInvalid: 'Poll interval must be an integer >= 1 (minutes)',
       githubFollowedTitle: 'Watched repos (derived from the owner registry)',
       githubNoRepos: 'No watched repos yet',
       githubWatermark: 'watermark',
@@ -919,6 +929,33 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var names = Object.keys(repos);
           var resolveErrors = gh.resolveErrors || {};
           var rows = [];
+          var gfs = React.useState({ min: '5', allowlist: '' });
+          var ghForm = gfs[0]; var setGhForm = gfs[1];
+          var gbs = React.useState(false); var ghBusy = gbs[0]; var setGhBusy = gbs[1];
+          var gss = React.useState(false); var ghSaved = gss[0]; var setGhSaved = gss[1];
+          var ges = React.useState(null); var ghErr = ges[0]; var setGhErr = ges[1];
+          React.useEffect(function () {
+            var g2 = props.view && props.view.github;
+            if (!g2) return;
+            setGhForm({ min: String(Math.round((g2.intervalMs || 300000) / 60000)), allowlist: (g2.loginAllowlist || []).join('\n') });
+          }, [props.view]);
+          var saveGh = function () {
+            var mins = parseInt(ghForm.min, 10);
+            if (!Number.isSafeInteger(mins) || mins < 1) { setGhErr(t('githubMinInvalid')); return; }
+            var list = ghForm.allowlist.split('\n').map(function (s) { return s.trim(); }).filter(Boolean);
+            setGhBusy(true); setGhSaved(false); setGhErr(null);
+            scoped.remote.hubBotSettings.update({ github: { intervalMs: mins * 60000, loginAllowlist: list } })
+              .then(function (raw) {
+                unwrap(raw);
+                setGhSaved(true);
+                if (props.onSaved) props.onSaved();
+              })
+              .catch(function (e) { setGhErr(e && e.message ? e.message : String(e)); })
+              .finally(function () { setGhBusy(false); });
+          };
+          var curGhMin = String(Math.round(((props.view && props.view.github && props.view.github.intervalMs) || 300000) / 60000));
+          var curGhList = ((props.view && props.view.github && props.view.github.loginAllowlist) || []).join('\n');
+          var ghDirty = ghForm.min !== curGhMin || ghForm.allowlist !== curGhList;
           if (!enabled) {
             rows.push(h('div', { key: 'off', style: { display: 'flex', gap: '12px', padding: '13px 15px', borderRadius: '10px', background: 'rgba(230,160,40,0.06)', border: '1px solid rgba(230,160,40,0.25)' } },
               h('span', { style: { fontSize: '16px', width: '28px', height: '28px', lineHeight: '27px', textAlign: 'center', borderRadius: '50%', background: TONES.amber.bg, border: '1px solid ' + TONES.amber.border, color: TONES.amber.fg, flexShrink: 0 } }, '!'),
@@ -956,6 +993,20 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                   info.lastError ? h('div', { style: { marginTop: '4px', fontSize: '11px', color: TONES.red.fg, wordBreak: 'break-all' } }, String(info.lastError).slice(0, 160)) : null));
               });
             }
+            rows.push(h('div', { key: 'gh-settings', style: { marginTop: '14px', paddingTop: '12px', borderTop: '1px solid rgba(127,127,127,0.14)' } },
+              h('div', { style: { fontSize: '12px', fontWeight: 600, opacity: 0.65, marginBottom: '10px' } }, t('githubSettingsTitle')),
+              h('div', { style: fieldStyle },
+                h('label', { style: labelStyle }, t('githubMinLabel')),
+                h('input', { type: 'number', min: 1, step: 1, value: ghForm.min, onChange: function (ev) { setGhForm(Object.assign({}, ghForm, { min: ev.target.value })); setGhSaved(false); }, style: Object.assign({}, inputStyle, { width: '120px' }) }),
+                h('div', { style: { fontSize: '12px', opacity: 0.65, marginTop: '4px' } }, t('githubMinHint'))),
+              h('div', { style: fieldStyle },
+                h('label', { style: labelStyle }, t('githubAllowlistLabel')),
+                h('textarea', { rows: 3, value: ghForm.allowlist, onChange: function (ev) { setGhForm(Object.assign({}, ghForm, { allowlist: ev.target.value })); setGhSaved(false); }, placeholder: 'Ghost233', style: Object.assign({}, inputStyle, { fontFamily: 'monospace', fontSize: '12px', resize: 'vertical' }) })),
+              h('div', { style: { display: 'flex', gap: '10px', alignItems: 'center' } },
+                h('button', { onClick: saveGh, disabled: ghBusy, style: Object.assign({}, inputStyle, { width: 'auto', cursor: 'pointer', padding: '6px 16px' }) }, ghBusy ? t('saving') : t('save')),
+                ghSaved && !ghDirty ? h('span', { style: { fontSize: '12px', opacity: 0.7 } }, t('saved')) : null,
+                ghDirty ? h('span', { style: { fontSize: '11px', padding: '1px 8px', borderRadius: '999px', background: 'rgba(230,160,40,0.14)', color: '#eba938', border: '1px solid rgba(230,160,40,0.4)', whiteSpace: 'nowrap' } }, t('unsaved')) : null,
+                ghErr ? h('span', { style: { fontSize: '12px', color: 'var(--dsh-danger, #d66)' } }, t('failed') + ': ' + ghErr) : null)));
           }
           return h('div', { id: 'hub-bot-github', style: sectionStyle }, h('div', { style: sectionTitleStyle }, t('githubSection')), rows);
         }
@@ -1801,7 +1852,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               h('div', { style: warnStyle }, t('modelPickerHint'))),
             h('div', { id: 'hub-bot-feishu' },
               h(FeishuSection, { view: view, onRefresh: refreshView }),
-              h(GithubSection, { view: view })),
+              h(GithubSection, { view: view, onSaved: refreshView })),
             h(HubBotRowConfig, { hubBotCtx: scoped, hideModel: true }),
             h(RuntimeSection, { view: view, onSaved: refreshView }),
             error ? h('div', { style: { fontSize: '12px', color: TONES.red.fg, marginTop: '8px' } }, error) : null,
