@@ -245,6 +245,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       copiedBtn: '已复制',
       copyIdHint: '复制工单号',
       settingsDivider: '设置',
+      selectAll: '全选',
+      selectNone: '全不选',
+      batchConfirm: '确认所选 · {count}',
+      batchReject: '拒绝所选 · {count}',
+      batchRunning: '执行中…',
+      batchFailed: '{count} 条批量操作失败',
       feishuMetricsTitle: '连接质量：',
       feishuMetricsReconnects: '重连 {count} 次',
       feishuMetricsLastConnected: '最近连接',
@@ -392,6 +398,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       copiedBtn: 'Copied',
       copyIdHint: 'Copy ticket id',
       settingsDivider: 'Settings',
+      selectAll: 'Select all',
+      selectNone: 'Select none',
+      batchConfirm: 'Confirm selected · {count}',
+      batchReject: 'Reject selected · {count}',
+      batchRunning: 'Running…',
+      batchFailed: '{count} batch operations failed',
       feishuMetricsTitle: 'Connection:',
       feishuMetricsReconnects: '{count} reconnects',
       feishuMetricsLastConnected: 'last connected',
@@ -819,6 +831,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           };
 
           var as2 = React.useState({}); var answers = as2[0]; var setAnswers = as2[1];
+          var sls = React.useState({}); var selected = sls[0]; var setSelected = sls[1];
+          var bbs = React.useState(false); var batchBusy = bbs[0]; var setBatchBusy = bbs[1];
           var resolve = function (tk, resolution) {
             var label = resolution === 'confirm' ? t('confirmBtn') : resolution === 'accept' ? t('acceptBtn') : t('rejectBtn');
             if (!window.confirm(label + ' — ' + (tk.pendingConfirm && tk.pendingConfirm.text ? tk.pendingConfirm.text : tk.id))) return;
@@ -827,6 +841,30 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               .then(function () { load(); })
               .catch(function (e) { setError(t('resolveFailed') + ': ' + (e && e.message ? e.message : String(e))); })
               .finally(function () { setResolving(null); });
+          };
+
+          // 批量裁决（round 24）: 危险命令挂起一多，逐个点确认很费手。
+          // 只对 person/confirm 可勾选；确认/拒绝串行执行，失败计数兜底，结束统一刷新。
+          var batchResolve = function (resolution) {
+            if (batchBusy) return;
+            var ids = needs.filter(function (tk) { return tk.stage === 'person/confirm' && selected[tk.id]; }).map(function (tk) { return tk.id; });
+            if (ids.length === 0) return;
+            var label = resolution === 'confirm' ? t('confirmBtn') : t('rejectBtn');
+            if (!window.confirm(label + ' × ' + ids.length)) return;
+            setBatchBusy(true); setError(null);
+            var failed = 0;
+            var chain = Promise.resolve();
+            ids.forEach(function (id) {
+              chain = chain.then(function () {
+                return scoped.remote.hubBotSettings.resolveTicket({ ticketId: id, resolution: resolution })
+                  .catch(function () { failed++; });
+              });
+            });
+            chain.then(function () {
+              setSelected({}); setBatchBusy(false);
+              if (failed > 0) setError(fill(t('batchFailed'), failed));
+              load();
+            });
           };
 
           // 回答问题（round 8）: person/answer 不再是只读——面板直接回复，票回 working。
@@ -868,6 +906,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
 
           var tickets = overview.tickets || [];
           var needs = tickets.filter(function (tk) { return NEEDS_ME.indexOf(tk.stage) >= 0; });
+          var confirmable = needs.filter(function (tk) { return tk.stage === 'person/confirm'; });
+          var selectedCount = confirmable.filter(function (tk) { return selected[tk.id]; }).length;
+          var allSelected = confirmable.length > 0 && selectedCount === confirmable.length;
           // 任务流过滤器（round 7）: 文本（消息/负责人/工单号）+ 阶段。只作用于任务流区，
           // 「需要我处理」永远完整呈现——裁决入口不能被过滤器藏起来。
           var filtered = tickets.filter(function (tk) {
@@ -1117,12 +1158,52 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                           h('button', { style: retryBtnStyle, onClick: function () { retryOutbox(r0.id); } }, t('retryOne'))),
                         r0.lastError ? h('div', { style: { opacity: 0.75, marginTop: '2px', wordBreak: 'break-all' } }, t('healthDetailLast') + ': ' + String(r0.lastError).slice(0, 140)) : null);
                     })) : null) : null,
-            h('div', { style: Object.assign({}, sectionStyle, needs.length > 0 ? { borderLeft: '3px solid ' + TONES.amber.border, paddingLeft: '14px' } : {}) },
-              h('div', { style: sectionTitleStyle }, t('needsMe'),
-                needs.length > 0 ? h('span', { style: { marginLeft: '8px', fontSize: '12px', fontWeight: 400, color: TONES.amber.fg } }, '· ' + needs.length) : null),
-              needs.length === 0
-                ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 0' } }, t('quiet'))
-                : needs.map(function (tk) { return ticketRowItem(tk, true); })),
+             h('div', { style: Object.assign({}, sectionStyle, needs.length > 0 ? { borderLeft: '3px solid ' + TONES.amber.border, paddingLeft: '14px' } : {}) },
+               h('div', { style: Object.assign({}, sectionTitleStyle, { display: 'flex', alignItems: 'center', gap: '8px' }) },
+                 h('span', null, t('needsMe'),
+                   needs.length > 0 ? h('span', { style: { marginLeft: '8px', fontSize: '12px', fontWeight: 400, color: TONES.amber.fg } }, '· ' + needs.length) : null),
+                 confirmable.length >= 2
+                   ? h('span', { style: { marginLeft: 'auto', display: 'inline-flex', gap: '6px', alignItems: 'center', fontWeight: 400 } },
+                       h('button', {
+                         style: { fontSize: '11px', padding: '2px 10px', borderRadius: '6px', cursor: 'pointer', background: 'rgba(127,127,127,0.1)', border: '1px solid rgba(127,127,127,0.3)', color: 'inherit' },
+                         onClick: function () {
+                           if (allSelected) { setSelected({}); return; }
+                           var next = {}; confirmable.forEach(function (tk) { next[tk.id] = true; }); setSelected(next);
+                         },
+                       }, allSelected ? t('selectNone') : t('selectAll')),
+                       selectedCount > 0
+                         ? h('button', {
+                             style: { fontSize: '11px', padding: '2px 10px', borderRadius: '6px', cursor: batchBusy ? 'default' : 'pointer', background: 'rgba(70,180,100,0.16)', border: '1px solid ' + TONES.green.border, color: TONES.green.fg },
+                             disabled: batchBusy,
+                             onClick: function () { batchResolve('confirm'); },
+                           }, batchBusy ? t('batchRunning') : fill(t('batchConfirm'), selectedCount))
+                         : null,
+                       selectedCount > 0
+                         ? h('button', {
+                             style: { fontSize: '11px', padding: '2px 10px', borderRadius: '6px', cursor: batchBusy ? 'default' : 'pointer', background: 'rgba(220,80,80,0.14)', border: '1px solid ' + TONES.red.border, color: TONES.red.fg },
+                             disabled: batchBusy,
+                             onClick: function () { batchResolve('reject'); },
+                           }, batchBusy ? t('batchRunning') : fill(t('batchReject'), selectedCount))
+                         : null)
+                   : null),
+               needs.length === 0
+                 ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 0' } }, t('quiet'))
+                 : needs.map(function (tk) {
+                     var card = ticketRowItem(tk, true);
+                     if (confirmable.length < 2 || tk.stage !== 'person/confirm') return card;
+                     var on = !!selected[tk.id];
+                     return h('div', { key: 'sel-' + tk.id, style: { display: 'flex', alignItems: 'flex-start', gap: '8px' } },
+                       h('input', {
+                         type: 'checkbox', checked: on,
+                         style: { marginTop: '14px', cursor: 'pointer', flexShrink: 0 },
+                         onChange: function () {
+                           var next = Object.assign({}, selected);
+                           if (on) delete next[tk.id]; else next[tk.id] = true;
+                           setSelected(next);
+                         },
+                       }),
+                       h('div', { style: { flex: 1, minWidth: 0 } }, card));
+                   })),
             h('div', { style: sectionStyle, id: 'hub-bot-stream' },
               h('div', { style: sectionTitleStyle }, t('ticketsSection'),
                 tickets.length > 0 ? h('span', { style: { marginLeft: '8px', fontSize: '12px', fontWeight: 400, opacity: 0.55 } }, '· ' + filtered.length + (filtered.length !== tickets.length ? ' / ' + tickets.length : '')) : null),
