@@ -38,7 +38,9 @@ HUB_BOT_TOKEN=$(openssl rand -hex 16)   # 开发实例启动时生成随机 toke
 # 4. 启动（独立端口；停止只需 Ctrl-C，用户的 DSH 不受影响）
 node "$DSH/node_modules/@deepseek-ai/dsh/lib/bin.js" --profile hub-bot-dev --no-open
 
-# 调用管理面：curl -H "x-hub-bot-token: $HUB_BOT_TOKEN" http://127.0.0.1:3199/hub-bot/api/state
+# 从启动日志复制本次 DSH Web 登录 URL 到 DSH_WEB_URL，然后请求管理 API。
+curl -fsS -c dev.cookies -o /dev/null "$DSH_WEB_URL"
+curl -fsS -b dev.cookies -H "x-hub-bot-token: $HUB_BOT_TOKEN" http://127.0.0.1:3199/hub-bot/api/state
 ```
 
 生产装载（与 superagent 相同形态）：在用户自己的 profile 里 `dsh plugin --profile <name> add link:<本目录>`（或安装打包后的 tgz），在该 profile 的 `cordis.patch.yml` 里给 `hub-bot` 条目加 `config.stateDir` 与 `config.homeRepo`（生产不建议开 `devApi`），重启该 profile 生效。重启用户正在运行的 DSH 需由交付 Lead 协调时机。

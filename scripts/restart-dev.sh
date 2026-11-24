@@ -10,12 +10,18 @@ DSH_BIN="/Applications/Ghost DSH Station.app/Contents/Resources/node_modules/@de
 PID=$(pgrep -f "lib/bin.js hub-bot-dev" | head -1 || true)
 if [ -n "$PID" ]; then kill -9 "$PID" 2>/dev/null || true; sleep 2; fi
 
+base_url="http://127.0.0.1:$PORT"
+boot_log="$DSH_HOME_DIR/boot-$(date +%Y%m%d-%H%M%S).log"
+cookie_jar=$(mktemp "$DSH_HOME_DIR/.dev-auth.XXXXXX")
+trap 'rm -f -- "$cookie_jar"' EXIT
 DSH_HOME="$DSH_HOME_DIR" nohup node "$DSH_BIN" hub-bot-dev --port "$PORT" --no-open \
-  > "$DSH_HOME_DIR/boot-$(date +%Y%m%d-%H%M%S).log" 2>&1 &
+  > "$boot_log" 2>&1 &
 
 for i in $(seq 1 25); do
-  code=$(curl -s -m 2 -o /dev/null -w "%{http_code}" "http://127.0.0.1:$PORT/hub-bot/panel/" 2>/dev/null || true)
-  if [ "$code" = "200" ]; then
+  login_url=$(awk -v base="$base_url/" '$1 == "dsh" && $2 == "web:" && index($3, base) == 1 { print $3; exit }' "$boot_log")
+  if [ -n "$login_url" ] &&
+     curl -fsS -m 2 -c "$cookie_jar" -o /dev/null "$login_url" &&
+     curl -fsS -m 2 -b "$cookie_jar" -o /dev/null "$base_url/hub-bot/panel/"; then
     echo "ready: http://127.0.0.1:$PORT/hub-bot/panel/"
     exit 0
   fi

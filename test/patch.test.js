@@ -34,13 +34,16 @@ async function patched() {
     const cordisRequire = createRequire(runtimeRequire.resolve('@deepseek-ai/cordis/package.json'))
     const includePath = cordisRequire.resolve('@deepseek-ai/cordis-plugin-include')
     include = await import(includePath)
-    const jsYamlRequire = createRequire(includePath)
-    yaml = await import(jsYamlRequire.resolve('js-yaml'))
+    if (!include.parseEntryYaml) {
+      yaml = await import(createRequire(includePath).resolve('js-yaml'))
+    }
   } catch {
     return null
   }
-  const patches = yaml.load(readFileSync(join(here, '..', 'cordis.patch.yml'), 'utf8'), { schema: include.entryListSchema })
-  return include.applyEntryPatches([], patches, message => { throw new Error('patch warning: ' + message) })
+  const source = readFileSync(join(here, '..', 'cordis.patch.yml'), 'utf8')
+  const patches = include.parseEntryYaml ? include.parseEntryYaml(source) : yaml.load(source, { schema: include.entryListSchema })
+  const result = include.applyEntryPatches([], patches, message => { throw new Error('patch warning: ' + message) })
+  return Array.isArray(result) ? result : result.data
 }
 
 /** Every plugin row of a preset, including rows nested inside cordis groups. */

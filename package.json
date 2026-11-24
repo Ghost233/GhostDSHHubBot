@@ -1,6 +1,6 @@
 {
   "name": "dsh-hub-bot",
-  "version": "0.73.0",
+  "version": "0.73.1",
   "private": true,
   "description": "Hub Bot: a three-layer owner-agent personal bot as a DSH cordis bundle. Feishu/GitHub sources route into owner sessions through prompt injection; this package is the bundle skeleton: state directory, versioned SQLite store, owner agent presets, and the session injection/inspection API.",
   "license": "MIT",
@@ -43,12 +43,13 @@
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0",
-    "dsh": "^0.2.1-alpha.2"
+    "dsh": ">=0.2.3-alpha.2 <0.3.0"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.76.0",
+    "@deepseek-ai/cordis": "4.2.0-alpha.1",
+    "@deepseek-ai/dsh-error": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.3-alpha.2",
     "@deepseek-ai/schemastery": "^3.19.0",
-    "@deepseek-ai/dsh-typert-protocol": "^0.2.2-rc.4",
-    "@deepseek-ai/cordis": "~4.1.0"
+    "@larksuiteoapi/node-sdk": "^1.76.0"
   }
 }

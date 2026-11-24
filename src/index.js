@@ -25,6 +25,7 @@ import { readFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
+import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { resolveConfig } from './config.js'
 
@@ -222,6 +223,8 @@ export function apply(ctx, rawConfig) {
   const placer = new WorkspacePlacer({ workspaceController: safeGetService(ctx, 'workspaceController'), homeRepo: config.homeRepo, workspaces: config.workspaces, logger: ctx.logger, registryList: () => safeGetService(ctx, 'workspaceRegistry')?.list?.() ?? [], archivedList: () => { try { return safeGetService(ctx, 'workspaceRegistry')?.archivedSessionIds ?? [] } catch { return [] } } })
   const hub = new Hub({ store, config, sessions, onSystemProblem: p => ctx.logger.warn('hub-bot system problem: %s (ticket %s, row %s)', p.reason, p.ticketId, p.rowId), placer })
   const chief = hub.registry.ensureChief({ cwd: config.homeRepo, workspace: basename(config.homeRepo) })
+  // Owner preset subtrees resolve the Hub through the Host root context.
+  const unprovide = ctx[Context.root].reflect.provide('hubBot', hub)
   setHub(hub)
   // 飞书入口 (#68): OFF unless config.feishu.enabled. With credentials present the WSClient long connection
   // starts at boot; the same source scans recorded feishu reply intents on the 1s tick (阶段 2 留的通道).
@@ -267,7 +270,7 @@ export function apply(ctx, rawConfig) {
     try { recycler.sweep() } catch (error) { ctx.logger.warn('hub-bot recycle sweep failed: %s', error?.message ?? error) }
   }, 1000)
   deliveryTimer.unref?.()
-  ctx.on('dispose', () => clearInterval(deliveryTimer))
+
   // #73 设置页: the poll loop is restartable — 轮询开关/间隔 changes via the settings API apply immediately.
   let githubPollTimer = null
   const restartGithubPolling = () => {
@@ -280,12 +283,23 @@ export function apply(ctx, rawConfig) {
     }
   }
   restartGithubPolling()
-  ctx.on('dispose', () => { if (githubPollTimer) clearInterval(githubPollTimer) })
-  // The preset-subtree tool plugins (router-tools) run in a separate module realm: neither a module-level singleton
-  // nor even globalThis reaches them (observed live). A service provided at this scope is the channel that crosses —
-  // the same way the subtree sees Host services like 'tools'. The fiber's unload unregisters it (reflect.provide).
-  const unprovide = ctx.root.reflect.provide('hubBot', hub)
-  // #53: cleanup moved to the single dispose hook after webServer.register (correct ordering: routes first).
+
+  let unregisterManagement
+  // Dispose the root service and store even when the management API is disabled. Stop new work before closing them.
+  ctx.effect(() => async () => {
+    clearInterval(deliveryTimer)
+    clearInterval(githubPollTimer)
+    const steps = [
+      ['unregister management routes', () => unregisterManagement?.()],
+      ['disconnect feishu', () => feishu.disconnect()],
+      ['unprovide hub service', unprovide],
+      ['release hub reference', () => setHub(null)],
+      ['close store', () => store.close()],
+    ]
+    for (const [label, step] of steps) {
+      try { await step() } catch (error) { ctx.logger.warn('hub-bot dispose step "%s" failed: %s', label, error?.message ?? error) }
+    }
+  })
   let staleReported = false
   ctx.logger.info('hub-bot ready: state %s (schema %s); chief owner %s (%s)%s',
     store.stateDir, store.schemaVersion, chief.owner.cwd, chief.created ? 'registered pending' : 'already registered',
@@ -396,7 +410,7 @@ export function apply(ctx, rawConfig) {
     discardOutbox: forwardDep('discardOutbox'),
     selfTest: forwardDep('selfTest'),
   })
-  // 填充真实实现——转发层延迟解引用；devApi 未配置时管理面方法本就不该可用（行为与现状一致）。
+  // The settings service also works when the optional HTTP management routes are disabled.
   Object.assign(serviceDeps, {
     settingsView,
     applySettings: applySettingsCore,
@@ -440,11 +454,7 @@ export function apply(ctx, rawConfig) {
     },
   })
 
-  if (!config.devApi) return
-  const token = config.devApi.token
-  if (ctx.webServer.host !== '127.0.0.1' && ctx.webServer.host !== 'localhost' && ctx.webServer.host !== '::1') {
-    throw new Error('hub-bot management requires a loopback Web server')
-  }
+  const token = config.devApi?.token
 
   /** Management calls are loopback-only and must carry the configured token. */
   // #53: capture the port NOW — after a hot-reload dispose the ctx.webServer proxy is dead, and a stale
@@ -658,7 +668,12 @@ export function apply(ctx, rawConfig) {
     return { discarded }
   }
 
-  const unregister = ctx.webServer.register({
+  if (!config.devApi) return
+  if (ctx.webServer.host !== '127.0.0.1' && ctx.webServer.host !== 'localhost' && ctx.webServer.host !== '::1') {
+    throw new Error('hub-bot management requires a loopback Web server')
+  }
+
+  unregisterManagement = ctx.webServer.register({
     kind: 'prefix',
     path: '/hub-bot',
     handler: async (req, res) => {
@@ -796,18 +811,5 @@ export function apply(ctx, rawConfig) {
       }
     },
   })
-  // #53 dispose 单钩子: unregister FIRST (stop new traffic before tearing down resources), every step
-  // isolated — one failing step must never skip the rest of the cleanup.
-  ctx.on('dispose', () => {
-    const steps = [
-      ['unregister management routes', () => unregister()],
-      ['disconnect feishu', () => feishu.disconnect()],
-      ['unprovide hub service', () => unprovide()],
-      ['release hub reference', () => setHub(null)],
-      ['close store', () => store.close()],
-    ]
-    for (const [label, step] of steps) {
-      try { void step() } catch (error) { ctx.logger.warn('hub-bot dispose step "%s" failed: %s', label, error?.message ?? error) }
-    }
-  })
+
 }
