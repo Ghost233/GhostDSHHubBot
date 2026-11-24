@@ -161,9 +161,10 @@ export class OutboxRunner {
    * scan until releaseHeld() flips it to 'queued' (slot admission). Per-ticket order survives: the held head
    * and any follow-up rows release together, oldest first.
    */
-  enqueue({ ticketId, kind, to, body, sessionId, requestId, held }) {
+  enqueue({ ticketId, triggerId, kind, to, body, sessionId, requestId, held }) {
     return insertOutbox(this.store, {
       ticketId: ticketId ?? null, kind, to, body, sessionId: sessionId ?? null, requestId, state: held === true ? 'held' : 'queued',
+      ...(triggerId !== undefined && { triggerId }),
     }, this.now)
   }
 

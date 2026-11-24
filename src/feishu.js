@@ -55,6 +55,7 @@ export function credentialPath(stateDir) {
 const MAX_FEISHU_ATTEMPTS = 5
 
 export class FeishuSource {
+  #chiefReady = null
   /**
    * @param {{ store: import('./store.js').Store, registry: import('./registry.js').OwnerRegistry,
    *   sessions: { create: Function, prompt: Function }, config: object, logger: { info: Function, warn: Function },
@@ -306,7 +307,9 @@ export class FeishuSource {
    */
   async handleEvent(raw) {
     const msg = this.normalize(raw)
-    if (!msg.messageId || !msg.chatId) return { dropped: 'malformed' }
+    if (typeof msg.messageId !== 'string' || !msg.messageId || typeof msg.chatId !== 'string' || !msg.chatId) {
+      return { dropped: 'malformed' }
+    }
     if (msg.senderType !== 'user') return { dropped: 'bot-self' } // 丢弃 bot 自己的消息
     const at = this.now()
     const triggerId = this.#triggerId(msg.messageId)
@@ -327,26 +330,33 @@ export class FeishuSource {
       record({ dropped: 'unsupported-type', msgType: msg.msgType })
       // 先存后做: the 暂不支持 reply is itself a recorded intent on the feishu channel.
       insertOutbox(this.store, {
-        ticketId: null, kind: 'reply', to: 'feishu:chat:' + msg.chatId,
+        ticketId: null, triggerId, kind: 'reply', to: 'feishu:chat:' + msg.chatId,
         body: UNSUPPORTED_MESSAGE_TYPE, state: 'recorded', requestId: 'hub-bot-feishu-unsupported-' + msg.messageId,
       })
       return { dropped: 'unsupported-type' }
     }
     const authorization = { actor: msg.openId, source: 'feishu', addressing: msg.addressing, messageId: msg.messageId, at }
-    record({ authorization })
-    // 注入 L1 总负责人会话 (spec: 飞书只是入口，L1 路由): the text carries the plugin-owned source mark and
-    // the reply channel address so L1 can answer with reply_source to='feishu:chat:<chatId>'.
+    const trigger = record({ authorization, injectedAt: null })
     const text = FEISHU_SOURCE_MARK + msg.chatId + '/' + msg.messageId + '] ' + msg.text
       + '\n\n来源：feishu 用户 ' + msg.openId + '（' + (msg.addressing === 'direct' ? '私聊' : '群聊 @bot') + '）于 ' + at
-      + '；回复本消息用 reply_source to=\'feishu:chat:' + msg.chatId + '\''
+      + `；回复本消息用 reply_source to='feishu:chat:${msg.chatId}' triggerRef='${triggerId}'。`
+      + (msg.messageId.startsWith('om_selftest-') ? '' : `若新建任务，调用 route_to_owner 时也传入 triggerRef='${triggerId}'。`)
     const sessionId = await this.#ensureChiefSession()
     const requestId = 'hub-bot-feishu-' + msg.messageId
     await this.sessions.prompt({ sessionId, requestId, text })
+    if (!this.store.closed) {
+      this.store.db.prepare('UPDATE trigger SET value = ? WHERE id = ?')
+        .run(JSON.stringify({ ...trigger, injectedAt: this.now() }), triggerId)
+    }
     return { injected: true, triggerId, sessionId, requestId }
   }
 
-  /** Lazily binds the chief (L1) Session — mirrors the router's lazy owner-session creation. */
-  async #ensureChiefSession() {
+  #ensureChiefSession() {
+    return this.#chiefReady ??= this.#prepareChiefSession().finally(() => { this.#chiefReady = null })
+  }
+
+  /** Lazily bind and configure the chief once for concurrent incoming messages. */
+  async #prepareChiefSession() {
     const chief = this.registry.get('chief')
     if (!chief) throw new Error('hub-bot feishu: the chief owner row is missing from the registry')
     if (!chief.sessionId) {

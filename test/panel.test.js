@@ -222,7 +222,7 @@ test('overview counts unprocessed triggers older than 5 minutes (round 67)', asy
     put('trg-young-unhandled', '2026-11-19T11:59:00.000Z', 'chat-z')            // 太新 → 不计
     put('trg-dropped', '2026-11-19T11:00:00.000Z', 'chat-w', { dropped: 'unsupported' }) // dropped → 不计
     put('trg-replied', '2026-11-19T11:00:00.000Z', 'chat-x')                    // 有直接回复 → 不计
-    insertOutbox(store, { kind: 'reply', state: 'sent', to: 'feishu:chat:chat-x', body: '收到' }, () => '2026-11-19T11:01:00.000Z')
+    insertOutbox(store, { kind: 'reply', state: 'sent', to: 'feishu:chat:chat-x', triggerId: 'trg-replied', body: '收到' }, () => '2026-11-19T11:01:00.000Z')
     const overview = buildOverview({ store, registry, now: () => now, health: {} })
     assert.equal(overview.unprocessedTriggers, 1, '只有又老又没人理的触发被计数')
   } finally { cleanup() }
@@ -239,10 +239,11 @@ test('Feishu self-test only matches its own reply, even outside the recent messa
     const read = () => buildOverview({ store, registry, now: () => '2026-11-19T12:00:00.000Z' })
     const insertTrigger = store.db.prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)')
     insertTrigger.run(triggerId, JSON.stringify({ id: triggerId, kind: 'feishu', at, source: { chatId, messageId } }), at)
-    const reply = body => insertOutbox(store, { kind: 'reply', state: 'sent', to: 'feishu:chat:' + chatId, body },
+    const reply = (body, ref) => insertOutbox(store, { kind: 'reply', state: 'sent', to: 'feishu:chat:' + chatId, triggerId: ref, body },
       () => '2026-11-19T11:59:30.000Z')
     reply('Unrelated reply in the same chat')
-    reply('[hub-bot-check:om_selftest-abcdef1234567890abcdef1234567890]')
+    reply('Wrong reply even with the correct trigger reference', triggerId)
+    reply('[hub-bot-check:om_selftest-abcdef1234567890abcdef1234567890]', triggerId)
     assert.equal(read().recentTriggers[0].reply, null)
 
     const expected = reply(marker)
@@ -259,13 +260,50 @@ test('Feishu self-test only matches its own reply, even outside the recent messa
   } finally { cleanup() }
 })
 
+test('recent messages separate dispatch, legacy chat replies and replies to a single message', async () => {
+  const { router, store, registry, cleanup } = fixture()
+  try {
+    const at = '2026-11-15T00:01:00.000Z'
+    const put = store.db.prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)')
+    for (const [id, tracked] of [['one', true], ['two', true], ['old', false]]) {
+      const trigger = {
+        id: 'feishu-' + id, kind: 'feishu', at, message: id, source: { chatId: 'same-chat', messageId: id },
+        ...(tracked && { injectedAt: at }),
+      }
+      put.run(trigger.id, JSON.stringify(trigger), at)
+    }
+    const when = () => '2026-11-15T00:02:00.000Z'
+    insertOutbox(store, { kind: 'reply', to: 'feishu:chat:same-chat', state: 'sent', body: 'Legacy reply' }, when)
+    insertOutbox(store, { kind: 'reply', to: 'feishu:chat:same-chat', triggerId: 'feishu-two', state: 'sent', body: 'Second message reply' }, when)
+    const owner = registry.create({ kind: 'repo', workspace: 'Project', cwd: '/repos/Project' })
+    const route = await router.routeToOwner({ ownerId: owner.id, message: 'Local task' })
+    insertOutbox(store, { kind: 'reply', to: 'dsh:session:chief', ticketId: route.ticketId, state: 'sent', body: 'Internal report' }, when)
+    const view = buildOverview({ store, registry, now: () => '2026-11-15T00:10:00.000Z' })
+    const msg = id => view.recentTriggers.find(t => t.id === 'feishu-' + id)
+    assert.equal(msg('one').reply, null)
+    assert.equal(msg('one').injectedAt, at)
+    assert.equal(msg('one').replyUnlinked, true)
+    assert.equal(msg('one').unprocessed, true)
+    assert.equal(msg('two').reply.text, 'Second message reply')
+    assert.equal(msg('two').unprocessed, false)
+    assert.equal(msg('old').reply, null)
+    assert.equal(msg('old').replyUnlinked, true)
+    assert.equal(msg('old').unprocessed, false)
+    assert.equal(view.recentTriggers.find(t => t.ticketId === route.ticketId).reply, null)
+  } finally { cleanup() }
+})
+
 test('overview reply projection carries the reply text snippet (round 54)', async () => {
   const { router, registry, store, cleanup } = fixture()
   try {
     const owner = registry.create({ kind: 'repo', workspace: 'DSH-Workflow', cwd: '/repos/DSH-Workflow' })
-    const r1 = await router.routeToOwner({ ownerId: owner.id, message: '看一下状态' })
-    // failed 优先级最低（最差），在路由器自己的通知行之上确定性地胜出
-    insertOutbox(store, { ticketId: r1.ticketId, kind: 'reply', to: 'feishu:chat:oc_x', body: '队列空闲，三张票在跑', state: 'failed', sessionId: null, requestId: null }, () => new Date().toISOString())
+    const at = '2026-11-15T00:00:00.000Z'
+    const trigger = { id: 'original', kind: 'feishu', at, message: '看一下状态', source: { chatId: 'oc_x' },
+      authorization: { actor: 'ou_x', source: 'feishu', at } }
+    store.db.prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)').run(trigger.id, JSON.stringify(trigger), at)
+    const receipt = await router.routeToOwner({ ownerId: owner.id, triggerRef: trigger.id, message: '检查当前队列' })
+    insertOutbox(store, { ticketId: receipt.ticketId, kind: 'reply', to: 'feishu:chat:oc_x', body: '处理中', state: 'sent' }, () => at)
+    insertOutbox(store, { triggerId: trigger.id, kind: 'reply', to: 'feishu:chat:oc_x', body: '队列空闲，三张票在跑', state: 'failed' }, () => at)
     const overview = buildOverview({ store, registry })
     const msg = overview.recentTriggers.find(t => t.message === '看一下状态')
     assert.equal(msg.reply?.state, 'failed')

@@ -47,7 +47,7 @@ function fixture({ botOpenId = 'ou_bot', larkOverrides = {}, chiefConfig } = {})
     now: () => new Date(nowMs).toISOString(),
   })
   return {
-    source, registry, store, calls, sent, fakeLark,
+    source, router, registry, store, calls, sent, fakeLark,
     advance: ms => { nowMs += ms },
     cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }) },
   }
@@ -92,6 +92,39 @@ test('a p2p text message is normalized, recorded as a Trigger, and injected into
     assert.equal(trigger.source.kind, 'feishu')
     assert.equal(trigger.source.addressing, 'direct')
     assert.deepEqual(trigger.authorization, { actor: 'ou_me', source: 'feishu', addressing: 'direct', messageId: 'om_1', at: trigger.authorization.at })
+  } finally { cleanup() }
+})
+
+test('Feishu replies and dispatches use the original message and its authorization', async () => {
+  const { source, router, registry, calls, sent, cleanup } = fixture()
+  try {
+    const [first, second] = await Promise.all([
+      source.handleEvent(event({ messageId: 'om_first', text: '原始请求' })),
+      source.handleEvent(event({ messageId: 'om_second', text: '另一条请求' })),
+    ])
+    assert.equal(first.sessionId, second.sessionId)
+    assert.equal(calls.create.length, 1)
+    assert.ok(calls.prompt.some(prompt => /triggerRef='feishu-om_first'/.test(prompt.text)))
+    assert.ok(router.getTrigger(first.triggerId).injectedAt)
+    await assert.rejects(router.replySource({ text: '不发送', triggerRef: second.triggerId, to: 'feishu:chat:oc_other' }),
+      { code: 'reply-target-mismatch' })
+    await assert.rejects(router.replySource({ text: '不发送', triggerRef: 'missing' }), { code: 'invalid-reply-trigger' })
+    const owner = registry.create({ kind: 'repo', workspace: 'A', cwd: '/repos/A' })
+    const other = registry.create({ kind: 'repo', workspace: 'B', cwd: '/repos/B' })
+    const route = await Promise.all([owner, other].map(row => router.routeToOwner({
+      ownerId: row.id, triggerRef: first.triggerId, message: '转交给负责人处理',
+    })))
+    assert.ok(route[0].ticketId)
+    assert.equal(route[1].ticketId, route[0].ticketId)
+    assert.equal(route[1].ownerId, owner.id)
+    assert.equal(registry.get(other.id).sessionId, null)
+    assert.deepEqual(router.getTicket(route[0].ticketId).authorization, router.getTrigger(first.triggerId).authorization)
+    assert.equal(router.getTrigger(first.triggerId).message, '原始请求')
+    assert.match(calls.prompt.at(-1).text, /转交给负责人处理/)
+    const reply = await router.replySource({ text: '收到第二条', triggerRef: second.triggerId })
+    assert.equal(router.listOutbox().find(row => row.id === reply.outboxId).triggerId, second.triggerId)
+    await source.deliverReplies()
+    assert.deepEqual(sent.map(request => [request.data.receive_id, JSON.parse(request.data.content).text]), [['oc_1', '收到第二条']])
   } finally { cleanup() }
 })
 
@@ -153,6 +186,7 @@ test('non-text messages get the recorded-reply 暂不支持该消息类型', asy
     assert.ok(reply, 'a reply intent was stored first (先存后做)')
     assert.equal(reply.state, 'recorded')
     assert.equal(reply.body, '暂不支持该消息类型')
+    assert.equal(reply.triggerId, 'feishu-om_5')
   } finally { cleanup() }
 })
 

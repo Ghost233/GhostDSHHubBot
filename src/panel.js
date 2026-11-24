@@ -274,7 +274,7 @@ export function buildOverview({ store, registry, health, now, listDir }) {
       ownerLabel: owner ? (owner.workspace ?? owner.id) : t.owner,
       stage: t.stage,
       stageText: STAGE_TEXT[t.stage] ?? t.stage,
-      message: typeof trigger?.message === 'string' ? trigger.message : null,
+      message: t.routedMessage ?? (typeof trigger?.message === 'string' ? trigger.message : null),
       createdAt: t.createdAt ?? null,
       updatedAt: t.updatedAt ?? null,
       recoveryPending: t.recoveryPending === true,
@@ -296,86 +296,77 @@ export function buildOverview({ store, registry, health, now, listDir }) {
   })
   // 最近消息流（GUI 面板「最近消息」区）: trigger 按时间倒序前 12 条，带上票面的 owner/阶段——
   // 让「刚才飞书那句话进来没有、派给谁了、现在什么状态」一眼可查，不用翻任务流。
-  // 关联方向: ticket.triggerId → trigger（trigger 侧没有 ticketId——入站先记 trigger，票面后建）。
+  const ticketsById = new Map(tickets.map(ticket => [ticket.id, ticket]))
   const ticketByTriggerId = new Map(tickets.filter(t => t.trigger?.id).map(t => [t.trigger.id, t]))
-  // 回复投递状态（消息闭环）: 每条入站消息关联的票 → outbox 行。多行取「最差」状态——
-  // failed > held/queued > sent > recorded，让失败永远浮在最上面。
-  const REPLY_PRIORITY = { failed: 0, held: 1, queued: 1, sent: 2, recorded: 3 }
-  const outboxByTicket = new Map()
-  // 直接回复（chief 未建票）outbox 行 ticketId 为空——按 feishu:chat:<chatId> 另建索引归位到 trigger (round 53)。
-  const replyRowsByChat = new Map()
-  for (const row of readAll('outbox')) {
-    if (row.kind === 'reply' && !row.ticketId && row.to && String(row.to).startsWith('feishu:chat:')) {
-      const chatList = replyRowsByChat.get(row.to) ?? []
-      chatList.push(row)
-      replyRowsByChat.set(row.to, chatList)
+  const replyPriority = { failed: 0, held: 1, queued: 1, recorded: 1, sent: 2 }
+  const linkedReplies = new Map()
+  const legacyReplies = new Map()
+  const legacyMarkers = new Map()
+  const markerPattern = /\[hub-bot-check:om_selftest-[0-9a-f]{32}\]/
+  function pickReply(index, key, row) {
+    if (!key) return
+    const prior = index.get(key)
+    const priority = replyPriority[row.state] ?? 3
+    if (!prior || priority < (replyPriority[prior.state] ?? 3)
+      || (priority === (replyPriority[prior.state] ?? 3) && (row.createdAt ?? '') >= (prior.createdAt ?? ''))) {
+      index.set(key, row)
     }
-    if (!row.ticketId) continue
-    const list = outboxByTicket.get(row.ticketId) ?? []
-    list.push(row)
-    outboxByTicket.set(row.ticketId, list)
   }
-  const directReplyFor = trigger => {
-    if (trigger.kind !== 'feishu' || !trigger.source?.chatId) return null
-    const marker = feishuSelfTestMarker(trigger.source.messageId)
-    const rows = (replyRowsByChat.get('feishu:chat:' + trigger.source.chatId) ?? [])
-      .filter(row => {
-        if (String(row.createdAt ?? '') < String(trigger.at ?? '')) return false
-        const text = String(row.body ?? row.text ?? '')
-        return marker ? text.includes(marker) : !/\[hub-bot-check:om_selftest-[0-9a-f]{32}\]/.test(text)
-      })
-      .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')))
-    return rows[0] ?? null
+  for (const row of readAll('outbox')) {
+    if (row.kind !== 'reply' || typeof row.to !== 'string') continue
+    if (row.to.startsWith('github:')) {
+      const ticket = row.ticketId && ticketsById.get(row.ticketId)
+      pickReply(linkedReplies, row.triggerId ?? ticket?.trigger?.id, row)
+      continue
+    }
+    if (!row.to.startsWith('feishu:')) continue
+    const chatId = row.to.replace(/^feishu:(chat:)?/, '')
+    const ticket = row.ticketId && ticketsById.get(row.ticketId)
+    const triggerId = row.triggerId ?? ticket?.trigger?.id
+    const trigger = triggerId && triggers.get(triggerId)
+    const marker = String(row.body ?? row.text ?? '').match(markerPattern)?.[0] ?? null
+    if (trigger?.kind === 'feishu' && trigger.source?.chatId === chatId) {
+      if (marker === feishuSelfTestMarker(trigger.source.messageId)) pickReply(linkedReplies, triggerId, row)
+    } else if (!row.triggerId && !row.ticketId) {
+      if (marker) pickReply(legacyMarkers, chatId + ':' + marker, row)
+      else if (!legacyReplies.has(chatId) || (row.createdAt ?? '') >= (legacyReplies.get(chatId).createdAt ?? '')) legacyReplies.set(chatId, row)
+    }
   }
-  const replyTextOf = row => String(row.body ?? row.text ?? '').slice(0, 120)
-  const replyStateForRow = row => ({ state: row.state ?? 'queued', id: row.id, attempts: row.attempts ?? 0, lastError: row.lastError ?? null, text: replyTextOf(row) })
-  const replyStateFor = ticketId => {
-    const rows = outboxByTicket.get(ticketId)
-    if (!rows || rows.length === 0) return null
-    const worst = [...rows].sort((a, b) => (REPLY_PRIORITY[a.state] ?? 9) - (REPLY_PRIORITY[b.state] ?? 9))[0]
-    return { state: worst.state ?? 'queued', id: worst.id, attempts: worst.attempts ?? 0, lastError: worst.lastError ?? null, text: replyTextOf(worst) }
+  const generatedAt = (now ?? (() => new Date().toISOString()))()
+  const nowMs = Date.parse(generatedAt) || Date.now()
+  function projectTrigger(trigger) {
+    const ticket = ticketByTriggerId.get(trigger.id)
+    const marker = feishuSelfTestMarker(trigger.source?.messageId)
+    const chatId = trigger.source?.chatId
+    const historicalRun = marker && chatId ? legacyMarkers.get(chatId + ':' + marker) : null
+    const row = linkedReplies.get(trigger.id)
+      ?? (historicalRun && (historicalRun.createdAt ?? '') >= trigger.at ? historicalRun : null)
+    const legacyReply = chatId && legacyReplies.get(chatId)
+    const unlinked = trigger.kind === 'feishu' && !trigger.dropped && !marker && !row
+      && Boolean(legacyReply && (legacyReply.createdAt ?? '') >= trigger.at)
+    const age = nowMs - Date.parse(trigger.at ?? '')
+    return {
+      id: trigger.id, kind: trigger.kind ?? null, at: trigger.at ?? null,
+      message: typeof trigger.message === 'string' ? (trigger.message.length > 160 ? trigger.message.slice(0, 160) + '…' : trigger.message) : null,
+      dropped: trigger.dropped ?? null,
+      injectedAt: trigger.injectedAt ?? null,
+      ticketId: ticket?.id ?? null, ownerLabel: ticket?.ownerLabel ?? null,
+      stage: ticket?.stage ?? null, stageText: ticket?.stageText ?? null,
+      reply: row ? { state: row.state ?? 'queued', id: row.id, attempts: row.attempts ?? 0,
+        lastError: row.lastError ?? null, text: String(row.body ?? row.text ?? '').slice(0, 120) } : null,
+      replyUnlinked: unlinked,
+      unprocessed: !trigger.dropped && !marker && !ticket && !row && age > 5 * 60_000
+        && (!unlinked || Object.hasOwn(trigger, 'injectedAt')),
+    }
   }
-  const nowMs = Date.parse((now ?? (() => new Date().toISOString()))()) || Date.now()
-  const recentTriggers = [...triggers.values()]
-    .sort((a, b) => String(b.at ?? '').localeCompare(String(a.at ?? '')))
-    .slice(0, 12)
-    .map(t => {
-      const tk = ticketByTriggerId.get(t.id)
-      const isSelfTest = feishuSelfTestMarker(t.source?.messageId) !== null
-      const direct = tk && !isSelfTest ? null : directReplyFor(t)
-      return {
-        id: t.id,
-        kind: t.kind ?? null,
-        at: t.at ?? null,
-        message: typeof t.message === 'string' ? (t.message.length > 160 ? t.message.slice(0, 160) + '…' : t.message) : null,
-        dropped: t.dropped ?? null,
-        ticketId: tk?.id ?? null,
-        ownerLabel: tk?.ownerLabel ?? null,
-        stage: tk?.stage ?? null,
-        stageText: tk?.stageText ?? null,
-        reply: tk?.id && !isSelfTest ? replyStateFor(tk.id) : (direct ? replyStateForRow(direct) : null),
-        unprocessed: !isSelfTest && !t.dropped && !tk?.id && !direct
-          && Number.isFinite(Date.parse(t.at ?? '')) && (nowMs - Date.parse(t.at)) > 5 * 60 * 1000,
-      }
-    })
-  // Self-test polling must survive bursts that push the probe out of recentTriggers.
-  const selfTests = [...triggers.values()]
-    .filter(t => t.kind === 'feishu' && feishuSelfTestMarker(t.source?.messageId) && nowMs - Date.parse(t.at) <= 120_000)
-    .map(t => {
-      const row = directReplyFor(t)
-      return { id: t.id, dropped: t.dropped ?? null, reply: row ? replyStateForRow(row) : null }
-    })
-  // A real message that never reached an owner gets its own health warning.
-  const unprocessedTriggers = [...triggers.values()].filter(t => {
-    if (t.dropped || feishuSelfTestMarker(t.source?.messageId)) return false
-    if (ticketByTriggerId.has(t.id)) return false
-    if (directReplyFor(t)) return false
-    const atMs = Date.parse(t.at ?? '')
-    if (!Number.isFinite(atMs)) return false
-    return nowMs - atMs > 5 * 60 * 1000
-  }).length
+  const projected = [...triggers.values()].map(projectTrigger)
+  const recentTriggers = [...projected].sort((a, b) => String(b.at ?? '').localeCompare(String(a.at ?? ''))).slice(0, 12)
+  const selfTests = projected
+    .filter(row => row.kind === 'feishu' && feishuSelfTestMarker(triggers.get(row.id)?.source?.messageId) && nowMs - Date.parse(row.at) <= 120_000)
+    .map(({ id, dropped, reply }) => ({ id, dropped, reply }))
+  const unprocessedTriggers = projected.filter(row => row.unprocessed).length
   return {
-    generatedAt: (now ?? (() => new Date().toISOString()))(),
+    generatedAt,
     owners,
     tickets,
     recentTriggers,

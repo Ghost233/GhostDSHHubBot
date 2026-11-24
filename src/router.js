@@ -54,8 +54,8 @@ export class Router {
    */
   #lastAutoReportAt = null
   #lastAutoReportText = null
-  /** #72 并发安全： per-owner promise chains — see the constructor note. */
-  #ownerChains = new Map()
+  // Owner queues protect execution slots. Trigger queues prevent duplicate tickets across owners.
+  #queues = new Map()
 
   constructor({ store, registry, sessions, tasks, runner, config, now, ids, onSystemProblem, placer }) {
     this.store = store
@@ -250,7 +250,7 @@ export class Router {
       const ensured = await this.#ensureSession(owner)
       const trigger = ticket.triggerId ? this.getTrigger(ticket.triggerId) : null
       const auth = ticket.authorization ?? { actor: 'user', source: 'dsh', at: ticket.createdAt }
-      const original = typeof trigger?.message === 'string' && trigger.message ? trigger.message : '（原始指令见会话历史）'
+      const original = ticket.routedMessage || trigger?.message || '（原始指令见会话历史）'
       const text = '[hub-bot 恢复 ' + ticket.id + '] 宿主重启，任务自动恢复（最旧优先）。原始任务：' + original
         + '\n\n授权：' + auth.actor + ' 经 ' + auth.source + ' 于 ' + auth.at + '；任务 ' + ticket.id
       this.runner.enqueue({
@@ -332,6 +332,15 @@ export class Router {
 
   async routeToOwner({ ownerId, message, triggerRef, ticketId, resolution, authorization }) {
     if (typeof message !== 'string' || !message.trim()) throw new RouterError('message-required', 'route_to_owner: message must be a non-empty string')
+    const route = () => this.#serialized('owner:' + ownerId, () =>
+      this.#routeToOwnerLocked({ ownerId, message: message.trim(), triggerRef, ticketId, resolution, authorization }))
+    return ticketId === undefined && triggerRef !== undefined
+      ? this.#serialized('trigger:' + triggerRef, route)
+      : route()
+  }
+
+  /** routeToOwner's body, run under the per-owner chain (see routeToOwner). */
+  async #routeToOwnerLocked({ ownerId, message, triggerRef, ticketId, resolution, authorization }) {
     const owner = this.registry.get(ownerId)
     if (!owner) throw new RouterError('unknown-owner', 'route_to_owner: unknown owner "' + ownerId + '" — call list_owners first')
     // chief 不是路由目标——但仅约束「新建任务」；带 ticketId 的 resolution 裁决（面板 confirm/reject）
@@ -340,27 +349,25 @@ export class Router {
     // #70: a recycled scratch owner's directory is gone (物理上无法恢复) — follow-ups to its finished task start
     // a NEW task instead (spec「已结束任务的跟进」例外); never route into a recycled row.
     if (owner.recycled) throw new RouterError('owner-recycled', 'route_to_owner: owner ' + ownerId + ' 已回收（临时目录已删）——请新建任务，不要复活旧负责人')
-    // #72 并发安全： every entry (L1 tool / devApi / 飞书 / GitHub) serializes per owner through the chain,
-    // so the slot ledger below can never be read mid-write by a same-owner sibling.
-    return this.#serialized(owner.id, () =>
-      this.#routeToOwnerLocked({ owner, message: message.trim(), triggerRef, ticketId, resolution, authorization }))
-  }
-
-  /** routeToOwner's body, run under the per-owner chain (see routeToOwner). */
-  async #routeToOwnerLocked({ owner, message, triggerRef, ticketId, resolution, authorization }) {
-    const ownerId = owner.id
     if (ticketId !== undefined) return this.#followUp({ owner, message, ticketId, resolution, authorization })
     if (resolution !== undefined) throw new RouterError('resolution-needs-ticket', 'route_to_owner: resolution requires ticketId')
-    if (triggerRef !== undefined) {
-      const existing = this.getTrigger(triggerRef)
-      if (existing) {
-        const ticket = this.#ticketByTrigger(triggerRef)
-        return { ownerId, sessionId: owner.sessionId, ticketId: ticket?.id ?? null, requestId: ticket?.requestId ?? null, createdSession: false, rebuilt: false, deduped: true, stage: ticket ? normalizeStage(ticket.stage) : null }
+    const existing = triggerRef === undefined ? undefined : this.getTrigger(triggerRef)
+    if (existing) {
+      const ticket = this.#ticketByTrigger(triggerRef)
+      if (ticket || existing.kind !== 'feishu') {
+        return {
+          ownerId: ticket?.owner ?? ownerId, sessionId: ticket?.targetSession ?? owner.sessionId,
+          ticketId: ticket?.id ?? null, requestId: ticket?.requestId ?? null,
+          createdSession: false, rebuilt: false, deduped: true, stage: ticket ? normalizeStage(ticket.stage) : null,
+        }
+      }
+      if (existing.dropped || !existing.authorization || String(existing.source?.messageId ?? '').startsWith('om_selftest-')) {
+        throw new RouterError('invalid-route-trigger', 'route_to_owner: the Feishu message is not eligible for dispatch')
       }
     }
     const at = this.now()
-    const auth = authorization ?? { actor: 'user', source: 'dsh', at }
-    const trigger = this.#insertTrigger({ id: triggerRef ?? 'trg-' + this.ids.uuid(), kind: 'route', ownerId, message, authorization: auth, at })
+    const auth = existing?.authorization ?? authorization ?? { actor: 'user', source: 'dsh', at }
+    const trigger = existing ?? this.#insertTrigger({ id: triggerRef ?? 'trg-' + this.ids.uuid(), kind: 'route', ownerId, message, authorization: auth, at })
     const ensured = await this.#ensureSession(owner)
     const requestId = 'hub-bot-route-' + this.ids.uuid()
     const freshTicketId = 'tsk-' + this.ids.uuid()
@@ -374,6 +381,7 @@ export class Router {
     this.#insertTicket({
       id: freshTicketId, triggerId: trigger.id, owner: ownerId, stage: atCapacity ? 'queued' : 'idle', mechanism: 'inject',
       targetSession: ensured.sessionId, requestId, authorization: auth, createdAt: at, updatedAt: at,
+      ...(existing && { routedMessage: message }),
     })
     // 危险命令黑名单 (spec「Policy」安全兜底): 命中即挂起 — 票转 person/confirm, 原文落票面 action,
     // 不 enqueue 任何注入; 用户确认后由 #confirmDangerousInject 放行。GitHub/飞书/L1/devApi 皆汇于此, 同护。
@@ -388,11 +396,13 @@ export class Router {
     return { ownerId, sessionId: stored.targetSession, ticketId: freshTicketId, requestId, createdSession: ensured.created, rebuilt: stored.lastDelivery?.rebuilt ?? false, deduped: false, stage: stored.stage }
   }
 
-  /** #72: runs `fn` after every prior op on the same owner; a rejected op never breaks the chain. */
-  #serialized(ownerId, fn) {
-    const prev = this.#ownerChains.get(ownerId) ?? Promise.resolve()
-    const run = prev.catch(() => {}).then(fn)
-    this.#ownerChains.set(ownerId, run.catch(() => {}))
+  #serialized(key, fn) {
+    const run = (this.#queues.get(key) ?? Promise.resolve()).then(fn)
+    const settled = run.catch(() => {})
+    this.#queues.set(key, settled)
+    void settled.then(() => {
+      if (this.#queues.get(key) === settled) this.#queues.delete(key)
+    })
     return run
   }
 
@@ -421,7 +431,7 @@ export class Router {
     const ownerIds = [...new Set(this.store.db.prepare('SELECT value FROM ticket').all()
       .map(raw => JSON.parse(String(raw.value)).owner))]
     for (const ownerId of ownerIds) {
-      await this.#serialized(ownerId, () => {
+      await this.#serialized('owner:' + ownerId, () => {
         const mine = this.store.db.prepare('SELECT value FROM ticket').all()
           .map(raw => JSON.parse(String(raw.value)))
           .map(ticket => ({ ...ticket, stage: normalizeStage(ticket.stage) }))
@@ -689,14 +699,27 @@ export class Router {
   }
 
   /**
-   * Replies to the trigger's Source through the outbox (spec: reply_source 经 Outbox 回复）. The 100-word
-   * discipline is enforced BY CODE (spec「消息纪律」); the stored row is the durable intent and is marked
-   * sent once admitted — the Feishu channel task will swap in a real deliverer.
+   * Queue a durable reply. A Feishu trigger reference binds the destination and the receipt to one message.
    */
-  async replySource({ text, to }) {
+  async replySource({ text, to, triggerRef }) {
     if (typeof text !== 'string' || !text.trim()) throw new RouterError('text-required', 'reply_source: text must be a non-empty string')
+    let target = to ?? 'dsh'
+    if (triggerRef !== undefined) {
+      const trigger = typeof triggerRef === 'string' ? this.getTrigger(triggerRef) : null
+      const chatId = trigger?.source?.chatId
+      if (trigger?.kind !== 'feishu' || trigger.dropped || !chatId) {
+        throw new RouterError('invalid-reply-trigger', 'reply_source: use the triggerRef of the original Feishu message')
+      }
+      target = 'feishu:chat:' + chatId
+      if (to !== undefined && to !== target && to !== 'feishu:' + chatId) {
+        throw new RouterError('reply-target-mismatch', 'reply_source: the supplied address does not match the Feishu message')
+      }
+    }
     const { text: body, truncated } = truncateWords(text.trim())
-    const row = this.runner.enqueue({ ticketId: null, kind: 'reply', to: to ?? 'dsh', body, requestId: 'hub-bot-reply-' + this.ids.uuid() })
+    const row = this.runner.enqueue({
+      ticketId: null, kind: 'reply', to: target, body, requestId: 'hub-bot-reply-' + this.ids.uuid(),
+      ...(triggerRef !== undefined && { triggerId: triggerRef }),
+    })
     await this.runner.tick()
     return { outboxId: row.id, state: this.#outboxRow(row.id).state, truncated }
   }

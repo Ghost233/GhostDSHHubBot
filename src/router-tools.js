@@ -84,7 +84,7 @@ export function apply(ctx) {
       properties: {
         ownerId: { type: 'string', description: 'list_owners 返回的负责人 id' },
         message: { type: 'string', description: '要注入的消息原文（追问时即追问内容）' },
-        triggerRef: { type: 'string', description: '可选：来源消息 id（幂等键），同一来源重复注入不重复建任务' },
+        triggerRef: { type: 'string', description: '新建任务时传入原消息提供的 triggerRef（幂等键），同一来源只建一个任务' },
         ticketId: { type: 'string', description: '可选：追问/验收的目标任务票（query_tasks 取得）' },
         resolution: { type: 'string', enum: ['accept', 'cancel', 'confirm', 'reject'], description: '可选：accept = 用户验收通过（票须在等您验收）；cancel = 用户取消整个任务（票须在等您确认）；confirm = 用户确认票面提议（如 fork，票须在等您确认，确认后系统自动执行）；reject = 用户否定票面提议（票转被卡住、保持原会话）' },
       },
@@ -130,12 +130,13 @@ export function apply(ctx) {
 
   register(ctx, {
     name: 'reply_source',
-    description: '经 Outbox 记录给触发来源的答复（先存后做；超过 100 词由代码截断并提示；外部投递通道随后续工单接入）。',
+    description: '把答复写入 Outbox 后投递给原消息来源，超过 100 词时自动截断。回复飞书来信时使用该消息提供的 triggerRef。',
     parameters: {
       type: 'object',
       properties: {
         text: { type: 'string', description: '答复正文' },
-        to: { type: 'string', description: '可选：来源地址，缺省为当前 DSH 会话' },
+        to: { type: 'string', description: '可选：回复地址。传入飞书 triggerRef 时可省略，系统从原消息取得地址' },
+        triggerRef: { type: 'string', description: '回复飞书来信时传入该消息提供的 triggerRef，以记录这条回复的投递状态' },
       },
       required: ['text'],
       additionalProperties: false,
@@ -148,6 +149,6 @@ export function apply(ctx) {
       schema: { type: 'object', properties: { outboxId: { type: 'string' }, state: { type: 'string' }, truncated: { type: 'boolean' } }, required: ['outboxId', 'state'], additionalProperties: false },
       render: (_args, value) => [{ type: 'text', text: '已记录答复 ' + value.outboxId + '（' + value.state + (value.truncated === true ? '，正文超 100 词已截断' : '') + '）' }],
     },
-    execute: async args => await api.router.replySource({ text: args.text, to: args.to }),
+    execute: async args => await api.router.replySource({ text: args.text, to: args.to, triggerRef: args.triggerRef }),
   })
 }

@@ -293,10 +293,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       healthDetailRetry: '重试中',
       healthDetailDead: '投递失败（死信）',
       healthSysProblems: '系统问题 {n} 条（展开查看）',
-      healthUnprocessed: '{n} 条消息超过 5 分钟未处理（无票据也无回复）——检查负责人会话是否被归档',
+      healthUnprocessed: '{n} 条消息已超过 5 分钟，尚无工单或对应回复',
       healthUnprocessedJump: '去最近消息看看',
       unprocessedLabel: '未处理',
-      unprocessedHint: '这条消息进来超过 5 分钟，没有生成任务也没有回复——负责人会话可能被归档',
+      unprocessedHint: '收到这条消息已超过 5 分钟，仍没有关联的工单或回复。',
       healthDetailSys: '系统问题',
       healthOk: '当前没有投递告警',
       healthPillSys: '系统',
@@ -349,7 +349,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       durHour: '{n} 小时',
       durDay: '{n} 天',
       originHint: '这条任务的来源渠道',
-      replyRecorded: '已注入会话',
+      replyInjected: '已交给总负责人',
+      replyUnlinked: '回复未关联',
+      replyUnlinkedHint: '这个飞书会话有回复记录。缺少原消息编号，无法确认它对应哪条消息。',
       replyPending: '投递中',
       replyFailed: '回复投递失败',
       artifactsLabel: '产物目录（负责人工作区）',
@@ -567,10 +569,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       healthDetailRetry: 'retrying',
       healthDetailDead: 'failed deliveries (dead letters)',
       healthSysProblems: '{n} system problem(s) (expand to view)',
-      healthUnprocessed: '{n} message(s) unprocessed for over 5 minutes (no ticket, no reply) — check whether owner sessions are archived',
+      healthUnprocessed: '{n} message(s) over 5 minutes old are still awaiting a ticket or a linked reply',
       healthUnprocessedJump: 'view recent messages',
       unprocessedLabel: 'unprocessed',
-      unprocessedHint: 'Arrived over 5 minutes ago with no ticket and no reply — the owner session may be archived',
+      unprocessedHint: 'This message arrived over 5 minutes ago and has no linked ticket or reply.',
       healthDetailSys: 'System problems',
       healthOk: 'No delivery alerts',
       healthPillSys: 'system',
@@ -623,7 +625,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       durHour: '{n}h',
       durDay: '{n}d',
       originHint: 'Origin channel of this task',
-      replyRecorded: 'injected',
+      replyInjected: 'Sent to chief',
+      replyUnlinked: 'Unlinked reply',
+      replyUnlinkedHint: 'A reply exists in this chat, but its record has no link to the original message.',
       replyPending: 'delivering',
       replyFailed: 'reply delivery failed',
       artifactsLabel: 'Artifacts (owner workspace)',
@@ -2169,28 +2173,22 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                         style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.88 },
                         title: tr.message || '',
                       }, tr.message || '—'),
-                      // 回复投递闭环指示： 已回复(绿) / 已注入(灰) / 投递中(琥珀) / 投递失败(红+行内重投)
-                      tr.reply && tr.reply.state === 'sent'
-                        ? h('span', {
-                            style: { flexShrink: 0, display: 'inline-flex', alignItems: 'center', fontSize: '11px', color: copiedId === 'rpl:' + tr.reply.id ? TONES.green.fg : TONES.green.fg, cursor: tr.reply.text ? 'pointer' : 'default' },
-                            title: tr.reply.text ? String(tr.reply.text) + '\n' + t('replyCopyHint') : '',
-                            onClick: tr.reply.text ? function (ev) { ev.stopPropagation(); copyText(String(tr.reply.text), 'rpl:' + tr.reply.id); } : undefined,
-                          }, dot('#46bb6d'), copiedId === 'rpl:' + tr.reply.id ? t('copiedBtn') : t('replySent'))
-                        : null,
-                      tr.reply && tr.reply.state === 'recorded'
-                        ? h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.5 }, title: tr.reply.text || '' }, t('replyRecorded'))
-                        : null,
-                      tr.reply && (tr.reply.state === 'queued' || tr.reply.state === 'held')
-                        ? h('span', { style: { flexShrink: 0, fontSize: '11px', color: TONES.amber.fg } }, t('replyPending'))
-                        : null,
-                      tr.reply && tr.reply.state === 'failed'
-                        ? h('span', { style: { flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: '6px' } },
-                            h('span', { style: { fontSize: '11px', color: TONES.red.fg }, title: tr.reply.lastError || '' }, t('replyFailed')),
-                            h('button', {
-                              onClick: function (ev) { ev.stopPropagation(); retryOutbox(tr.reply.id); },
-                              style: { fontSize: '11px', padding: '1px 8px', borderRadius: '6px', cursor: 'pointer', background: 'rgba(230,160,40,0.13)', border: '1px solid ' + TONES.amber.border, color: TONES.amber.fg },
-                            }, t('retryOne')))
-                        : null,
+                      tr.reply?.state === 'sent' ? h('button', {
+                        type: 'button', className: 'hb-text-action',
+                        style: { flexShrink: 0, fontSize: '11px', color: TONES.green.fg },
+                        title: tr.reply.text ? tr.reply.text + '\n' + t('replyCopyHint') : '',
+                        onClick: function (ev) { ev.stopPropagation(); copyText(tr.reply.text, 'rpl:' + tr.reply.id); },
+                      }, copiedId === 'rpl:' + tr.reply.id ? t('copiedBtn') : t('replySent'))
+                      : tr.reply?.state === 'failed' ? h('span', { style: { flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: '6px' } },
+                          h('span', { style: { fontSize: '11px', color: TONES.red.fg }, title: tr.reply.lastError || '' }, t('replyFailed')),
+                          h('button', {
+                            type: 'button', onClick: function (ev) { ev.stopPropagation(); retryOutbox(tr.reply.id); },
+                            style: { fontSize: '11px', padding: '1px 8px', borderRadius: '6px', cursor: 'pointer', background: 'rgba(230,160,40,0.13)', border: '1px solid ' + TONES.amber.border, color: TONES.amber.fg },
+                          }, t('retryOne')))
+                      : tr.reply ? h('span', { style: { flexShrink: 0, fontSize: '11px', color: TONES.amber.fg }, title: tr.reply.lastError || tr.reply.text }, t('replyPending'))
+                      : tr.replyUnlinked ? h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.7 }, title: t('replyUnlinkedHint') }, t('replyUnlinked'))
+                      : tr.injectedAt && !tr.ticketId ? h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.7 }, title: tr.injectedAt }, t('replyInjected'))
+                      : null,
                       tr.unprocessed
                         ? h('span', { style: { flexShrink: 0, fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: TONES.red.bg, color: TONES.red.fg, border: '1px solid ' + TONES.red.border }, title: t('unprocessedHint') }, t('unprocessedLabel'))
                         : tr.dropped
