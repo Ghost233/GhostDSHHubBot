@@ -331,7 +331,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       expandAll: '全部展开',
       collapseAll: '全部收起',
       expandAllHint: '展开或收起任务流的全部阶段分组',
-      ownerClickHint: '点击在任务流中只看这个负责人',
+
       runningLabel: '已运行',
       runningHint: '进入执行阶段的时长（按最近一次状态变化起算）',
       showMoreInGroup: '展开剩余 {count} 条',
@@ -370,6 +370,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       healthPillRetrying: '重试中',
       healthPillDead: '死信',
       filterAllOwners: '全部负责人',
+      filterOwnerLabel: '按负责人筛选',
+      filterStageLabel: '按阶段筛选',
+      openTicketLabel: '打开工单 {n}',
+      openOwnerTasks: '查看「{n}」的任务',
       copyIdBtn: '复制',
       copiedBtn: '已复制',
       copyIdHint: '复制工单号',
@@ -601,7 +605,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       expandAll: 'Expand all',
       collapseAll: 'Collapse all',
       expandAllHint: 'Expand or collapse every stage group in the stream',
-      ownerClickHint: 'Click to filter the stream to this owner',
+
       runningLabel: 'running',
       runningHint: 'Time since entering the working stage (from the last status change)',
       showMoreInGroup: 'Show {count} more',
@@ -640,6 +644,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       healthPillRetrying: 'retrying',
       healthPillDead: 'dead',
       filterAllOwners: 'All owners',
+      filterOwnerLabel: 'Filter by owner',
+      filterStageLabel: 'Filter by stage',
+      openTicketLabel: 'Open ticket {n}',
+      openOwnerTasks: 'Show tasks for {n}',
       copyIdBtn: 'Copy',
       copiedBtn: 'Copied',
       copyIdHint: 'Copy ticket id',
@@ -1239,6 +1247,21 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var fts = React.useState(''); var filterText = fts[0]; var setFilterText = fts[1];
           var fss = React.useState(''); var filterStage = fss[0]; var setFilterStage = fss[1];
           var fos = React.useState(''); var filterOwner = fos[0]; var setFilterOwner = fos[1];
+          var [streamTarget, setStreamTarget] = React.useState(null);
+          var [openGroups, setOpenGroups] = React.useState({});
+          var streamHeading = React.useRef(null);
+          var targetCard = React.useRef(null);
+          React.useLayoutEffect(function () {
+            if (!streamTarget) return;
+            var card = targetCard.current;
+            var target = card || streamHeading.current;
+            if (!target) return;
+            var details = card?.querySelector('[data-hb-ticket-details]');
+            if (details) details.open = true;
+            target.focus({ preventScroll: true });
+            var reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+            target.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'start' });
+          }, [streamTarget]);
           var rks = React.useState(''); var recentKind = rks[0]; var setRecentKind = rks[1];
           var cps = React.useState(''); var copiedId = cps[0]; var setCopiedId = cps[1];
           var rds = React.useState(false); var recentDroppedOnly = rds[0]; var setRecentDroppedOnly = rds[1];
@@ -1404,7 +1427,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var bbs = React.useState(false); var batchBusy = bbs[0]; var setBatchBusy = bbs[1];
           var hvs = React.useState(null); var hoverTicket = hvs[0]; var setHoverTicket = hvs[1];
           var eds = React.useState({}); var expandedDone = eds[0]; var setExpandedDone = eds[1];
-          var aos = React.useState(false); var allOpen = aos[0]; var setAllOpen = aos[1];
+
           var egs = React.useState({}); var expandedGroups = egs[0]; var setExpandedGroups = egs[1];
           var resolve = function (tk, resolution) {
             var label = resolution === 'confirm' ? t('confirmBtn') : resolution === 'accept' ? t('acceptBtn') : resolution === 'retry' ? t('retryTicketBtn') : resolution === 'cancel' ? t('cancelTicketBtn') : t('rejectBtn');
@@ -1506,19 +1529,37 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var needsCardSub = needs.length === 0 ? t('quiet') : needsStages.map(function (s) { return s.label + ' ' + s.count; }).join(' · ');
           var selectedCount = confirmable.filter(function (tk) { return selected[tk.id]; }).length;
           var allSelected = confirmable.length > 0 && selectedCount === confirmable.length;
-          // 任务流过滤器（round 7）: 文本（消息/负责人/工单号）+ 阶段。只作用于任务流区，
-          // 「需要我处理」永远完整呈现——裁决入口不能被过滤器藏起来。
-          var filtered = tickets.filter(function (tk) {
-            if (filterStage && tk.stage !== filterStage) return false;
-            if (filterOwner && (tk.ownerLabel || tk.owner) !== filterOwner) return false;
-            if (!filterText) return true;
-            var q = filterText.toLowerCase();
-            return (tk.message || '').toLowerCase().indexOf(q) >= 0
-              || (tk.ownerLabel || tk.owner || '').toLowerCase().indexOf(q) >= 0
-              || (tk.id || '').toLowerCase().indexOf(q) >= 0;
+          var focusedTicketId = streamTarget?.ticketId;
+          var filterActive = Boolean(focusedTicketId || filterText.trim() || filterStage || filterOwner);
+          var ticketById = new Map(tickets.map(ticket => [ticket.id, ticket]));
+          var ownerNames = new Map(owners.map(owner => [owner.id, owner.dshWorkspace?.title || owner.workspace || owner.id]));
+          tickets.forEach(function (ticket) {
+            if (ticket.owner && !ownerNames.has(ticket.owner)) ownerNames.set(ticket.owner, ticket.ownerLabel || ticket.owner);
           });
-          var presentStages = STAGE_ORDER.filter(function (st) { return tickets.some(function (tk) { return tk.stage === st; }); });
-          var presentOwners = [...new Set(tickets.map(function (tk) { return tk.ownerLabel || tk.owner; }).filter(Boolean))].sort();
+          if (filterOwner && !ownerNames.has(filterOwner)) ownerNames.set(filterOwner, filterOwner);
+          var ownerNameCounts = new Map();
+          for (var name of ownerNames.values()) ownerNameCounts.set(name, (ownerNameCounts.get(name) || 0) + 1);
+          function ownerFilterLabel(id) {
+            var name = ownerNames.get(id) || id;
+            return ownerNameCounts.get(name) > 1 ? name + ' · ' + id : name;
+          }
+          var presentOwners = [...ownerNames.keys()].sort((a, b) => ownerFilterLabel(a).localeCompare(ownerFilterLabel(b)));
+          var query = filterText.trim().toLowerCase();
+          var filtered = tickets.filter(function (tk) {
+            if (focusedTicketId) return tk.id === focusedTicketId;
+            if (filterStage && tk.stage !== filterStage) return false;
+            if (filterOwner && tk.owner !== filterOwner) return false;
+            return !query || [tk.message, tk.ownerLabel, ownerNames.get(tk.owner), tk.owner, tk.id].some(text => text?.toLowerCase().includes(query));
+          });
+          var presentStages = STAGE_ORDER.filter(st => tickets.some(ticket => ticket.stage === st));
+          var visibleStages = presentStages.filter(st => filtered.some(ticket => ticket.stage === st));
+          function groupIsOpen(stage) {
+            return openGroups[stage] ?? (NEEDS_ME.includes(stage) || filterActive);
+          }
+          var allGroupsOpen = visibleStages.length > 0 && visibleStages.every(groupIsOpen);
+          function toggleGroups() {
+            setOpenGroups(Object.fromEntries(visibleStages.map(stage => [stage, !allGroupsOpen])));
+          }
           var healthItems = healthProblems(overview.health || {}, t);
           if ((overview.unprocessedTriggers || 0) > 0) healthItems.push(fill(t('healthUnprocessed'), overview.unprocessedTriggers) + ' — ' + t('healthUnprocessedJump'));
           var recent = overview.recentTriggers || [];
@@ -1530,12 +1571,32 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           });
           var recentFilterActive = recentKind !== '' || recentDroppedOnly || recentUnprocOnly;
           var kindLabel = function (k) { return k === 'feishu' ? t('kindFeishu') : k === 'github' ? t('kindGitHub') : t('kindRoute'); };
-          // 消息 → 票据定位（round 8）: 点一条最近消息 = 按工单号过滤任务流并滚过去。
-          var locateTicket = function (ticketId) {
-            setFilterText(ticketId); setFilterStage('');
-            var el = document.getElementById('hub-bot-stream');
-            if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-          };
+          function resetStreamTarget() {
+            setStreamTarget(null);
+            setOpenGroups({});
+          }
+          function clearStreamFilters() {
+            setFilterText('');
+            setFilterStage('');
+            setFilterOwner('');
+            resetStreamTarget();
+          }
+          function openStream({ ticketId = null, ownerId = '', stage = '' }) {
+            setFilterText('');
+            setFilterStage(stage);
+            setFilterOwner(ownerId);
+            setOpenGroups({});
+            setStreamTarget({ ticketId: ticketId });
+          }
+          function ownerFilterButton(ownerId, displayName, style) {
+            if (!ownerId) return null;
+            return h('button', {
+              type: 'button', className: 'hb-text-action', style: style,
+              title: fill(t('openOwnerTasks'), ownerFilterLabel(ownerId)),
+              'aria-label': fill(t('openOwnerTasks'), ownerFilterLabel(ownerId)),
+              onClick: function (event) { event.stopPropagation(); openStream({ ownerId: ownerId }); },
+            }, displayName || ownerNames.get(ownerId) || ownerId);
+          }
           // 通用复制（round 37）：报告全文/负责人路径/票据 id 共用一套翻转反馈，key 区分来源。
           var copyText = function (text, key) {
             var done = function () { setCopiedId(key); setTimeout(function () { setCopiedId(''); }, 1200); };
@@ -1556,7 +1617,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               document.body.removeChild(ta);
             } catch (e) { /* 剪贴板不可达就算了 */ }
           };
-          var filterActive = !!filterText || !!filterStage || !!filterOwner;
+
           var scrollToSection = function (id) {
             var el = document.getElementById(id);
             if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1565,14 +1626,14 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             return targetId ? { cursor: 'pointer' } : {};
           };
 
-          var ticketRowItem = function (tk, withActions) {
+          var ticketRowItem = function (tk, withActions, isTarget) {
             var rows = [];
             rows.push(h('div', { key: 'head', style: { display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0 } },
               stagePill(tk.stage, tk.stageText || tk.stage),
               tk.trigger && tk.trigger.kind
                 ? h('span', { style: { flexShrink: 0, fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: tk.trigger.kind === 'feishu' ? 'rgba(70,150,255,0.14)' : 'rgba(150,150,150,0.14)', color: tk.trigger.kind === 'feishu' ? '#7db8ff' : 'rgba(200,200,200,0.8)', border: '1px solid ' + (tk.trigger.kind === 'feishu' ? 'rgba(70,150,255,0.3)' : 'rgba(150,150,150,0.25)') }, title: t('originHint') }, kindLabel(tk.trigger.kind))
                 : null,
-              h('span', { style: { fontWeight: 600, whiteSpace: 'nowrap', cursor: 'pointer' }, title: t('ownerClickHint'), onClick: function (ev) { ev.stopPropagation(); setFilterOwner(tk.ownerLabel || tk.owner); scrollToSection('hub-bot-stream'); } }, tk.ownerLabel || tk.owner),
+              ownerFilterButton(tk.owner, tk.ownerLabel, { fontWeight: 600, maxWidth: '32%' }),
               h('span', {
                 style: { flex: 1, opacity: 0.85, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: tk.message ? 'pointer' : 'default' },
                 title: tk.message ? String(tk.message) + '\n' + t('copyMsgHint') : '',
@@ -1720,7 +1781,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             if (tk.report && tk.report.at) evs.push({ at: tk.report.at, tone: 'blue', label: t('tlReport'), detail: tk.report.summary || '' });
             evs.push({ at: tk.updatedAt || tk.createdAt, tone: STAGE_TONE[tk.stage] || 'gray', label: tk.stageText || tk.stage, detail: null, current: true });
             evs.sort(function (a, b) { return String(a.at || '').localeCompare(String(b.at || '')); });
-            rows.push(h('details', { key: 'd', style: { marginTop: '6px', fontSize: '12px', opacity: 0.85 } },
+            rows.push(h('details', { key: 'd', 'data-hb-ticket-details': '', style: { marginTop: '6px', fontSize: '12px', opacity: 0.85 } },
               h('summary', { style: { cursor: 'pointer' } }, t('detailToggle')),
               h('div', { style: { marginTop: '6px', paddingLeft: '4px', display: 'flex', flexDirection: 'column' } },
                 evs.map(function (ev, i) {
@@ -1775,6 +1836,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             var isHover = hoverTicket === tk.id;
             return h('div', {
               key: tk.id,
+              ref: isTarget ? targetCard : undefined,
+              tabIndex: isTarget ? -1 : undefined,
+              className: isTarget ? 'hb-stream-target' : undefined,
+              'data-hb-ticket': tk.id,
+              'aria-label': isTarget ? (tk.message || tk.id) : undefined,
               onMouseEnter: function () { setHoverTicket(tk.id); },
               onMouseLeave: function () { setHoverTicket(null); },
               style: {
@@ -1811,7 +1877,17 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
 
           return h('div', { style: { padding: '20px 24px', overflowY: 'auto', height: '100%', boxSizing: 'border-box' } },
             h('h2', { style: { fontSize: '17px', fontWeight: 600, margin: '0 0 18px' } }, t('title')),
-            h('style', null, '.hb-recent-list{border:1px solid rgba(255,255,255,0.08);border-radius:10px;overflow:hidden}.hb-recent-row{transition:background 120ms ease}.hb-recent-row+.hb-recent-row{border-top:1px solid rgba(255,255,255,0.05)}.hb-recent-row:hover{background:rgba(255,255,255,0.045)}'),
+            h('style', null, [
+              '.hb-recent-list{border:1px solid var(--dsh-border,rgba(127,127,127,.18));border-radius:10px;overflow:hidden}',
+              '.hb-recent-row{transition:background 120ms ease}',
+              '.hb-recent-row+.hb-recent-row{border-top:1px solid var(--dsh-border,rgba(127,127,127,.15))}',
+              '.hb-recent-row:hover{background:rgba(127,127,127,.06)}',
+              '.hb-text-action{background:none;border:0;color:inherit;font:inherit;padding:0;min-width:0;cursor:pointer;text-align:start;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+              '.hb-text-action:hover{text-decoration:underline}',
+              '.hb-text-action:focus-visible,.hb-stage-action:focus-visible{outline:2px solid var(--dsh-accent,currentColor);outline-offset:2px}',
+              '.hb-stream-target{scroll-margin-block-start:12px}',
+              '.hb-stream-target:focus{outline:2px solid var(--dsh-accent,currentColor);outline-offset:2px}',
+            ].join('')),
             h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '14px' } },
               h('span', { style: { fontSize: '16px', fontWeight: 700 } }, 'Hub Bot'),
               view && view.version ? h('span', { style: { fontSize: '11px', fontFamily: 'monospace', padding: '1px 8px', borderRadius: '999px', background: 'rgba(127,127,127,0.1)', border: '1px solid rgba(127,127,127,0.2)', opacity: 0.75 } }, 'v' + view.version) : null,
@@ -1943,79 +2019,82 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                        }),
                        h('div', { style: { flex: 1, minWidth: 0 } }, card));
                    })),
-            h('div', { style: sectionStyle, id: 'hub-bot-stream' },
-              h('div', { style: sectionTitleStyle }, t('ticketsSection'),
-                tickets.length > 0 ? h('span', { style: { marginLeft: '8px', fontSize: '12px', fontWeight: 400, opacity: 0.55 } }, '· ' + filtered.length + (filtered.length !== tickets.length ? ' / ' + tickets.length : '')) : null),
-              tickets.length === 0
-                ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 0' } }, t('emptyTickets'))
-                : h('div', { style: { display: 'flex', gap: '8px', marginBottom: '10px', flexWrap: 'wrap' } },
+            h('section', { style: sectionStyle, id: 'hub-bot-stream', 'aria-labelledby': 'hub-bot-stream-title' },
+              h('h3', { id: 'hub-bot-stream-title', className: 'hb-stream-target', ref: streamHeading, tabIndex: -1,
+                style: Object.assign({}, sectionTitleStyle, { marginTop: 0 }),
+              }, t('ticketsSection'), tickets.length > 0 ? h('span', { style: { marginLeft: '8px', fontSize: '12px', fontWeight: 400, opacity: 0.55 } },
+                '· ' + filtered.length + (filtered.length !== tickets.length ? ' / ' + tickets.length : '')) : null),
+              tickets.length > 0 || filterActive
+                ? h('div', { style: { display: 'flex', gap: '8px', marginBottom: '10px', flexWrap: 'wrap' } },
                     h('input', {
                       style: Object.assign({}, inputStyle, { flex: '1 1 200px', width: 'auto', padding: '4px 10px', fontSize: '12px' }),
-                      value: filterText, placeholder: t('filterPlaceholder'),
-                      onChange: function (ev) { setFilterText(ev.target.value); },
-                      onKeyDown: function (ev) { if (ev.key === 'Escape') { setFilterText(''); setFilterStage(''); setFilterOwner(''); } },
+                      value: focusedTicketId || filterText, placeholder: t('filterPlaceholder'), 'aria-label': t('filterPlaceholder'),
+                      onChange: function (ev) { setFilterText(ev.target.value); resetStreamTarget(); },
+                      onKeyDown: function (ev) { if (ev.key === 'Escape') clearStreamFilters(); },
                     }),
                     h('select', {
                       style: Object.assign({}, inputStyle, { width: 'auto', padding: '4px 10px', fontSize: '12px' }),
-                      value: filterStage, onChange: function (ev) { setFilterStage(ev.target.value); },
-                    }, [h('option', { key: '', value: '' }, t('filterAllStages'))].concat(
-                      presentStages.map(function (st) {
-                        var sample = tickets.find(function (tk) { return tk.stage === st; });
-                        return h('option', { key: st, value: st }, (sample && sample.stageText) || st);
-                      }))),
-                    presentOwners.length > 1
+                      value: filterStage, 'aria-label': t('filterStageLabel'),
+                      onChange: function (ev) { setFilterStage(ev.target.value); resetStreamTarget(); },
+                    }, h('option', { value: '' }, t('filterAllStages')), presentStages.map(function (stage) {
+                      var sample = tickets.find(ticket => ticket.stage === stage);
+                      return h('option', { key: stage, value: stage }, sample.stageText || stage);
+                    })),
+                    presentOwners.length > 1 || filterOwner
                       ? h('select', {
                           style: Object.assign({}, inputStyle, { width: 'auto', padding: '4px 10px', fontSize: '12px' }),
-                          value: filterOwner, onChange: function (ev) { setFilterOwner(ev.target.value); },
-                        }, [h('option', { key: '', value: '' }, t('filterAllOwners'))].concat(
-                          presentOwners.map(function (label) { return h('option', { key: label, value: label }, label); })))
+                          value: filterOwner, 'aria-label': t('filterOwnerLabel'),
+                          onChange: function (ev) { setFilterOwner(ev.target.value); resetStreamTarget(); },
+                        }, h('option', { value: '' }, t('filterAllOwners')), presentOwners.map(function (id) {
+                          return h('option', { key: id, value: id }, ownerFilterLabel(id));
+                        }))
                       : null,
                     filterActive
                       ? h('button', {
-                          onClick: function () { setFilterText(''); setFilterStage(''); setFilterOwner(''); },
-                          title: t('clearFiltersHint'),
+                          type: 'button', onClick: clearStreamFilters, title: t('clearFiltersHint'),
                           style: { fontSize: '11px', padding: '3px 10px', borderRadius: '999px', cursor: 'pointer', background: 'rgba(127,127,127,0.08)', border: '1px solid rgba(127,127,127,0.25)', opacity: 0.75, whiteSpace: 'nowrap' },
                         }, '× ' + t('clearFilters'))
                       : null,
-                    h('button', {
-                      onClick: function () {
-                        var next = !allOpen; setAllOpen(next);
-                        var sec = document.getElementById('hub-bot-stream');
-                        if (sec) [...sec.querySelectorAll('details')].forEach(function (d) { d.open = next; });
-                      },
-                      title: t('expandAllHint'),
+                    visibleStages.length > 0 ? h('button', {
+                      type: 'button', onClick: toggleGroups, title: t('expandAllHint'),
                       style: { marginLeft: 'auto', fontSize: '11px', padding: '3px 10px', borderRadius: '999px', cursor: 'pointer', background: 'rgba(127,127,127,0.08)', border: '1px solid rgba(127,127,127,0.25)', opacity: 0.75, whiteSpace: 'nowrap' },
-                    }, allOpen ? '▴ ' + t('collapseAll') : '▾ ' + t('expandAll'))),
-              filtered.length === 0 && tickets.length > 0
-                ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 10px' } }, t('filterNoMatch'))
-                : STAGE_ORDER.map(function (stage) {
-                    var list = filtered.filter(function (tk) { return tk.stage === stage; });
-                    if (!list.length) return null;
-                    var isPerson = NEEDS_ME.indexOf(stage) >= 0;
-                    return h('details', { key: stage, open: isPerson || filterActive, style: { marginBottom: '6px' } },
+                    }, allGroupsOpen ? '▴ ' + t('collapseAll') : '▾ ' + t('expandAll')) : null)
+                : null,
+              filtered.length === 0
+                ? h('p', { style: { fontSize: '13px', opacity: 0.6, margin: '4px 0 10px' } }, t(filterActive ? 'filterNoMatch' : 'emptyTickets'))
+                : visibleStages.map(function (stage) {
+                    var list = filtered.filter(ticket => ticket.stage === stage);
+                    var open = groupIsOpen(stage);
+                    var shown = filterActive || expandedGroups[stage] ? list : list.slice(0, 12);
+                    var rows = shown.map(function (tk) {
+                      var isTarget = tk.id === focusedTicketId;
+                      if (tk.stage !== 'done' || expandedDone[tk.id] || isTarget) return ticketRowItem(tk, false, isTarget);
+                      return h('div', { key: tk.id, className: 'hb-recent-row', 'data-hb-ticket': tk.id,
+                        onClick: function () { setExpandedDone(current => ({ ...current, [tk.id]: true })); },
+                        title: t('doneExpandHint'),
+                        style: { display: 'flex', alignItems: 'baseline', gap: '8px', padding: '4px 8px', borderRadius: '6px', fontSize: '12px', opacity: 0.75, cursor: 'pointer' },
+                      },
+                        h('span', { style: { flexShrink: 0, color: TONES.green.fg, fontSize: '11px' } }, '✓'),
+                        ownerFilterButton(tk.owner, tk.ownerLabel, { flexShrink: 0, maxWidth: '32%', fontSize: '11px', opacity: 0.7 }),
+                        h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: tk.message || '' }, tk.message || '—'),
+                        h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.5 } }, relTime(t, tk.updatedAt || tk.createdAt)));
+                    });
+                    if (list.length > shown.length) {
+                      rows.push(h('button', {
+                        key: 'more-' + stage, type: 'button',
+                        onClick: function () { setExpandedGroups(current => ({ ...current, [stage]: true })); },
+                        style: { display: 'block', width: '100%', textAlign: 'center', fontSize: '12px', padding: '6px 0', marginTop: '2px', borderRadius: '6px', cursor: 'pointer', background: 'rgba(127,127,127,0.07)', border: '1px dashed rgba(127,127,127,0.3)', opacity: 0.8 },
+                      }, fill(t('showMoreInGroup'), list.length - shown.length)));
+                    }
+                    return h('details', { key: stage, open: open, 'data-hb-stage': stage, style: { marginBottom: '6px' },
+                      onToggle: function (ev) {
+                        var nextOpen = ev.currentTarget.open;
+                        if (nextOpen !== open) setOpenGroups(current => ({ ...current, [stage]: nextOpen }));
+                      },
+                    },
                       h('summary', { style: { cursor: 'pointer', padding: '4px 0', display: 'flex', alignItems: 'center', gap: '8px' } },
                         stagePill(stage, (list[0].stageText || stage) + ' · ' + list.length)),
-                      h('div', { style: { marginTop: '8px' } }, (function () { var shown = filterActive || expandedGroups[stage] ? list : list.slice(0, 12); var rows = shown.map(function (tk) {
-                        if (tk.stage === 'done' && !expandedDone[tk.id]) {
-                          return h('div', { key: tk.id, className: 'hb-recent-row',
-                            onClick: function () { var next = {}; for (var k in expandedDone) next[k] = expandedDone[k]; next[tk.id] = true; setExpandedDone(next); },
-                            title: t('doneExpandHint'),
-                            style: { display: 'flex', alignItems: 'baseline', gap: '8px', padding: '4px 8px', borderRadius: '6px', fontSize: '12px', opacity: 0.75, cursor: 'pointer' } },
-                            h('span', { style: { flexShrink: 0, color: TONES.green.fg, fontSize: '11px' } }, '✓'),
-                            tk.ownerLabel ? h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.6, cursor: 'pointer' }, title: t('ownerClickHint'), onClick: function (ev) { ev.stopPropagation(); setFilterOwner(tk.ownerLabel); scrollToSection('hub-bot-stream'); } }, tk.ownerLabel) : null,
-                            h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: tk.message || '' }, tk.message || '—'),
-                            h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.5 } }, relTime(t, tk.updatedAt || tk.createdAt)));
-                        }
-                        return ticketRowItem(tk, false);
-                      });
-                      if (list.length > shown.length) {
-                        rows.push(h('button', {
-                          key: 'more-' + stage,
-                          onClick: function () { var next = {}; for (var k in expandedGroups) next[k] = expandedGroups[k]; next[stage] = true; setExpandedGroups(next); },
-                          style: { display: 'block', width: '100%', textAlign: 'center', fontSize: '12px', padding: '6px 0', marginTop: '2px', borderRadius: '6px', cursor: 'pointer', background: 'rgba(127,127,127,0.07)', border: '1px dashed rgba(127,127,127,0.3)', opacity: 0.8 },
-                        }, fill(t('showMoreInGroup'), list.length - shown.length)));
-                      }
-                      return rows; })()));
+                      h('div', { style: { marginTop: '8px' } }, rows));
                   })),
             h('div', { style: sectionStyle, id: 'hub-bot-recent' },
               h('div', { style: Object.assign({}, sectionTitleStyle, { display: 'flex', alignItems: 'center', gap: '8px' }) },
@@ -2072,7 +2151,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                   : h('div', { className: 'hb-recent-list' },
                     recentFiltered.map(function (tr) {
                     return h('div', { key: tr.id, className: 'hb-recent-row',
-                      onClick: tr.ticketId ? function () { locateTicket(tr.ticketId); } : undefined,
+                      onClick: tr.ticketId ? function () { openStream({ ticketId: tr.ticketId }); } : undefined,
                       title: tr.ticketId ? t('recentLocateHint') : undefined,
                       style: {
                       display: 'flex', alignItems: 'baseline', gap: '8px', padding: '5px 10px',
@@ -2081,7 +2160,15 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     } },
                       h('span', { style: { flexShrink: 0, fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: tr.kind === 'feishu' ? 'rgba(70,150,255,0.14)' : 'rgba(150,150,150,0.14)', color: tr.kind === 'feishu' ? '#7db8ff' : 'rgba(200,200,200,0.8)', border: '1px solid ' + (tr.kind === 'feishu' ? 'rgba(70,150,255,0.3)' : 'rgba(150,150,150,0.25)') } }, kindLabel(tr.kind)),
                       h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.5, minWidth: '56px' } }, tr.at ? relTime(t, tr.at) : '—'),
-                      h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.88 }, title: tr.message || '' }, tr.message || '—'),
+                      tr.ticketId ? h('button', {
+                        type: 'button', className: 'hb-text-action', style: { flex: 1 },
+                        title: tr.message || t('recentLocateHint'),
+                        'aria-label': fill(t('openTicketLabel'), tr.ticketId) + (tr.message ? ' · ' + tr.message : ''),
+                        onClick: function (ev) { ev.stopPropagation(); openStream({ ticketId: tr.ticketId }); },
+                      }, tr.message || tr.ticketId) : h('span', {
+                        style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.88 },
+                        title: tr.message || '',
+                      }, tr.message || '—'),
                       // 回复投递闭环指示： 已回复(绿) / 已注入(灰) / 投递中(琥珀) / 投递失败(红+行内重投)
                       tr.reply && tr.reply.state === 'sent'
                         ? h('span', {
@@ -2109,7 +2196,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                         : tr.dropped
                         ? h('span', { style: { flexShrink: 0, fontSize: '11px', opacity: 0.55, fontStyle: 'italic' } }, t('droppedLabel') + ': ' + tr.dropped)
                         : (tr.stageText ? stagePill(tr.stage || '', tr.stageText) : null),
-                      tr.ownerLabel ? h('span', { style: { flexShrink: 0, fontSize: '12px', opacity: 0.6, cursor: 'pointer' }, title: t('ownerClickHint'), onClick: function (ev) { ev.stopPropagation(); setFilterOwner(tr.ownerLabel); scrollToSection('hub-bot-stream'); } }, tr.ownerLabel) : null);
+                      ownerFilterButton(ticketById.get(tr.ticketId)?.owner, tr.ownerLabel, { flexShrink: 0, maxWidth: '24%', fontSize: '12px', opacity: 0.7 }));
                   }))),
             h('div', { style: sectionStyle, id: 'hub-bot-owners' },
               h('div', { style: sectionTitleStyle }, t('ownersSection'),
@@ -2125,10 +2212,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                       var current = null;
                       for (var ci = 0; ci < mine.length; ci++) { if (mine[ci].stage === 'working') { current = mine[ci]; break; } }
                       var roleTone = o.role === 'chief' ? TONES.amber : o.kind === 'temp' ? TONES.gray : TONES.blue;
-                      var label = o.dshWorkspace && o.dshWorkspace.title ? o.dshWorkspace.title : (o.workspace || o.id);
+                      var label = ownerNames.get(o.id);
                       return h('div', {
                         key: o.id,
-                        onClick: function () { setFilterText(o.workspace || o.id); setFilterStage(''); scrollToSection('hub-bot-stream'); },
+                        onClick: function () { openStream({ ownerId: o.id }); },
                         title: t('ownerFilterHint'),
                         style: {
                           padding: '12px 14px', borderRadius: '10px', cursor: 'pointer',
@@ -2140,7 +2227,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                         h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' } },
                           h('span', { style: { fontSize: '11px', padding: '1px 8px', borderRadius: '999px', background: roleTone.bg, color: roleTone.fg, border: '1px solid ' + roleTone.border, flexShrink: 0 } },
                             o.role === 'chief' ? t('roleChief') : o.kind === 'temp' ? t('kindTemp') : t('roleOwner')),
-                          h('span', { style: { fontWeight: 600, fontSize: '14px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, label),
+                          ownerFilterButton(o.id, label, { fontWeight: 600, fontSize: '14px' }),
                           verdict > 0
                             ? h('span', { style: { marginLeft: 'auto', fontSize: '11px', padding: '1px 8px', borderRadius: '999px', background: TONES.amber.bg, color: TONES.amber.fg, border: '1px solid ' + TONES.amber.border, flexShrink: 0 } },
                                 fill(t('verdictCount'), verdict))
@@ -2162,12 +2249,18 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                             byStage[tk.stage] += 1;
                           });
                           if (order.length === 0) return null;
-                          return h('div', { style: { display: 'flex', height: '6px', borderRadius: '999px', overflow: 'hidden', marginBottom: '8px', gap: '2px' } },
+                          return h('div', { style: { display: 'flex', height: '6px', marginBottom: '8px', gap: '2px' } },
                             order.map(function (st) {
                               var tone = TONES[STAGE_TONE[st] || 'gray'];
                               var sample = null;
                               for (var si = 0; si < mine.length; si++) if (mine[si].stage === st) { sample = mine[si]; break; }
-                              return h('span', { key: st, title: (sample && sample.stageText ? sample.stageText : st) + ' x ' + byStage[st] + ' · ' + t('barFilterHint'), style: { flex: byStage[st] + ' 1 0', minWidth: '10px', background: tone.border, cursor: 'pointer' }, onClick: function (ev) { ev.stopPropagation(); setFilterOwner(label); setFilterStage(st); scrollToSection('hub-bot-stream'); } });
+                              var segmentLabel = (sample?.stageText || st) + ' · ' + byStage[st];
+                              return h('button', {
+                                key: st, type: 'button', className: 'hb-stage-action',
+                                title: segmentLabel + ' · ' + t('barFilterHint'), 'aria-label': segmentLabel,
+                                style: { flex: byStage[st] + ' 1 0', minWidth: '10px', padding: 0, border: 0, borderRadius: '999px', background: tone.border, cursor: 'pointer' },
+                                onClick: function (ev) { ev.stopPropagation(); openStream({ ownerId: o.id, stage: st }); },
+                              });
                             }));
                         })(),
                         h('div', { style: { display: 'flex', alignItems: 'center', gap: '12px', fontSize: '12px' } },
