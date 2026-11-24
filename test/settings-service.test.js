@@ -96,11 +96,13 @@ test('selfTest forwards to the dep (round 53)', async () => {
   assert.equal(out.triggerId, 'feishu-om_selftest-1')
 })
 
-test('selfTest maps 400s to RemoteError with details (round 53)', async () => {
-  const err = new Error('no feishu chat on record yet')
-  err.statusCode = 400
-  const { service } = makeService({ selfTest: async () => { throw err } })
-  await assert.rejects(() => service.selfTest(), (e) => e.code === 'self-test/unavailable' && e.details !== undefined)
+test('selfTest returns the original start error from both HTTP error shapes', async () => {
+  for (const field of ['status', 'statusCode']) {
+    const err = Object.assign(new Error('no feishu chat on record yet'), { [field]: 400 })
+    const { service } = makeService({ selfTest: async () => { throw err } })
+    await assert.rejects(() => service.selfTest(), error => error.code === 'self-test/unavailable'
+      && error.message === err.message && error.details !== undefined)
+  }
 })
 
 test('listOwners projects registry rows to plain JSON', async () => {

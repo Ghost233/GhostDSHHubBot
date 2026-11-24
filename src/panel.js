@@ -243,6 +243,11 @@ export function buildSettingsView(config, { feishuStatus, githubStatus } = {}) {
   }
 }
 
+export function feishuSelfTestMarker(messageId) {
+  if (typeof messageId !== 'string' || !/^om_selftest-[0-9a-f]{32}$/.test(messageId)) return null
+  return '[hub-bot-check:' + messageId + ']'
+}
+
 /**
  * The 三问 overview (spec「观测性：独立 web 面板」):
  *  1. 什么状态 — every ticket with its stage + stageText 朗读, grouped client-side (计数 = 列表长度);
@@ -300,7 +305,7 @@ export function buildOverview({ store, registry, health, now, listDir }) {
   // 直接回复（chief 未建票）outbox 行 ticketId 为空——按 feishu:chat:<chatId> 另建索引归位到 trigger (round 53)。
   const replyRowsByChat = new Map()
   for (const row of readAll('outbox')) {
-    if (row.kind === 'reply' && row.to && String(row.to).startsWith('feishu:chat:')) {
+    if (row.kind === 'reply' && !row.ticketId && row.to && String(row.to).startsWith('feishu:chat:')) {
       const chatList = replyRowsByChat.get(row.to) ?? []
       chatList.push(row)
       replyRowsByChat.set(row.to, chatList)
@@ -312,8 +317,13 @@ export function buildOverview({ store, registry, health, now, listDir }) {
   }
   const directReplyFor = trigger => {
     if (trigger.kind !== 'feishu' || !trigger.source?.chatId) return null
+    const marker = feishuSelfTestMarker(trigger.source.messageId)
     const rows = (replyRowsByChat.get('feishu:chat:' + trigger.source.chatId) ?? [])
-      .filter(r => String(r.createdAt ?? '') >= String(trigger.at ?? ''))
+      .filter(row => {
+        if (String(row.createdAt ?? '') < String(trigger.at ?? '')) return false
+        const text = String(row.body ?? row.text ?? '')
+        return marker ? text.includes(marker) : !/\[hub-bot-check:om_selftest-[0-9a-f]{32}\]/.test(text)
+      })
       .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')))
     return rows[0] ?? null
   }
@@ -331,7 +341,8 @@ export function buildOverview({ store, registry, health, now, listDir }) {
     .slice(0, 12)
     .map(t => {
       const tk = ticketByTriggerId.get(t.id)
-      const direct = tk ? null : directReplyFor(t)
+      const isSelfTest = feishuSelfTestMarker(t.source?.messageId) !== null
+      const direct = tk && !isSelfTest ? null : directReplyFor(t)
       return {
         id: t.id,
         kind: t.kind ?? null,
@@ -342,15 +353,21 @@ export function buildOverview({ store, registry, health, now, listDir }) {
         ownerLabel: tk?.ownerLabel ?? null,
         stage: tk?.stage ?? null,
         stageText: tk?.stageText ?? null,
-        reply: tk?.id ? replyStateFor(tk.id) : (direct ? replyStateForRow(direct) : null),
-        unprocessed: !t.dropped && !tk?.id && !direct
+        reply: tk?.id && !isSelfTest ? replyStateFor(tk.id) : (direct ? replyStateForRow(direct) : null),
+        unprocessed: !isSelfTest && !t.dropped && !tk?.id && !direct
           && Number.isFinite(Date.parse(t.at ?? '')) && (nowMs - Date.parse(t.at)) > 5 * 60 * 1000,
       }
     })
-  // 未受理信号：非 dropped、无票据、无回复、且已超过 5 分钟的触发——
-  // 消息进来了却什么都没发生（生产 archived-chief 事故的可见化）。
+  // Self-test polling must survive bursts that push the probe out of recentTriggers.
+  const selfTests = [...triggers.values()]
+    .filter(t => t.kind === 'feishu' && feishuSelfTestMarker(t.source?.messageId) && nowMs - Date.parse(t.at) <= 120_000)
+    .map(t => {
+      const row = directReplyFor(t)
+      return { id: t.id, dropped: t.dropped ?? null, reply: row ? replyStateForRow(row) : null }
+    })
+  // A real message that never reached an owner gets its own health warning.
   const unprocessedTriggers = [...triggers.values()].filter(t => {
-    if (t.dropped) return false
+    if (t.dropped || feishuSelfTestMarker(t.source?.messageId)) return false
     if (ticketByTriggerId.has(t.id)) return false
     if (directReplyFor(t)) return false
     const atMs = Date.parse(t.at ?? '')
@@ -362,6 +379,7 @@ export function buildOverview({ store, registry, health, now, listDir }) {
     owners,
     tickets,
     recentTriggers,
+    selfTests,
     unprocessedTriggers,
     health: health ?? {},
   }

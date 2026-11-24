@@ -157,10 +157,10 @@ export class FeishuSource {
    * im:message, im:chat:readonly + im.message.receive_v1).
    */
   async register() {
-    const lark = await this.#sdk()
     this.registering = true
     this.lastQr = null
     try {
+      const lark = await this.#sdk()
       const result = await lark.registerApp({
         createOnly: true, // 只允许创建新应用，避免误覆盖已有应用
         appPreset: { name: BOT_PRESET.name, desc: BOT_PRESET.desc },

@@ -33,7 +33,7 @@ import { resolveConfig } from './config.js'
 const PKG_VERSION = createRequire(import.meta.url)('../package.json').version
 import {
   SETTINGS_FILE, applySettingsOverlay, applySettingsPatch, loadSettingsOverlay, mergeSettingsOverlay,
-  saveSettingsOverlay, buildOverview, buildSettingsView,
+  saveSettingsOverlay, buildOverview, buildSettingsView, feishuSelfTestMarker,
 } from './panel.js'
 import { discardOutboxRows, retryOutboxRows } from './outbox.js'
 import { Store, SCHEMA_VERSION } from './store.js'
@@ -366,28 +366,33 @@ export function apply(ctx, rawConfig) {
   /**
    * 面板「自检」 (round 53): 构造一条模拟 im.message.receive_v1 事件，走真实 normalize → 策略 → trigger →
    * chief 注入链路；chief 经 reply_source 回投 outbox，由投递循环真实发到用户飞书。
-   * chatId/openId 取最近一条真实 trigger——保证回复落进用户确实存在的会话。
+   * The reply target comes from the most recent accepted Feishu direct message.
    */
   const selfTest = async () => {
-    if (!config.feishu.enabled) throw new HttpError(400, 'feishu is not enabled')
-    const rows = store.db.prepare('SELECT value FROM trigger ORDER BY at DESC LIMIT 50').all()
-    let chatId = null; let openId = null
-    for (const r of rows) {
-      try {
-        const v = JSON.parse(String(r.value))
-        if (v?.source?.chatId) { chatId = v.source.chatId; openId = v.source?.openId ?? null; break }
-      } catch { /* 跳过坏行 */ }
+    if (!config.feishu.enabled || !feishu.status().bot?.connected) throw new HttpError(400, 'Connect the Feishu bot before running a self-test')
+    const rows = store.db.prepare('SELECT value FROM trigger ORDER BY at DESC').iterate()
+    let source
+    for (const row of rows) {
+      let trigger
+      try { trigger = JSON.parse(String(row.value)) } catch { continue }
+      const candidate = trigger?.source
+      if (trigger?.kind !== 'feishu' || trigger.dropped || candidate?.addressing !== 'direct' || !candidate.chatId) continue
+      if (typeof candidate.messageId !== 'string' || !candidate.messageId || candidate.messageId.startsWith('om_selftest-')) continue
+      source = candidate
+      break
     }
-    if (!chatId) throw new HttpError(400, 'no feishu chat on record yet — send the bot one real message first')
-    const ts = Date.now()
+    if (!source) throw new HttpError(400, '请先在飞书私聊给 Bot 发一条消息。')
+    const { chatId, openId } = source
+    const messageId = 'om_selftest-' + randomUUID().replaceAll('-', '')
+    const marker = feishuSelfTestMarker(messageId)
     const event = {
       sender: { sender_type: 'user', sender_id: { open_id: openId ?? 'ou_selftest' } },
       message: {
-        message_id: 'om_selftest-' + ts,
+        message_id: messageId,
         chat_id: chatId,
         chat_type: 'p2p',
         message_type: 'text',
-        content: JSON.stringify({ text: '自检：Hub Bot 端到端连通性测试 ' + ts }),
+        content: JSON.stringify({ text: 'Hub Bot 连通性自检。请调用 reply_source，回复内容只写 ' + marker }),
       },
     }
     const result = await feishu.handleEvent(event)

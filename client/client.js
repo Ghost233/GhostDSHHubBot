@@ -201,13 +201,17 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       copyPathHint: '点击复制完整路径',
       copySessionHint: '点击复制完整会话 id',
       unsaved: '未保存',
-      selfTestBtn: '自检',
-      selfTestHint: '模拟一条飞书消息走完整链路（会向你的飞书发一条真实回复）',
-      selfTestConfirm: '自检会向你的飞书会话发送一条真实回复。确认继续？',
-      selfTestInjected: '自检消息已注入 chief 会话，等待回复…',
-      selfTestPassed: '自检通过：回复已送达飞书',
-      selfTestDropped: '自检消息被策略丢弃',
-      selfTestTimeout: '自检超时：chief 未回复（会话可能被归档，或模型不可用）',
+      selfTestBtn: '飞书自检',
+      selfTestHint: '模拟飞书来信并验证这次回复的投递结果',
+      selfTestConfirm: '自检会向最近联系 Bot 的飞书私聊发送一条回复。确认继续？',
+      selfTestNeedsConnection: '连接飞书 Bot 后可运行自检',
+      selfTestStarting: '正在启动自检…',
+      selfTestInjected: '总负责人已收到自检消息，正在等待回复投递…',
+      selfTestPassed: '自检通过，回复已送达飞书',
+      selfTestDropped: '自检消息未受理',
+      selfTestFailed: '自检启动失败',
+      selfTestDeliveryFailed: '自检回复投递失败',
+      selfTestTimeout: '本次自检超时，尚未确认回复已送达',
       ownersCard: '负责人',
       needsCard: '待我处理',
       connected: '已连接',
@@ -264,6 +268,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       feishuWsOk: '长连接正常',
       feishuWsDown: '长连接未建立',
       feishuNotBound: '尚未绑定飞书 Bot',
+      feishuSetupHint: '扫码绑定后，在飞书给 Bot 发一条消息即可运行自检。',
+      feishuWaitingBind: '待绑定',
+      feishuBindingStatus: '绑定中',
+      feishuConnecting: '连接中',
+      feishuReconnecting: '正在重连',
+      feishuCredentialsInvalid: '凭据失效',
       feishuInvalid: '凭据失效 — 请重新扫码绑定',
       feishuBindStart: '开始扫码绑定',
       feishuBinding: '正在等待二维码…',
@@ -288,7 +298,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       unprocessedLabel: '未处理',
       unprocessedHint: '这条消息进来超过 5 分钟，没有生成任务也没有回复——负责人会话可能被归档',
       healthDetailSys: '系统问题',
-      healthOk: '消息投递链路正常，没有积压、死信或系统问题',
+      healthOk: '当前没有投递告警',
       healthPillSys: '系统',
       retryOne: '重投',
       retryAll: '全部重投',
@@ -462,13 +472,17 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       copyPathHint: 'Click to copy the full path',
       copySessionHint: 'Click to copy the full session id',
       unsaved: 'Unsaved',
-      selfTestBtn: 'Self-test',
-      selfTestHint: 'Simulate a Feishu message through the full pipeline (a REAL reply lands in your Feishu)',
-      selfTestConfirm: 'The self-test sends a REAL reply to your bound Feishu chat. Continue?',
-      selfTestInjected: 'Self-test message injected into the chief session, waiting for the reply…',
-      selfTestPassed: 'Self-test passed: reply delivered to Feishu',
-      selfTestDropped: 'Self-test message dropped by policy',
-      selfTestTimeout: 'Self-test timed out: the chief did not reply (session may be archived or the model unavailable)',
+      selfTestBtn: 'Test Feishu',
+      selfTestHint: 'Simulate a Feishu message and verify that its reply is delivered',
+      selfTestConfirm: 'This test sends a reply to the last Feishu direct chat that messaged the bot. Continue?',
+      selfTestNeedsConnection: 'Connect the Feishu bot to run a test',
+      selfTestStarting: 'Starting the test…',
+      selfTestInjected: 'The chief received the test message. Waiting for reply delivery…',
+      selfTestPassed: 'Test passed. The reply reached Feishu.',
+      selfTestDropped: 'The test message was dropped',
+      selfTestFailed: 'The test could not start',
+      selfTestDeliveryFailed: 'The test reply could not be delivered',
+      selfTestTimeout: 'The test timed out waiting for reply delivery',
       ownersCard: 'Owners',
       needsCard: 'Needs me',
       connected: 'Connected',
@@ -523,7 +537,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       feishuBoundAt: 'bound',
       feishuWsOk: 'Long connection OK',
       feishuWsDown: 'Long connection down',
-      feishuNotBound: 'No feishu bot bound yet',
+      feishuNotBound: 'No Feishu bot bound yet',
+      feishuSetupHint: 'Scan to bind the bot, then send it a message in Feishu before running a test.',
+      feishuWaitingBind: 'Needs binding',
+      feishuBindingStatus: 'Binding',
+      feishuConnecting: 'Connecting',
+      feishuReconnecting: 'Reconnecting',
+      feishuCredentialsInvalid: 'Credentials invalid',
       feishuInvalid: 'Credentials invalid — scan to re-bind',
       feishuBindStart: 'Start scan-to-bind',
       feishuBinding: 'Waiting for the QR code…',
@@ -548,7 +568,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       unprocessedLabel: 'unprocessed',
       unprocessedHint: 'Arrived over 5 minutes ago with no ticket and no reply — the owner session may be archived',
       healthDetailSys: 'System problems',
-      healthOk: 'Delivery pipeline healthy — no backlog, dead letters, or system problems',
+      healthOk: 'No delivery alerts',
       healthPillSys: 'system',
       retryOne: 'Retry',
       retryAll: 'Retry all',
@@ -915,11 +935,23 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           if (hr < 24) return fill(t('relHours'), hr);
           return fill(t('relDays'), Math.floor(hr / 24));
         }
+        function feishuPresentation(enabled, status) {
+          if (!enabled) return { label: 'disabled', stage: 'idle' };
+          if (status.registration === 'pending') return { label: 'feishuBindingStatus', stage: 'working' };
+          if (status.credentialState === 'invalid') return { label: 'feishuCredentialsInvalid', stage: 'failed' };
+          if (status.credentialState !== 'ok') return { label: 'feishuWaitingBind', stage: 'queued' };
+          if (status.wsState === 'reconnecting') return { label: 'feishuReconnecting', stage: 'working' };
+          if (status.wsState === 'connecting') return { label: 'feishuConnecting', stage: 'working' };
+          if (status.bot?.connected || status.wsState === 'connected') return { label: 'connected', stage: 'done' };
+          return { label: 'feishuWsDown', stage: 'failed' };
+        }
+
         function healthProblems(health, t) {
           var items = [];
           var feishu = health.feishu || {};
-          if (feishu.enabled && feishu.credentialState && feishu.credentialState !== 'ok') items.push(t('healthFeishuCred'));
-          if (feishu.enabled && feishu.credentialState === 'ok' && feishu.connected === false) items.push(t('healthFeishuWs'));
+          var connection = feishuPresentation(feishu.enabled, feishu);
+          if (connection.label === 'feishuCredentialsInvalid') items.push(t('healthFeishuCred'));
+          if (connection.label === 'feishuWsDown') items.push(t('healthFeishuWs'));
           var gh = health.github || {};
           if (gh.enabled && gh.lastPollError) items.push(t('healthGithubPoll') + '：' + gh.lastPollError);
           var ob = health.outbox || {};
@@ -933,18 +965,19 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var t = scoped.locale.bind(NS);
           var view = props.view;
           var onRefresh = props.onRefresh;
-          var fs = (view.feishu && view.feishu.status) || {};
-          var enabled = !!(view.feishu && view.feishu.enabled);
+          var fs = props.status;
+          var qr = view.feishu?.status?.qr;
+          var enabled = !!view.feishu?.enabled;
           var bound = fs.credentialState === 'ok' && !!fs.bot;
-          var invalid = enabled && fs.credentialState && fs.credentialState !== 'ok' && !fs.registration;
           var pending = fs.registration === 'pending';
+          var invalid = fs.credentialState === 'invalid' && !pending;
+          var connection = feishuPresentation(enabled, fs);
+          var connectionTone = TONES[STAGE_TONE[connection.stage]];
           var bs = React.useState(false); var busy = bs[0]; var setBusy = bs[1];
           var es = React.useState(null); var err = es[0]; var setErr = es[1];
-          var ts = React.useState(0); var tick = ts[0]; var setTick = ts[1];
-          // 注册流 pending 时轮询 read()，直到扫码完成（credentialState 转 ok）或二维码过期
           React.useEffect(function () {
             if (!pending) return undefined;
-            var timer = setInterval(function () { onRefresh(); setTick(function (n) { return n + 1; }); }, 2500);
+            var timer = setInterval(onRefresh, 2500);
             return function () { clearInterval(timer); };
           }, [pending]);
           var start = function () {
@@ -968,11 +1001,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                   h('li', null, t('feishuEnableStep2'))))));
           } else if (bound) {
             rows.push(h('div', { key: 'card', style: { display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' } },
-              dot(fs.bot.connected ? '#46bb6d' : '#e06060'),
+              dot(connectionTone.fg),
               h('span', { style: { fontWeight: 600 } }, fs.bot.name || 'bot'),
               h('span', { style: { fontSize: '12px', opacity: 0.65 } }, 'App ID：' + (fs.bot.appIdMasked || '—')),
               fs.bot.boundAt ? h('span', { style: { fontSize: '12px', opacity: 0.65 } }, t('feishuBoundAt') + ' ' + relTime(t, fs.bot.boundAt)) : null,
-              stagePill(fs.bot.connected ? 'done' : 'failed', fs.bot.connected ? t('feishuWsOk') : t('feishuWsDown'))));
+              stagePill(connection.stage, t(connection.label === 'connected' ? 'feishuWsOk' : connection.label))));
             // 连接质量（host 侧持久化的 ws 生命周期记账）: 有记录才渲染
             var mt = fs.metrics || {};
             var mtParts = [];
@@ -986,17 +1019,19 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             }
           } else {
             if (invalid) rows.push(h('p', { key: 'inv', style: { fontSize: '13px', color: TONES.red.fg, margin: '0 0 4px' } }, t('feishuInvalid')));
-            else rows.push(h('p', { key: 'nb', style: { fontSize: '13px', opacity: 0.75, margin: '0 0 4px' } }, t('feishuNotBound')));
+            else if (!pending) rows.push(h('div', { key: 'nb', style: { marginBottom: '4px' } },
+              h('div', { style: { fontWeight: 600 } }, t('feishuNotBound')),
+              h('p', { style: { fontSize: '12px', opacity: 0.75, margin: '4px 0' } }, t('feishuSetupHint'))));
             if (!pending) {
               rows.push(h('button', { key: 'start', onClick: start, disabled: busy,
                 style: Object.assign({}, inputStyle, { width: 'auto', cursor: 'pointer', padding: '6px 18px', marginTop: '6px' }),
               }, busy ? t('feishuBinding') : t('feishuBindStart')));
             }
           }
-          if (pending && fs.qr && fs.qr.svg) {
+          if (pending && qr?.svg && qr.url === fs.qr?.url) {
             rows.push(h('div', { key: 'qr', style: { marginTop: '12px', display: 'flex', gap: '16px', alignItems: 'center', flexWrap: 'wrap' } },
               h('img', {
-                src: 'data:image/svg+xml;utf8,' + encodeURIComponent(fs.qr.svg),
+                src: 'data:image/svg+xml;utf8,' + encodeURIComponent(qr.svg),
                 alt: 'feishu qr', style: { width: '168px', height: '168px', borderRadius: '8px', background: '#fff', padding: '6px' },
               }),
               h('div', { style: { fontSize: '13px', opacity: 0.8, maxWidth: '320px' } }, t('feishuScanHint'))));
@@ -1188,9 +1223,15 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var es = React.useState(null); var error = es[0]; var setError = es[1];
           var nts = React.useState(''); var notice = nts[0]; var setNotice = nts[1];
           var noticeSeq = React.useRef(0);
-          var lls = React.useState(null); var lastLoadedAt = lls[0]; var setLastLoadedAt = lls[1];
-          var sts2 = React.useState(false); var selfTestBusy = sts2[0]; var setSelfTestBusy = sts2[1];
-          var sts3 = React.useState(null); var selfTestState = sts3[0]; var setSelfTestState = sts3[1];
+          var [selfTestResult, setSelfTestResult] = React.useState(null);
+          var selfTestBusy = selfTestResult?.stage === 'starting' || selfTestResult?.stage === 'waiting';
+          var selfTestRun = React.useRef(null);
+          React.useEffect(function () {
+            return function () {
+              clearTimeout(selfTestRun.current?.timer);
+              selfTestRun.current = null;
+            };
+          }, []);
           var ms = React.useState(''); var modelChoice = ms[0]; var setModelChoice = ms[1];
           var bs = React.useState(false); var modelBusy = bs[0]; var setModelBusy = bs[1];
           var ds = React.useState(false); var modelDone = ds[0]; var setModelDone = ds[1];
@@ -1213,75 +1254,96 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             ]).then(function (r) {
               var v = unwrap(r[0]); var ow = unwrap(r[1]); var cat = unwrap(r[2]); var board = unwrap(r[3]);
               setView(v); setOwners(Array.isArray(ow) ? ow : []); setCatalog(cat); setOverview(board);
-              setLastLoadedAt(new Date().toISOString());
+
               var m = v.chief && v.chief.model;
               setModelChoice(m ? m.provider + '/' + m.model : '');
             }).catch(function (e) { setError(e && e.message ? e.message : String(e)); });
           };
           React.useEffect(load, []);
+          React.useEffect(function () {
+            var active = true;
+            var refreshing = false;
+            function refreshMonitoring() {
+              if (document.hidden || refreshing) return;
+              refreshing = true;
+              Promise.all([scoped.remote.hubBotSettings.overview(), scoped.remote.hubBotSettings.listOwners()])
+                .then(function (results) {
+                  if (!active) return;
+                  var board = unwrap(results[0]);
+                  var rows = unwrap(results[1]);
+                  if (board?.generatedAt) {
+                    setOverview(function (current) { return current?.generatedAt > board.generatedAt ? current : board; });
+                  }
+                  if (Array.isArray(rows)) setOwners(rows);
+                }).catch(function () { /* keep the last successful reading */ })
+                .finally(function () { refreshing = false; });
+            }
+            var timer = setInterval(refreshMonitoring, 15000);
+            document.addEventListener('visibilitychange', refreshMonitoring);
+            return function () {
+              active = false;
+              clearInterval(timer);
+              document.removeEventListener('visibilitychange', refreshMonitoring);
+            };
+          }, []);
           // 成功提示条（round 28）: 动作成功也要看得见——3.5s 自动消，序号防旧定时器清掉新提示。
           var flashNotice = function (text) {
             var seq = ++noticeSeq.current;
             setNotice(text);
             setTimeout(function () { if (noticeSeq.current === seq) setNotice(''); }, 3500);
           };
-          // 面板「自检」 (round 53): 注入模拟飞书消息后轮询 overview，等到 reply=sent 或超时。
-          var pollSelfTest = function (attempt) {
+          function finishSelfTest(run, stage, label, detail) {
+            if (selfTestRun.current !== run) return;
+            clearTimeout(run.timer);
+            selfTestRun.current = null;
+            setSelfTestResult({ stage: stage, label: label, detail: detail });
+          }
+          function pollSelfTest(run) {
+            if (selfTestRun.current !== run) return;
+            if (run.polls-- === 0) {
+              finishSelfTest(run, 'error', 'selfTestTimeout');
+              return;
+            }
             scoped.remote.hubBotSettings.overview().then(function (raw) {
+              if (selfTestRun.current !== run) return;
               var ov = unwrap(raw);
-              var found = null;
-              (ov.recentTriggers || []).forEach(function (tr) { if (!found && String(tr.id).indexOf('om_selftest-') === 0) found = tr; });
-              if (found && found.reply && found.reply.state === 'sent') {
-                setSelfTestBusy(false);
-                setSelfTestState('passed');
-                flashNotice(t('selfTestPassed'));
-                load();
-              } else if (found && found.dropped) {
-                setSelfTestBusy(false);
-                setSelfTestState('dropped');
-                setError(t('selfTestDropped') + ': ' + found.dropped);
-              } else if (attempt >= 14) {
-                setSelfTestBusy(false);
-                setSelfTestState('timeout');
-                setError(t('selfTestTimeout'));
-                load();
+              var result = ov?.selfTests?.find(test => test.id === run.triggerId);
+              if (result?.dropped) {
+                finishSelfTest(run, 'error', 'selfTestDropped', result.dropped);
+              } else if (result?.reply?.state === 'sent') {
+                setOverview(ov);
+                finishSelfTest(run, 'success', 'selfTestPassed');
+              } else if (result?.reply?.state === 'failed') {
+                setOverview(ov);
+                finishSelfTest(run, 'error', 'selfTestDeliveryFailed', result.reply.lastError);
               } else {
-                setTimeout(function () { pollSelfTest(attempt + 1); }, 2500);
+                run.timer = setTimeout(function () { pollSelfTest(run); }, 2500);
               }
             }).catch(function () {
-              if (attempt >= 14) { setSelfTestBusy(false); setError(t('selfTestTimeout')); }
-              else setTimeout(function () { pollSelfTest(attempt + 1); }, 2500);
+              if (selfTestRun.current === run) run.timer = setTimeout(function () { pollSelfTest(run); }, 2500);
             });
-          };
-          var runSelfTest = function () {
-            if (!window.confirm(t('selfTestConfirm'))) return;
-            setSelfTestBusy(true);
-            setSelfTestState(null);
-            setError(null);
-            scoped.remote.hubBotSettings.selfTest()
-              .then(function (raw) {
-                unwrap(raw);
-                flashNotice(t('selfTestInjected'));
-                setTimeout(function () { pollSelfTest(0); }, 2500);
-              })
-              .catch(function (e) {
-                setSelfTestBusy(false);
-                setError(e && e.message ? e.message : String(e));
-              });
-          };
-          // 自动刷新（round 7）: 每 15s 拉一次 overview——新消息/票据状态变化不用手动刷新页面。
-          // 只刷 overview 不刷 view: RowConfig 的表单正在编辑时不能被远端值覆盖。
-          // 页面藏进后台（document.hidden）时暂停，失败静默——下一轮自然会再试。
-          React.useEffect(function () {
-            var timer = setInterval(function () {
-              if (typeof document !== 'undefined' && document.hidden) return;
-              scoped.remote.hubBotSettings.overview()
-                .then(function (raw) { setOverview(unwrap(raw)); })
-                .catch(function () {});
-            }, 15000);
-            return function () { clearInterval(timer); };
-          }, []);
-          // 死信重投（健康警告条操作闭环）: 单条或全部，成功后整体刷新（overview 在 load 里）。
+          }
+          function runSelfTest() {
+            if (selfTestRun.current || !window.confirm(t('selfTestConfirm'))) return;
+            var run = { polls: 24 };
+            selfTestRun.current = run;
+            setSelfTestResult({ stage: 'starting', label: 'selfTestStarting' });
+            scoped.remote.hubBotSettings.selfTest().then(function (raw) {
+              if (selfTestRun.current !== run) return;
+              if (raw?.ok === false) throw new Error(raw.error?.message || t('selfTestFailed'));
+              var result = unwrap(raw);
+              if (result?.dropped) {
+                finishSelfTest(run, 'error', 'selfTestDropped', result.dropped);
+                return;
+              }
+              if (!result?.triggerId) throw new Error(t('selfTestFailed'));
+              run.triggerId = result.triggerId;
+              setSelfTestResult({ stage: 'waiting', label: 'selfTestInjected' });
+              pollSelfTest(run);
+            }).catch(function (error) {
+              finishSelfTest(run, 'error', 'selfTestFailed', error?.message);
+            });
+          }
           var retryOutbox = function (idOrNull) {
             var req = idOrNull === null ? { all: true } : { id: idOrNull };
             scoped.remote.hubBotSettings.retryOutbox(req)
@@ -1310,8 +1372,17 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           };
           var refreshView = function () {
             scoped.remote.hubBotSettings.read()
-              .then(function (raw) { setView(unwrap(raw)); })
-              .catch(function () { /* 轮询失败静默——下一次再试 */ });
+              .then(function (raw) {
+                if (raw?.ok === false) return;
+                var settings = unwrap(raw);
+                setView(settings);
+                if (settings?.feishu?.status) {
+                  setOverview(function (current) {
+                    return current ? { ...current, health: { ...current.health, feishu: settings.feishu.status } } : current;
+                  });
+                }
+              })
+              .catch(function () { /* keep the last successful reading */ });
           };
 
           var saveModel = function () {
@@ -1400,11 +1471,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           if (!view || !owners || !overview) return h('p', { style: { padding: '20px 24px' } }, t('loading'));
 
           var feishu = view.feishu || {};
-          var fs = feishu.status || {};
-          var feishuOn = feishu.enabled && (fs.wsState === 'connected' || fs.wsState === 'ready');
-          var feishuText = !feishu.enabled ? t('disabled')
-            : feishuOn ? t('connected') : (fs.wsState || t('notConnected'));
-          var feishuColor = !feishu.enabled ? 'rgba(140,140,140,0.6)' : feishuOn ? '#46bb6d' : '#e06060';
+          var fs = overview.health?.feishu || feishu.status || {};
+          var feishuStatus = feishuPresentation(feishu.enabled, fs);
+          var feishuOn = feishuStatus.stage === 'done';
+          var feishuText = t(feishuStatus.label);
+          var feishuColor = TONES[STAGE_TONE[feishuStatus.stage]].fg;
           var github = view.github || {};
           var followed = github.followed || [];
           var githubText = !github.enabled ? t('disabled') : fill(t('watching'), followed.length);
@@ -1744,14 +1815,16 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '14px' } },
               h('span', { style: { fontSize: '16px', fontWeight: 700 } }, 'Hub Bot'),
               view && view.version ? h('span', { style: { fontSize: '11px', fontFamily: 'monospace', padding: '1px 8px', borderRadius: '999px', background: 'rgba(127,127,127,0.1)', border: '1px solid rgba(127,127,127,0.2)', opacity: 0.75 } }, 'v' + view.version) : null,
-              lastLoadedAt ? h('span', { style: { fontSize: '11px', opacity: 0.55 } }, t('updatedAt') + ' ' + relTime(t, lastLoadedAt)) : null,
+              overview.generatedAt ? h('span', { style: { fontSize: '11px', opacity: 0.55 } }, t('updatedAt') + ' ' + relTime(t, overview.generatedAt)) : null,
               h('span', { style: { fontSize: '11px', opacity: 0.4 } }, t('autoRefreshHint')),
-              h('button', { onClick: runSelfTest, disabled: selfTestBusy, title: t('selfTestHint'), style: { marginLeft: 'auto', fontSize: '11px', padding: '3px 12px', borderRadius: '6px', cursor: 'pointer',
-                background: selfTestState === 'passed' ? TONES.green.bg : (selfTestState ? TONES.red.bg : 'rgba(70,150,255,0.1)'),
-                border: '1px solid ' + (selfTestState === 'passed' ? TONES.green.border : (selfTestState ? TONES.red.border : 'rgba(70,150,255,0.3)')),
-                color: selfTestState === 'passed' ? TONES.green.fg : (selfTestState ? TONES.red.fg : '#7db8ff'),
-                opacity: selfTestBusy ? 0.5 : 0.9 } }, selfTestBusy ? t('saving') : (selfTestState === 'passed' ? '✓ ' + t('selfTestBtn') : (selfTestState ? '✗ ' + t('selfTestBtn') : t('selfTestBtn')))),
+              h('button', { type: 'button', onClick: runSelfTest, disabled: selfTestBusy || !feishuOn, 'aria-describedby': 'hub-bot-self-test-status',
+                style: { marginLeft: 'auto', fontSize: '11px', padding: '3px 12px', borderRadius: '6px', background: TONES.blue.bg,
+                  border: '1px solid ' + TONES.blue.border, color: TONES.blue.fg, cursor: feishuOn && !selfTestBusy ? 'pointer' : 'default', opacity: feishuOn && !selfTestBusy ? 1 : 0.6 },
+              }, t('selfTestBtn')),
               h('button', { onClick: function () { load(); }, title: t('refreshHint'), style: { fontSize: '11px', padding: '3px 12px', borderRadius: '6px', cursor: 'pointer', background: 'rgba(127,127,127,0.08)', border: '1px solid rgba(127,127,127,0.22)', opacity: 0.85 } }, '\u21bb ' + t('refreshBtn'))),
+            h('div', { id: 'hub-bot-self-test-status', role: 'status', style: { margin: '-5px 0 14px', fontSize: '12px',
+              color: selfTestResult?.stage === 'error' ? TONES.red.fg : selfTestResult?.stage === 'success' ? TONES.green.fg : 'inherit',
+            } }, selfTestResult ? t(selfTestResult.label) + (selfTestResult.detail ? ' · ' + selfTestResult.detail : '') : t(feishuOn ? 'selfTestHint' : 'selfTestNeedsConnection')),
             h('div', { style: cardRowStyle },
               h('div', { style: Object.assign({}, cardStyle, clickableCard('hub-bot-feishu')), onClick: function () { scrollToSection('hub-bot-feishu'); }, title: t('cardJumpHint') }, h('div', { style: cardTitleStyle }, t('feishuCard')), h('div', { style: cardValueStyle }, dot(feishuColor), feishuText), feishuSub ? h('div', { style: cardSubStyle }, feishuSub) : null,
                 lastDropped ? h('div', { style: Object.assign({}, cardSubStyle, { color: TONES.amber.fg, opacity: 0.85 }), title: lastDropped.message || '' },
@@ -2138,7 +2211,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     modelDirty ? h('button', { onClick: function () { setModelChoice(savedChoice); }, disabled: modelBusy, title: t('revertHint'), style: { fontSize: '11px', padding: '4px 12px', borderRadius: '6px', cursor: 'pointer', background: 'transparent', border: '1px solid rgba(230,160,40,0.4)', color: '#eba938' } }, t('revertBtn')) : null,
               h('div', { style: warnStyle }, t('modelPickerHint'))),
             h('div', { id: 'hub-bot-feishu' },
-              h(FeishuSection, { view: view, onRefresh: refreshView }),
+              h(FeishuSection, { view: view, status: fs, onRefresh: refreshView }),
               h(GithubSection, { view: view, onSaved: refreshView })),
             h(HubBotRowConfig, { hubBotCtx: scoped, hideModel: true }),
             h(RuntimeSection, { view: view, onSaved: refreshView }),

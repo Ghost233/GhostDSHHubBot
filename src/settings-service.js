@@ -123,7 +123,7 @@ export class HubBotSettingsService extends TypertRemoteService {
     try {
       return await this.deps.selfTest()
     } catch (error) {
-      if (error?.statusCode === 400) throw new RemoteError('self-test/unavailable', error.message ?? 'self-test unavailable', {})
+      if ((error?.status ?? error?.statusCode) === 400) throw new RemoteError('self-test/unavailable', error.message ?? 'self-test unavailable', {})
       throw error
     }
   }

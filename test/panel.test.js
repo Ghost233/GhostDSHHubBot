@@ -228,6 +228,37 @@ test('overview counts unprocessed triggers older than 5 minutes (round 67)', asy
   } finally { cleanup() }
 })
 
+test('Feishu self-test only matches its own reply, even outside the recent message list', () => {
+  const { store, registry, cleanup } = fixture()
+  try {
+    const messageId = 'om_selftest-1234567890abcdef1234567890abcdef'
+    const triggerId = 'feishu-' + messageId
+    const marker = '[hub-bot-check:' + messageId + ']'
+    const chatId = 'same-chat'
+    const at = '2026-11-19T11:59:00.000Z'
+    const read = () => buildOverview({ store, registry, now: () => '2026-11-19T12:00:00.000Z' })
+    const insertTrigger = store.db.prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)')
+    insertTrigger.run(triggerId, JSON.stringify({ id: triggerId, kind: 'feishu', at, source: { chatId, messageId } }), at)
+    const reply = body => insertOutbox(store, { kind: 'reply', state: 'sent', to: 'feishu:chat:' + chatId, body },
+      () => '2026-11-19T11:59:30.000Z')
+    reply('Unrelated reply in the same chat')
+    reply('[hub-bot-check:om_selftest-abcdef1234567890abcdef1234567890]')
+    assert.equal(read().recentTriggers[0].reply, null)
+
+    const expected = reply(marker)
+    for (let i = 0; i < 12; i++) {
+      const id = 'new-trigger-' + i
+      const newerAt = '2026-11-19T11:59:50.000Z'
+      insertTrigger.run(id, JSON.stringify({ id, kind: 'route', at: newerAt }), newerAt)
+    }
+    const overview = read()
+    assert.ok(!overview.recentTriggers.some(row => row.id === triggerId))
+    const testRun = overview.selfTests.find(row => row.id === triggerId)
+    assert.equal(testRun.reply.id, expected.id)
+    assert.equal(testRun.reply.state, 'sent')
+  } finally { cleanup() }
+})
+
 test('overview reply projection carries the reply text snippet (round 54)', async () => {
   const { router, registry, store, cleanup } = fixture()
   try {
