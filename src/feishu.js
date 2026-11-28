@@ -219,7 +219,7 @@ export class FeishuSource {
           clearTimeout(registration.expiryTimer)
           const lifetime = Number.isFinite(expireIn) && expireIn > 0 ? Math.min(expireIn, 2_147_483) : 3600
           registration.expiresAt = Date.parse(this.now()) + lifetime * 1000
-          this.lastQr = { url, expireIn: lifetime, expiresAt: new Date(registration.expiresAt).toISOString() }
+          this.lastQr = { url, expireIn: lifetime }
           registration.expiryTimer = setTimeout(() => this.#expireRegistration(registration), lifetime * 1000)
           registration.expiryTimer.unref()
         },
