@@ -193,6 +193,9 @@ function renderBoard(overview) {
     ownerBox.append(table)
   }
 
+  // 投喂口径（只读观测面）：飞书入口与负责人路由各自生效的受理口径/去重/队列状态
+  renderIntake(overview.intake)
+
   // 最近触发（观测面）：渠道消息与处置——直读 trigger 表，异步加载不阻塞三问
   const trigBox = $('#triggers')
   trigBox.replaceChildren(el('p', { class: 'quiet small' }, text('加载中…')))
@@ -212,6 +215,53 @@ function renderBoard(overview) {
     }
     trigBox.append(table)
   }).catch(() => trigBox.replaceChildren(el('p', { class: 'quiet small' }, text('触发记录加载失败。'))))
+}
+
+/* ---------- 投喂口径（只读） ---------- */
+// S06: 两个入口（飞书 / 负责人路由）的「生效受理口径」投影。数据全部来自 router 已经落库的 trigger/outbox 行，
+// 这一块没有任何输入框、没有保存按钮——只把事实念出来，缺什么就显示「—」，不猜、不补。
+const QUEUE_TEXT = { queued: '排队中', held: '暂缓', recorded: '待发送', sent: '已送达', failed: '失败' }
+// 处置口径由 src/panel.js 统一判定（disposition 字段），面板只负责翻译，不自己再猜一遍。
+const DISPOSITION_TEXT = { dropped: '已丢弃', injected: '已注入', pending: '待注入', interrupt: '停止请求', 'interrupt-requested': '已请求停止' }
+
+function dash(value) { return value === null || value === undefined || value === '' ? '—' : String(value) }
+
+function renderIntake(intake) {
+  const box = $('#intake')
+  if (!box) return
+  box.replaceChildren()
+  // 旧后端没有 intake 投影时整块（含标题）不出现——不拿「没有数据」冒充「没有记录」。
+  const title = $('#intake-title')
+  if (title) title.hidden = !intake
+  if (!intake) return
+  const sources = intake.sources ?? []
+  if (!sources.length) { box.append(el('p', { class: 'quiet' }, text('暂无投喂口径数据。'))); return }
+  const table = el('table', { class: 'data-table' })
+  table.append(el('tr', {},
+    el('th', {}, text('入口')), el('th', {}, text('最近受理')), el('th', {}, text('受理口径')),
+    el('th', {}, text('处置')), el('th', {}, text('队列')), el('th', {}, text('累计'))))
+  for (const s of sources) {
+    const queue = s.queue ?? {}
+    const queueText = queue.state ? (QUEUE_TEXT[queue.state] ?? queue.state) + (queue.attempts ? ' · 第 ' + queue.attempts + ' 次' : '') : '—'
+    // 处置（s06-core 契约）: dropped=当场丢弃并记账；injected=真的注入过；pending=已受理、等注入
+    // （重启会重放，不是丢了）；没有触发行才是「—」。
+    const disposition = s.disposition ? (DISPOSITION_TEXT[s.disposition] ?? s.disposition) : '—'
+    const detail = s.disposition === 'dropped' && s.dropped ? '已丢弃: ' + s.dropped : disposition
+    const policy = s.policy ? Object.entries(s.policy).map(([k, v]) => k + '=' + dash(typeof v === 'object' ? JSON.stringify(v) : v)).join(' · ') : null
+    table.append(el('tr', {},
+      el('td', {}, text(s.label ?? s.source), el('span', { class: 'quiet small' }, text(' · ' + (s.source ?? '—')))),
+      el('td', { class: 'quiet small', title: s.triggerId ?? '' }, text(fmtTime(s.at))),
+      // 受理口径 = 到达时的 addressing +（若 router 落了快照）原样透传的 policy 键值，没有就只显示 addressing。
+      el('td', { class: 'quiet small', title: policy ?? '' }, text(policy ? dash(s.addressing) + ' · ' + policy : dash(s.addressing))),
+      el('td', { class: 'quiet small' }, text(detail)),
+      el('td', { class: 'quiet small', title: queue.lastError ?? '' }, text(queueText)),
+      el('td', { class: 'quiet small' },
+        text('触发 ' + (s.counts?.triggers ?? 0) + ' · 丢弃 ' + (s.counts?.dropped ?? 0) + ' · 注入 ' + (s.counts?.injected ?? 0)))))
+  }
+  box.append(table)
+  // 去重键只读展示：飞书侧就是 feishu-<messageId>，同一条消息重复投递不会再落第二条 trigger。
+  const keys = sources.filter(s => s.dedupKey).map(s => (s.label ?? s.source) + ' → ' + s.dedupKey)
+  if (keys.length) box.append(el('p', { class: 'quiet small' }, text('去重键: ' + keys.join('；'))))
 }
 
 /* ---------- 设置 ---------- */

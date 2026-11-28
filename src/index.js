@@ -219,6 +219,10 @@ export function apply(ctx, rawConfig) {
       await ctx.sessionPersistence.flush()
       return { sessionId: value.sessionId ?? value.session?.id }
     },
+    // S06 显式停止（停 / 停止）: the router stops exactly ONE session through this port — the installed DSH
+    // SessionCancelRequest shape is { sessionId } (no invented fields). Authorization stays with the caller:
+    // the router only reaches here after the existing owner/actor check, so this never widens scope.
+    cancel: request => sessionController.cancel({ sessionId: request.sessionId }, deadline(30_000)),
   }
   // GUI 工作区 (#52): ctx.get 动态探测（不放 inject 声明——旧版 DSH 无该服务时插件仍须可加载）。
   // 会话只能「出生即归位」（create({ workspaceId })）——已创建会话无任何归位 API（cwd 严格校验）。
@@ -231,8 +235,11 @@ export function apply(ctx, rawConfig) {
   // 飞书入口 (#68): OFF unless config.feishu.enabled. With credentials present the WSClient long connection
   // starts at boot; the same source scans recorded feishu reply intents on the 1s tick (阶段 2 留的通道).
   const feishu = new FeishuSource({
-    store, registry: hub.registry, sessions, config: config.feishu, chiefConfig: config.chief, logger: ctx.logger, placer,
+    store, config: config.feishu, logger: ctx.logger,
     credentials: safeGetService(ctx, 'credentials'),
+    // S06 单一入口: with the router port present the source is a pure adapter — it hands the ORIGINAL event to
+    // router.acceptFeishuTrigger() and never prompts a session itself (same port pattern as GitHubSource below).
+    router: hub.router,
   })
   const updateFeishuConnection = () => {
     if (!config.feishu.enabled) { feishu.disconnect(); return }

@@ -97,8 +97,8 @@ patch 结构测试复用仓内先例 `scripts/test-runtime.mjs` 的解析链：`
 - **扫码绑定**：设备授权回调取得的应用绑定先写入 DSH 宿主凭据记录，成功后才建立长连接。面板通过飞书状态接口查看进度和二维码。权限包含发送消息、读取消息、读取会话基本信息和长连接事件订阅。
 - **沿用已有 Bot**：在当前 profile 所用的 DSH 凭据库中，将原应用的 `appId` 和 `appSecret` 存为 `hub-bot/feishu` 下的 `grant` 记录，两项均放在 `payload` 中，可选填 `boundAt`。如果使用其他记录名，将 `feishu.credentialRef` 设置为对应的 `hub-bot/<id>`。保存引用后重新加载插件。请从插件配置中移除旧的 `feishu.appId` 和 `feishu.appSecret`。原绑定来自 `stateDir/feishu-credentials.json` 时也使用相同的迁移步骤。安装版 DSH 默认将宿主凭据库放在对应 `DSH_HOME` 的 `.credentials.yaml`，权限需为 0600。
 - **长连接配置**：凭证落地后插件尝试 application-config patch 设长连接模式——**实测不可行**（2026-11-16：设备流权限包不含 `application:application:patch`，返回 404）；**正式路径是手工一次性配置**：open.feishu.cn/app → 应用 → 事件与回调 → 订阅方式 → 使用长连接接收事件/回调。失败只记日志不阻断。
-- **来信关联**：`im.message.receive_v1` 写入 `feishu-<messageId>` 后交给 L1 总负责人。调用 `reply_source` 或新建任务时使用来信给出的 `triggerRef`，最近消息就能显示对应的回复状态或工单。相同 `triggerRef` 只派单一次。
-- **Policy 代码强制**：bot 自己的消息丢弃；**授权边界在飞书侧**——应用的可用范围与可见成员由飞书管理后台配置，能与 bot 说话即已授权，插件不做二次过滤（原 `openIdAllowlist` 已移除，残留该键的旧配置会被严格校验拒绝）；群聊只有 @bot 的消息成请求（botOpenId 缺省时任何 @ 宽松算）；非文本消息回「暂不支持该消息类型」。
+- **来信关联**：先在同一次 SQLite 写入中保存 `feishu-<messageId>`、到达时的来源及策略和投递意图，再确认收录。现有投递泵依序把消息交给总负责人的 DSH 队列，待投递记录可在重启后恢复。回复或派单时使用原来信的 `triggerRef`，以便面板显示关联结果。
+- **飞书受理规则**：应用可用范围由飞书管理后台配置。只受理私聊或明确 @ 本 Bot 的群消息。缺少真实 `botOpenId` 或 @ 对象不同，会记录丢弃原因。非文本消息记一条「暂不支持该消息类型」回复。明确输入「停」或「停止」会请求停止当前总负责人回合，保留已排队消息。
 - **回复投递**：`reply_source` 带飞书 `triggerRef` 时从来信读取聊天地址，投递成功后显示「已回复」。连续失败五次后可从面板重投。历史记录只有聊天地址时显示「回复未关联」。
 - **凭据状态**：`credentialReason` 区分缺少记录、记录格式不正确和宿主凭据服务不可用。保存失败会显示错误，已有绑定保留最后一次确认的记录。旧明文插件配置在启动时被拒绝并给出迁移提示。
 - dev 实证探针：`POST /hub-bot/api/feishu/simulate` 注入 mock 事件走真实归一化/Policy/注入路径（无真实飞书时实证全链）。

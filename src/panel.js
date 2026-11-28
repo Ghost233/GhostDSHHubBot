@@ -388,6 +388,129 @@ export function readMessageDetail(store, triggerId) {
 }
 
 /**
+ * S06 投喂面（只读投影）: the two intake entries — the Feishu source and the normal owner route — described
+ * ONLY by what the router already persisted (trigger rows + outbox rows). Nothing here is computed from
+ * settings, nothing here is writable, and a fact the router did not record stays null so the panel renders
+ * 「—」 instead of inventing a value (诚实状态). The arrival-time policy snapshot is passed through verbatim
+ * under whatever key the router chose; the panel never guesses or fills it in.
+ */
+const INTAKE_SOURCES = [
+  ['feishu', '飞书入口'],
+  ['route', '负责人路由'],
+]
+
+/** Most relevant delivery row first: failures, then in-flight, then delivered (mirrors REPLY_PRIORITY). */
+const QUEUE_PRIORITY = { failed: 0, held: 1, queued: 1, recorded: 1, sent: 2 }
+
+/**
+ * The arrival-time policy snapshot, if the router persisted one on the trigger row (read-only pass-through).
+ * 契约（s06-core 确认）: 快照是触发行上的顶层 `policy` 字段（{ addressing, chatType, msgType, allowed, reason }），
+ * 没有 `intake`/`policySnapshot` 之类的外层包装。没落库就是 null —— 面板不补、不猜。
+ */
+function policySnapshot(trigger) {
+  const value = trigger.policy
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : null
+}
+
+function pickQueueRow(rows) {
+  let best = null
+  for (const row of rows) {
+    const order = QUEUE_PRIORITY[row.state] ?? 3
+    if (!best) { best = row; continue }
+    const bestOrder = QUEUE_PRIORITY[best.state] ?? 3
+    if (order < bestOrder || (order === bestOrder && String(row.createdAt ?? '') >= String(best.createdAt ?? ''))) best = row
+  }
+  return best
+}
+
+/**
+ * 处置口径 — 只从已落库的事实里选一个词，两个入口共用同一套判断（面板与客户端不再各自猜）:
+ *  - 'dropped'  触发行自带 dropped（router 当场丢弃并记账）
+ *  - 'injected' 触发行有真实注入时间戳（飞书侧注入成功才回写）或票面 lastDelivery.state === 'sent'
+ *               （router markDelivered 只在 prompt 真被宿主接纳后才写）
+ *  - 'pending'  触发行已落库但上面两条都不成立 —— 已受理、等注入（重启会重放，不是丢失）
+ *  - null       这个入口还没有任何触发行
+ */
+function intakeDisposition(trigger, ticket) {
+  if (!trigger) return null
+  if (trigger.dropped) return 'dropped'
+  if (trigger.policy?.mode === 'interrupt') return trigger.interruptAt ? 'interrupt-requested' : 'interrupt'
+  if (trigger.injectedAt != null) return 'injected'
+  if (ticket?.lastDelivery?.state === 'sent') return 'injected'
+  return 'pending'
+}
+
+function intakeProjection({ triggers, tickets, outbox, generatedAt }) {
+  const ticketByTrigger = new Map()
+  for (const ticket of tickets) if (ticket.triggerId) ticketByTrigger.set(ticket.triggerId, ticket)
+  const rowsByTicket = new Map()
+  const rowsByTrigger = new Map()
+  const push = (map, key, row) => { const list = map.get(key); if (list) list.push(row); else map.set(key, [row]) }
+  for (const row of outbox) {
+    if (row.ticketId) push(rowsByTicket, row.ticketId, row)
+    if (row.triggerId) push(rowsByTrigger, row.triggerId, row)
+  }
+  const emptyQueue = { state: null, attempts: 0, nextRetryAt: null, lastError: null, rows: 0 }
+  const sources = INTAKE_SOURCES.map(([source, label]) => {
+    const mine = triggers.filter(trigger => (trigger.kind ?? null) === source)
+    // 计数就是列表长度，口径与「处置」列一致：飞书侧注入成功才回写 injectedAt；route 侧由票面
+    // lastDelivery.state === 'sent' 判定（router markDelivered 只在 prompt 真被宿主接纳后才写）。
+    const counts = {
+      triggers: mine.length,
+      dropped: mine.filter(trigger => Boolean(trigger.dropped)).length,
+      injected: mine.filter(trigger => intakeDisposition(trigger, ticketByTrigger.get(trigger.id) ?? null) === 'injected').length,
+    }
+    const last = mine.reduce((best, trigger) => (!best || String(trigger.at ?? '') >= String(best.at ?? '') ? trigger : best), null)
+    if (!last) {
+      return { source, label, at: null, triggerId: null, addressing: null, dropped: null, injectedAt: null,
+        ownerId: null, ticketId: null, policy: null, dedupKey: null, disposition: null, queue: { ...emptyQueue }, counts }
+    }
+    const ticket = ticketByTrigger.get(last.id) ?? null
+    const linked = new Map()
+    for (const row of rowsByTrigger.get(last.id) ?? []) linked.set(row.id, row)
+    for (const row of ticket ? rowsByTicket.get(ticket.id) ?? [] : []) linked.set(row.id, row)
+    const queueRow = pickQueueRow([...linked.values()])
+    return {
+      source,
+      label,
+      at: last.at ?? null,
+      triggerId: last.id,
+      // 到达时的受理口径: 触发行自带的 addressing（feishu 源归一化产物 / 授权记录），没有就是 null。
+      addressing: last.source?.addressing ?? last.authorization?.addressing ?? null,
+      dropped: last.dropped ?? null,
+      injectedAt: last.injectedAt ?? null,
+      // 归属人：触发行自己写了就用它，否则用这张票面上的 owner（都是已落库的事实，不推断）。
+      ownerId: last.ownerId ?? ticket?.owner ?? null,
+      ticketId: ticket?.id ?? null,
+      policy: policySnapshot(last),
+      // 去重键 = 触发行 id（feishu 侧是 feishu-<messageId>；route 侧是 router 生成/回填的引用）。
+      dedupKey: last.id,
+      disposition: intakeDisposition(last, ticket),
+      queue: {
+        state: queueRow?.state ?? null,
+        attempts: queueRow?.attempts ?? 0,
+        nextRetryAt: queueRow?.nextRetryAt ?? null,
+        lastError: queueRow?.lastError ?? null,
+        rows: linked.size,
+      },
+      counts,
+    }
+  })
+  return { generatedAt, sources }
+}
+
+/** Standalone entry point for callers that hold only a Store (tests, dev API). */
+export function buildIntakePolicy(store, { now } = {}) {
+  const readAll = table => store.db.prepare('SELECT value FROM ' + table).all().map(r => JSON.parse(String(r.value)))
+  return intakeProjection({
+    triggers: readAll('trigger'),
+    tickets: readAll('ticket'),
+    outbox: readAll('outbox'),
+    generatedAt: (now ?? (() => new Date().toISOString()))(),
+  })
+}
+
+/**
  * The 三问 overview (spec「观测性：独立 web 面板」):
  *  1. 什么状态 — every ticket with its stage + stageText 朗读, grouped client-side (计数 = 列表长度);
  *  2. 在干什么 — the ticket face facts (report 四段, pendingConfirm, question, assignments);
@@ -397,14 +520,16 @@ export function readMessageDetail(store, triggerId) {
  */
 export function buildOverview({ store, registry, health, now, listDir }) {
   const readAll = table => store.db.prepare('SELECT value FROM ' + table).all().map(r => JSON.parse(String(r.value)))
-  const triggers = new Map(readAll('trigger').map(t => [t.id, t]))
+  const triggerRows = readAll('trigger')
+  const triggers = new Map(triggerRows.map(t => [t.id, t]))
   const owners = registry.list().map(o => ({
     id: o.id, role: o.role, kind: o.kind, workspace: o.workspace ?? null, cwd: o.cwd,
     sessionId: o.sessionId ?? null, status: o.status, transient: o.transient === true, recycled: o.recycled === true,
     createdAt: o.createdAt ?? null, updatedAt: o.updatedAt ?? null,
   }))
   const ownerById = new Map(owners.map(o => [o.id, o]))
-  const tickets = readAll('ticket').map(t => {
+  const ticketRows = readAll('ticket')
+  const tickets = ticketRows.map(t => {
     const trigger = t.triggerId ? triggers.get(t.triggerId) : undefined
     const owner = ownerById.get(t.owner)
     const row = {
@@ -463,6 +588,8 @@ export function buildOverview({ store, registry, health, now, listDir }) {
     .filter(row => row.kind === 'feishu' && feishuSelfTestMarker(triggers.get(row.id)?.source?.messageId) && nowMs - Date.parse(row.at) <= 120_000)
     .map(({ id, dropped, reply }) => ({ id, dropped, reply }))
   const unprocessedTriggers = projected.filter(row => row.unprocessed).length
+  // S06: 投喂面口径只读投影 — 完全由上面已读出的 trigger/ticket/outbox 行推导，不读设置、不写任何东西。
+  const intake = intakeProjection({ triggers: triggerRows, tickets: ticketRows, outbox: readAll('outbox'), generatedAt })
   return {
     generatedAt,
     owners,
@@ -470,6 +597,7 @@ export function buildOverview({ store, registry, health, now, listDir }) {
     recentTriggers,
     selfTests,
     unprocessedTriggers,
+    intake,
     health: health ?? {},
   }
 }

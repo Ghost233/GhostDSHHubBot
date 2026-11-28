@@ -324,6 +324,28 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       kindFeishu: '飞书',
       kindGithub: 'GitHub',
       kindRoute: '直派',
+      intakeSection: '投喂口径（只读）',
+      intakeHint: '两个入口各自生效的受理口径、去重键与队列状态，全部取自已落库的触发行与投递行；未记录的事实显示为 —。',
+      intakeEmpty: '还没有投喂记录',
+      intakeSource: '入口',
+      intakeLastAt: '最近受理',
+      intakePolicy: '受理口径',
+      intakeDisposition: '处置',
+      intakeQueue: '队列',
+      intakeCounts: '累计',
+      intakeDedup: '去重键',
+      intakeDropped: '已丢弃',
+      intakeInjected: '已注入',
+      intakePending: '待注入',
+      intakeInterrupt: '停止请求',
+      intakeInterruptRequested: '已请求停止',
+      intakeTriggers: '触发',
+      intakeQueueAttempt: '第 {n} 次',
+      queueQueued: '排队中',
+      queueHeld: '暂缓',
+      queueRecorded: '待发送',
+      queueSent: '已送达',
+      queueFailed: '失败',
       droppedLabel: '未受理',
       healthDetailRetry: '重试中',
       healthDetailDead: '投递失败（死信）',
@@ -657,6 +679,28 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       kindFeishu: 'Feishu',
       kindGitHub: 'GitHub',
       kindRoute: 'Direct',
+      intakeSection: 'Intake policy (read-only)',
+      intakeHint: 'The effective intake policy, dedup key and queue state for both entries, read straight from persisted trigger and delivery rows. Facts that were not recorded show as —.',
+      intakeEmpty: 'No intake records yet',
+      intakeSource: 'Entry',
+      intakeLastAt: 'Last accepted',
+      intakePolicy: 'Policy',
+      intakeDisposition: 'Disposition',
+      intakeQueue: 'Queue',
+      intakeCounts: 'Totals',
+      intakeDedup: 'Dedup key',
+      intakeDropped: 'dropped',
+      intakeInjected: 'injected',
+      intakePending: 'awaiting injection',
+      intakeInterrupt: 'Stop request',
+      intakeInterruptRequested: 'Stop requested',
+      intakeTriggers: 'triggers',
+      intakeQueueAttempt: 'attempt {n}',
+      queueQueued: 'queued',
+      queueHeld: 'held',
+      queueRecorded: 'pending send',
+      queueSent: 'delivered',
+      queueFailed: 'failed',
       droppedLabel: 'dropped',
       healthDetailRetry: 'retrying',
       healthDetailDead: 'failed deliveries (dead letters)',
@@ -1646,7 +1690,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
 
         var boardSections = [
           ['hub-bot-overview-title', 'statusSection'], ['hub-bot-needs-title', 'needsCard'],
-          ['hub-bot-stream-title', 'ticketsSection'], ['hub-bot-recent-title', 'recentSection'],
+          ['hub-bot-stream-title', 'ticketsSection'], ['hub-bot-intake-title', 'intakeSection'],
+          ['hub-bot-recent-title', 'recentSection'],
           ['hub-bot-owners-title', 'ownersSection'], ['hub-bot-settings', 'settingsDivider'],
         ];
         var boardScrollGap = 16;
@@ -2084,6 +2129,73 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var healthItems = healthProblems(overview.health || {}, t);
 
           var recent = overview.recentTriggers || [];
+          // S06 投喂口径（只读）: 只把 overview.intake 里已落库的事实念出来——没有输入框、没有保存按钮，
+          // 缺记录就显示 —（不猜、不补、不伪造处置结果）。
+          var intakeSources = (overview.intake && overview.intake.sources) || [];
+          var cellHeadStyle = { textAlign: 'left', padding: '4px 8px', fontWeight: 600, whiteSpace: 'nowrap', borderBottom: '1px solid rgba(127,127,127,0.2)' };
+          var cellStyle = { padding: '4px 8px', verticalAlign: 'top' };
+          function intakeDash(value) {
+            return value === null || value === undefined || value === '' ? '—' : String(value);
+          }
+          function renderIntake() {
+            // 旧后端没有 intake 投影时整块不出现——不拿「没有数据」冒充「没有记录」。
+            if (!overview.intake) return null;
+            function queueText(queue) {
+              if (!queue || !queue.state) return '—';
+              var label = t('queue' + String(queue.state).charAt(0).toUpperCase() + String(queue.state).slice(1)) || queue.state;
+              return queue.attempts ? label + ' · ' + fill(t('intakeQueueAttempt'), queue.attempts) : label;
+            }
+            function disposition(entry) {
+              // 处置口径由 src/panel.js 统一判定（disposition），客户端只翻译，不自己再猜一遍。
+              if (entry.disposition === 'dropped') return t('intakeDropped') + (entry.dropped ? ': ' + String(entry.dropped).slice(0, 24) : '');
+              if (entry.disposition === 'injected') return t('intakeInjected');
+            if (entry.disposition === 'interrupt') return t('intakeInterrupt');
+            if (entry.disposition === 'interrupt-requested') return t('intakeInterruptRequested');
+              // pending = 已受理但还没注入时间戳（重启会重放），不是丢失，也不是已注入。
+              if (entry.disposition === 'pending') return t('intakePending');
+              return '—';
+            }
+            function policyText(entry) {
+              if (!entry.policy) return '—';
+              return Object.keys(entry.policy).map(function (key) {
+                var value = entry.policy[key];
+                return key + '=' + (value && typeof value === 'object' ? JSON.stringify(value) : intakeDash(value));
+              }).join(' · ');
+            }
+            var head = h('tr', null,
+              h('th', { style: cellHeadStyle }, t('intakeSource')),
+              h('th', { style: cellHeadStyle }, t('intakeLastAt')),
+              h('th', { style: cellHeadStyle }, t('intakePolicy')),
+              h('th', { style: cellHeadStyle }, t('intakeDisposition')),
+              h('th', { style: cellHeadStyle }, t('intakeQueue')),
+              h('th', { style: cellHeadStyle }, t('intakeCounts')));
+            var rows = intakeSources.map(function (entry) {
+              var counts = entry.counts || {};
+              return h('tr', { key: entry.source },
+                h('td', { style: cellStyle }, (entry.label || entry.source) + ' · ' + intakeDash(entry.source)),
+                h('td', { style: Object.assign({}, cellStyle, settingsHintStyle), title: entry.triggerId || '' },
+                  entry.at ? hhmm(entry.at) : '—'),
+                h('td', { style: Object.assign({}, cellStyle, settingsHintStyle), title: policyText(entry) },
+                  intakeDash(entry.addressing), entry.policy ? ' · ' + policyText(entry) : ''),
+                h('td', { style: Object.assign({}, cellStyle, settingsHintStyle) }, disposition(entry)),
+                h('td', { style: Object.assign({}, cellStyle, settingsHintStyle), title: entry.queue && entry.queue.lastError ? entry.queue.lastError : '' }, queueText(entry.queue)),
+                h('td', { style: Object.assign({}, cellStyle, settingsHintStyle) },
+                  t('intakeTriggers') + ' ' + intakeDash(counts.triggers) + ' · ' + t('intakeDropped') + ' ' + intakeDash(counts.dropped) + ' · ' + t('intakeInjected') + ' ' + intakeDash(counts.injected)));
+            });
+            var dedup = intakeSources.filter(function (entry) { return entry.dedupKey; })
+              .map(function (entry) { return (entry.label || entry.source) + ' → ' + entry.dedupKey; });
+            return h('section', { id: 'hub-bot-intake', style: sectionStyle, 'aria-labelledby': 'hub-bot-intake-title' },
+              h('h3', { id: 'hub-bot-intake-title', tabIndex: -1, className: 'hb-scroll-target', style: Object.assign({}, sectionTitleStyle, { marginTop: 0 }) }, t('intakeSection')),
+              h('p', { style: Object.assign({}, settingsHintStyle, { margin: '0 0 8px' }) }, t('intakeHint')),
+              intakeSources.length === 0
+                ? h('p', { style: settingsHintStyle }, t('intakeEmpty'))
+                : h('div', { style: { overflowX: 'auto' } },
+                    h('table', { className: 'hb-intake-table', style: { borderCollapse: 'collapse', width: '100%', fontSize: '12px' } },
+                      h('thead', null, head), h('tbody', null, rows))),
+              dedup.length
+                ? h('p', { style: Object.assign({}, settingsHintStyle, { margin: '8px 0 0' }) }, t('intakeDedup') + ': ' + dedup.join('；'))
+                : null);
+          }
           var recentFiltered = recent.filter(function (tr) {
             if (recentKind && tr.kind !== recentKind) return false;
             if (recentDroppedOnly && !tr.dropped) return false;
@@ -2731,6 +2843,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                         stagePill(stage, (list[0].stageText || stage) + ' · ' + list.length)),
                       h('div', { style: { marginTop: '8px' } }, rows));
                   })),
+            renderIntake(),
             renderRecentMessages(),
             h('section', { style: sectionStyle, id: 'hub-bot-owners', 'aria-labelledby': 'hub-bot-owners-title' },
               h('h3', { id: 'hub-bot-owners-title', tabIndex: -1, className: 'hb-scroll-target', style: Object.assign({}, sectionTitleStyle, { marginTop: 0 }) }, t('ownersSection'),
