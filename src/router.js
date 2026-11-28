@@ -48,6 +48,12 @@ function isMissingSession(error) {
   return /session\b[^\n]*\bnot found/i.test(message) || /absent from persistence|unknown session/i.test(message)
 }
 
+function githubReplyTarget(source) {
+  if (source?.kind !== 'github' || typeof source.repo !== 'string' || !/^[a-z0-9_-]+[/][a-z0-9_.-]+$/i.test(source.repo)
+    || !Number.isSafeInteger(source.issueNumber) || source.issueNumber < 1) return null
+  return 'github:' + source.repo + ':' + source.issueNumber
+}
+
 function ownerSwitchCommand(text) {
   if (typeof text !== 'string' || !/^[/]hub-switch(?:\s|$)/.test(text)) return null
   const match = /^[/]hub-switch[ \t]+(wait|stop|status|cancel|retry-archive)[ \t]+([^\r\n]+)$/.exec(text.trim())
@@ -165,9 +171,8 @@ export class Router {
     }
     if (!row.ticketId) return false
     const ticket = this.tasks.getTicket(row.ticketId)
-    if (row.kind === 'approved-owner-inject') {
-      const requestId = row.requestId.slice('hub-bot-approved-'.length)
-      if (this.#currentDeferredWork(row.ticketId, requestId)) this.tasks.fail({ ticketId: ticket.id, reason })
+    if (row.kind === 'approved-owner-inject' || this.#isLegacyApprovedRow(row, ticket)) {
+      if (this.#currentApprovedWork(row)) this.tasks.fail({ ticketId: ticket.id, reason })
       return true
     }
     if (row.kind === 'background-recovery') {
@@ -194,7 +199,15 @@ export class Router {
     if (target?.ownerId && target.sessionId && (owner.sessionId !== target.sessionId || this.sessions.isArchived?.(target.sessionId))) {
       throw new RouterError('deferred-target-invalid', 'The original owner session is unavailable. Request a new confirmation for the current session.')
     }
+    if (target?.sessionId && !target.ownerId && !this.#isConfirmedWorker(ticket, target.sessionId)) {
+      throw new RouterError('deferred-target-invalid', 'The original execution session is unavailable. Request a new confirmation for a different target.')
+    }
     return { ticket, owner }
+  }
+
+  #isConfirmedWorker(ticket, sessionId) {
+    return typeof sessionId === 'string' && Boolean(sessionId) && ticket.workerSession?.sessionId === sessionId
+      && !this.registry.isOwnerSession(sessionId) && !this.sessions.isArchived?.(sessionId)
   }
 
   async #fulfillDeferred(request) {
@@ -203,8 +216,8 @@ export class Router {
     if (target && !request.target.ownerId) {
       const worker = await this.sessions.workerInfo?.(target)
       const current = this.#requireCurrentApproval(request.requestId)
-      if (!worker || this.registry.isOwnerSession(target) || this.sessions.isArchived?.(target)
-        || ['hub-bot-owner', 'hub-bot-router'].includes(worker.agentPreset) || !worker.cwd || !isWithinCwd(current.owner.cwd, worker.cwd)) {
+      if (!worker || ['hub-bot-owner', 'hub-bot-router'].includes(worker.agentPreset)
+        || !worker.cwd || !isWithinCwd(current.owner.cwd, worker.cwd)) {
         throw new RouterError('deferred-target-invalid', 'The original execution session is unavailable. Request a new confirmation for a different target.')
       }
     }
@@ -367,13 +380,19 @@ export class Router {
         body: '[您的答复 ' + request.ticketId + '] ' + request.outcome.text,
       })
     } else if (request.status === 'expired') {
-      const feishu = request.source.kind === 'feishu' && request.source.chatId
-      insertOutbox(this.store, {
-        id: 'out-expiry-' + request.requestId, kind: 'reply', ticketId: request.ticketId, triggerId: request.source.triggerId,
-        to: feishu ? 'feishu:chat:' + request.source.chatId : 'dsh:session:chief',
-        state: feishu ? 'recorded' : 'queued', requestId: 'hub-bot-expiry-' + request.requestId,
+      const source = request.source
+      const destination = source.kind === 'feishu' && source.chatId ? 'feishu:chat:' + source.chatId : githubReplyTarget(source)
+      const notification = insertOutbox(this.store, {
+        id: 'out-expiry-' + request.requestId, kind: 'reply', ticketId: request.ticketId, triggerId: source.triggerId,
+        to: destination ?? 'dsh:session:chief',
+        state: destination ? 'recorded' : 'queued', requestId: 'hub-bot-expiry-' + request.requestId,
         body: '请求 ' + request.requestId + ' 已过期。',
       }, () => Date.parse(this.now()))
+      const ticket = this.tasks.getTicket(request.ticketId)
+      if (destination && this.#ensureRun(ticket)) {
+        if (ticket.stage === 'blocked') this.runs.recordResult(ticket.id, { kind: 'blocked', at: ticket.updatedAt })
+        this.runs.linkOutbox(ticket.id, notification.id)
+      }
     }
   }
 
@@ -397,12 +416,12 @@ export class Router {
     return ticket
   }
 
-  async #reconcileDeferredPrompt(sessionId, promptId) {
+  async #reconcilePromptReceipt(sessionId, promptId, kind = 'answer') {
     if (!sessionId || this.store.closed) return null
     const admitted = await this.sessions.hasPromptReceipt?.({ sessionId, requestId: promptId })
     if (this.store.closed || admitted === false) return null
     if (admitted === true) return { sessionId }
-    throw new RouterError('answer-receipt-unavailable', 'The previous answer delivery could not be verified.')
+    throw new RouterError(kind + '-receipt-unavailable', 'The previous ' + kind + ' delivery could not be verified.')
   }
 
   async #admitDeferredPrompt(request, promptId, sessionId, send) {
@@ -411,7 +430,7 @@ export class Router {
     if (attemptedSessionId && (attemptedSessionId !== sessionId || this.sessions.isArchived?.(sessionId))) {
       // Host prompt IDs deduplicate within a session. A retry on a different session must first
       // establish whether the previous session accepted it before the local receipt was written.
-      const delivery = await this.#reconcileDeferredPrompt(attemptedSessionId, promptId)
+      const delivery = await this.#reconcilePromptReceipt(attemptedSessionId, promptId)
       if (delivery) return delivery
     }
     if (this.store.closed || !this.#currentDeferredWork(request.ticketId, requestId)) return null
@@ -454,7 +473,7 @@ export class Router {
     const checkWorkerReceipt = worker && attempted === request.receiver.sessionId && typeof this.sessions.hasPromptReceipt === 'function'
     let delivered
     if (checkWorkerReceipt) {
-      delivered = (await this.#reconcileDeferredPrompt(attempted, row.requestId)) ?? undefined
+      delivered = (await this.#reconcilePromptReceipt(attempted, row.requestId)) ?? undefined
       if (this.store.closed) return inactive
     }
     let unavailable
@@ -490,7 +509,7 @@ export class Router {
       // A ticket may advance or its original worker may disappear after admission. Reconcile historical
       // evidence before recording failure, and never prompt from this recovery path.
       if (attempted && !checkWorkerReceipt && (!worker || attempted === request.receiver.sessionId)) {
-        delivered = await this.#reconcileDeferredPrompt(attempted, row.requestId)
+        delivered = await this.#reconcilePromptReceipt(attempted, row.requestId)
       }
       if (!delivered && unavailable && current()) throw Object.assign(new Error(unavailable), { permanent: true })
       if (!delivered) return skipped()
@@ -721,14 +740,31 @@ export class Router {
     }
     if (sources.every(entry => entry.injectedAt)) return
     const text = sources.map(feishuPrompt).join('\n\n')
-    const result = await this.#promptOwner('chief', null, row.requestId, text, { model: this.config.chief?.model })
+    const admit = async (sessionId, send) => {
+      const prior = this.getTrigger(row.triggerId)?.intakeAttemptSessionId
+      if (prior && prior !== sessionId) {
+        const known = await this.#reconcilePromptReceipt(prior, row.requestId, 'intake')
+        if (known || this.store.closed) return known
+      }
+      if (prior !== sessionId) this.#updateTrigger({ ...this.getTrigger(row.triggerId), intakeAttemptSessionId: sessionId })
+      try { return await send() } catch (error) {
+        if (!this.store.closed && prior !== sessionId && (isMissingSession(error) || error?.code === 'session/not-found')) {
+          const { intakeAttemptSessionId, ...current } = this.getTrigger(row.triggerId)
+          if (intakeAttemptSessionId === sessionId) this.#updateTrigger(current)
+        }
+        throw error
+      }
+    }
+    const result = await this.#promptOwner('chief', null, row.requestId, text, { model: this.config.chief?.model, admit })
     if (result?.postponeMs) return result
     if (this.store.closed || !result?.sessionId) return
     this.#persistWork(() => {
       const at = this.now()
       for (const { id } of sources) {
         const latest = this.getTrigger(id)
-        if (latest && !latest.injectedAt) this.#updateTrigger({ ...latest, injectedAt: at, injectedSessionId: result.sessionId })
+        if (!latest || latest.injectedAt) continue
+        const { intakeAttemptSessionId: _, ...accepted } = latest
+        this.#updateTrigger({ ...accepted, injectedAt: at, injectedSessionId: result.sessionId })
       }
     })
   }
@@ -808,7 +844,7 @@ export class Router {
       if (ticket.deferred) continue
       const at = ticket.pendingConfirm?.at
       if (!at) continue
-      if (nowMs - Date.parse(at) <= CONFIRM_TIMEOUT_MS) continue
+      if (nowMs - Date.parse(at) < CONFIRM_TIMEOUT_MS) continue
       try {
         this.tasks.cancel(ticket.id, { by: 'system', reason: '确认超过 24 小时未回应，自动取消', kind: 'timeout' })
         this.#notifyTerminal(ticket.id)
@@ -824,17 +860,18 @@ export class Router {
    * leaves the ticket at person/confirm — the user may retry, reject or cancel.
    */
   async #confirmPendingFork(owner, ticket, ticketId, approvalId) {
+    // No execution can be authorized by a legacy conversation alone.
+    if (!ticket.authorization) throw new RouterError('authorization-missing', 'The original fork authorization is unavailable.')
+    const source = ticket.pendingConfirm?.action?.sessionId
+    if (!approvalId && source && !this.#isConfirmedWorker(ticket, source)) {
+      throw new RouterError('legacy-confirm-target-invalid', 'The original execution session is unavailable. Request a new confirmation.')
+    }
     const checkConfirmation = approvalId ? () => this.#requireCurrentApproval(approvalId) : undefined
     let result
     try {
       result = await confirmTicketFork({ tasks: this.tasks, sessions: this.sessions, ticketId, checkConfirmation })
     } catch (error) {
       throw translateTaskError(error, (code, message) => new RouterError(code, message))
-    }
-    // 缺上下文升级不编造： the fork executed, but without an authorization record the continuation must not run.
-    if (!ticket.authorization) {
-      try { this.tasks.escalate({ ticketId, reason: '授权记录缺失（票面权威），fork 已执行但拒绝凭会话叙事续作' }) } catch { /* stage may not allow it */ }
-      throw new RouterError('authorization-missing', 'route_to_owner: ticket ' + ticketId + ' has no authorization record — refusing to act on a guess')
     }
     const auth = ticket.authorization
     const ensured = await this.#ensureSession(owner)
@@ -865,17 +902,24 @@ export class Router {
     }
     const auth = ticket.authorization
     if (action.entry === 'owner-inject') {
+      if (!this.#isConfirmedWorker(ticket, action.sessionId)) {
+        throw new RouterError('deferred-target-invalid', 'The original execution session is unavailable. Request a new confirmation.')
+      }
       // L2 发起、被挂起的执行会话注入: 确认后按票面存储的完整文本原样直投 (文本构建时已携授权记录)。
       // 不经 outbox 的理由: runner 的 inject 行恒投 owner 会话 (#deliverRow 先 ensureSession), 而这里的目标是票面
       // 存储的执行会话; 执行会话归 L2 管理、失败由 L2 感知, 一次性放行不需要路由注入的重建/重投语义。
       // The stored approval prevents replay if the host accepted the prompt before returning a result.
-      const requestId = approvalId ? 'hub-bot-approved-' + approvalId : 'hub-bot-owner-' + this.ids.uuid()
-      await this.sessions.prompt({ requestId, sessionId: action.sessionId, mode: 'queue', content: [{ type: 'text', text: action.text }] })
+      const requestId = approvalId ? 'hub-bot-approved-' + approvalId : 'hub-bot-legacy-worker-' + ticketId + '-' + (ticket.transitions?.length ?? 0)
+      const receipt = await this.sessions.prompt({ requestId, sessionId: action.sessionId, mode: 'queue', content: [{ type: 'text', text: action.text }] })
+      if (receipt?.accepted === false) throw new RouterError('worker-not-admitted', 'The Host declined the stored execution request.')
       if (approvalId) this.#requireCurrentApproval(approvalId)
       try { this.tasks.confirm({ ticketId, result: { injected: { entry: action.entry, sessionId: action.sessionId, requestId } }, by: 'user' }) } catch (error) { throw translateTaskError(error, (code, message) => new RouterError(code, message)) }
       return { ownerId: owner.id, sessionId: action.sessionId, ticketId, requestId, createdSession: false, rebuilt: false, deduped: false, confirmed: true, stage: 'working' }
     }
-    const fixedSessionId = approvalId ? ticket.deferred.target?.sessionId : undefined
+    const fixedSessionId = approvalId ? ticket.deferred.target?.sessionId : ticket.targetSession
+    if (!approvalId && (!fixedSessionId || owner.sessionId !== fixedSessionId || this.sessions.isArchived?.(fixedSessionId))) {
+      throw new RouterError('legacy-confirm-target-invalid', 'The original owner session is unavailable. Request a new confirmation for the current session.')
+    }
     const ensured = fixedSessionId ? { sessionId: fixedSessionId, created: false }
       : await (owner.role === 'chief' ? this.#ensureChiefSession() : this.#ensureSession(owner))
     if (approvalId) this.#requireCurrentApproval(approvalId)
@@ -901,9 +945,11 @@ export class Router {
         .map(raw => JSON.parse(String(raw.value)))
         .filter(ticket => ticket.recoveryPending === true && normalizeStage(ticket.stage) === 'working')
         .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)))
+      const pendingById = new Map(pending.map(ticket => [ticket.id, ticket]))
       const queuedRecoveries = new Set(this.listOutbox()
         .filter(row => ['queued', 'held'].includes(row.state) && (['background-recovery', 'deferred-answer', 'approved-owner-inject'].includes(row.kind)
-          || (row.kind === 'inject' && row.body.startsWith('[hub-bot 恢复 ' + row.ticketId + ']'))))
+          || (row.kind === 'inject' && (row.body.startsWith('[hub-bot 恢复 ' + row.ticketId + ']')
+            || this.#isLegacyApprovedRow(row, pendingById.get(row.ticketId))))))
         .map(row => row.ticketId))
       const perOwner = new Map()
       let resumed = 0
@@ -1027,14 +1073,14 @@ export class Router {
   }
 
   /** Authorized source adapters assign work without waking a management session. */
-  async routeBackground({ ownerId, message, triggerRef, authorization, source }) {
+  async routeBackground({ ownerId, message, triggerRef, authorization, source, canAdmit }) {
     if (!['github', 'timer'].includes(source?.kind) || typeof triggerRef !== 'string' || !triggerRef.trim()
       || typeof authorization?.actor !== 'string' || !authorization.actor.trim()
       || (authorization.source !== source.kind && !this.#hasOriginalTimerAuthorization(source, authorization))
       || (source.kind === 'timer' && (typeof source.timerId !== 'string' || !source.timerId))) {
       throw new RouterError('invalid-background-source', 'background work requires an authorized source and a stable trigger identity')
     }
-    return this.#routeMessage({ ownerId, message, triggerRef, authorization, source })
+    return this.#routeMessage({ ownerId, message, triggerRef, authorization, source, canAdmit })
   }
 
   #hasOriginalTimerAuthorization(source, authorization) {
@@ -1047,17 +1093,18 @@ export class Router {
       && JSON.stringify(trigger.authorization) === JSON.stringify(authorization)
   }
 
-  #routeMessage({ ownerId, message, triggerRef, ticketId, resolution, authorization, source }) {
+  #routeMessage({ ownerId, message, triggerRef, ticketId, resolution, authorization, source, canAdmit }) {
     if (typeof message !== 'string' || !message.trim()) throw new RouterError('message-required', 'route_to_owner: message must be a non-empty string')
     const route = () => this.#serialized('owner:' + ownerId, () =>
-      this.#routeToOwnerLocked({ ownerId, message: message.trim(), triggerRef, ticketId, resolution, authorization, source }))
+      this.#routeToOwnerLocked({ ownerId, message: message.trim(), triggerRef, ticketId, resolution, authorization, source, canAdmit }))
     return ticketId === undefined && triggerRef !== undefined
       ? this.#serialized('trigger:' + triggerRef, route)
       : route()
   }
 
   /** routeToOwner's body, run under the per-owner chain (see routeToOwner). */
-  async #routeToOwnerLocked({ ownerId, message, triggerRef, ticketId, resolution, authorization, source }) {
+  async #routeToOwnerLocked({ ownerId, message, triggerRef, ticketId, resolution, authorization, source, canAdmit }) {
+    if (canAdmit && canAdmit() !== true) throw new RouterError('background-source-paused', 'The background source is no longer enabled or assigned to this owner.')
     const owner = this.registry.get(ownerId)
     if (!owner) throw new RouterError('unknown-owner', 'route_to_owner: unknown owner "' + ownerId + '" — call list_owners first')
     // chief 不是路由目标——但仅约束「新建任务」；带 ticketId 的 resolution 裁决（面板 confirm/reject）
@@ -1222,6 +1269,12 @@ export class Router {
       throw new RouterError('exact-request-required', 'Reply through the original deferred request ID.')
     }
     if (resolution !== undefined) {
+      if (ticket.stage === 'person/confirm' && ticket.pendingConfirm && ['confirm', 'reject'].includes(resolution)) {
+        const openedAt = Date.parse(ticket.pendingConfirm.at)
+        if (!Number.isFinite(openedAt) || Date.parse(this.now()) - openedAt >= CONFIRM_TIMEOUT_MS) {
+          throw new RouterError('confirm-expired', 'The original confirmation has expired. Request a new confirmation.')
+        }
+      }
       if (resolution === 'accept') {
         try {
           this.tasks.accept(ticketId)
@@ -1349,7 +1402,13 @@ export class Router {
     if (row.kind === 'owner-switch-control') return this.#deliverOwnerSwitch(row)
     if (row.kind === 'handoff-summary-generate') return this.#generateFeishuHandoff(row)
     if (row.kind === 'background-report') return this.#deliverBackgroundReport(row)
-    if (row.kind === 'deferred-answer') return this.#deliverDeferredAnswer(row)
+    if (row.kind === 'deferred-answer') {
+      const request = this.deferred?.get(row.id.slice('out-answer-'.length))
+      if (request?.receiver.kind === 'worker' && this.tasks.getTicket(request.ticketId)?.background?.kind === 'github') {
+        return this.#serialized('background-admission:' + request.ownerId, () => this.#deliverDeferredAnswer(row))
+      }
+      return this.#deliverDeferredAnswer(row)
+    }
     if (row.kind === 'approved-owner-inject') return this.#deliverApprovedOwner(row)
     if (row.kind === 'deferred-decision') {
       if (row.panelDecision) {
@@ -1387,6 +1446,7 @@ export class Router {
     if (row.kind === 'reply') return this.#deliverReply(row)
     if (row.kind !== 'inject' && row.kind !== 'background-recovery') return
     const ticket = this.tasks.getTicket(row.ticketId)
+    if (this.#isLegacyApprovedRow(row, ticket)) return this.#deliverApprovedOwner(row)
     const permanent = (message) => { const error = new Error(message); error.permanent = true; return error }
     if (!ticket) throw permanent('outbox ' + row.id + ': ticket ' + row.ticketId + ' is gone')
     // S01：入队之后票可能已被取消/失败/关闭 —— 结案的票一次都不许注入（也不算投递成功，记 recorded）。
@@ -1423,9 +1483,21 @@ export class Router {
     })
   }
 
+  #isLegacyApprovedRow(row, ticket) {
+    const approval = ticket?.confirmOutcome
+    const injected = approval?.result?.injected
+    return row.kind === 'inject' && approval?.kind === 'confirmed' && ['route', 'follow-up'].includes(injected?.entry)
+      && injected.requestId === row.requestId
+  }
+
+  #currentApprovedWork(row) {
+    if (row.kind === 'approved-owner-inject') return this.#currentDeferredWork(row.ticketId, row.requestId.slice('hub-bot-approved-'.length))
+    const ticket = this.tasks.getTicket(row.ticketId)
+    return ticket?.stage === 'working' && ticket.authorization && this.#isLegacyApprovedRow(row, ticket) ? ticket : null
+  }
+
   async #deliverApprovedOwner(row) {
-    const requestId = row.requestId.slice('hub-bot-approved-'.length)
-    const current = () => this.#currentDeferredWork(row.ticketId, requestId)
+    const current = () => this.#currentApprovedWork(row)
     const ticket = current()
     if (!ticket) return { recorded: true, skipped: 'deferred-no-longer-active' }
     const text = ticket.recoveryPending ? RECOVERY_NOTE + '\n\n' + row.body : row.body
@@ -1542,8 +1614,10 @@ export class Router {
     const text = recovery + timing + row.body + '\n完成后调用 report_background，传入 ticketId=' + ticket.id + ' 及结果摘要或失败原因。没有新信息时可以用 silenceReason="no-change" 静默结束。需要用户输入时调用 ask_user，传入同一个 ticketId。'
     let rebuilt = false
     try {
-      await this.sessions.prompt({ sessionId, requestId: row.requestId, text })
+      const receipt = await this.sessions.prompt({ sessionId, requestId: row.requestId, text })
+      if (receipt?.accepted === false) throw new RouterError('worker-not-admitted', 'The Host declined the background request.')
     } catch (error) {
+      if (this.store.closed) return inactive
       if (!isMissingSession(error) && error?.code !== 'session/not-found') throw error
       const latest = currentTicket()
       if (!latest) return inactive
@@ -1556,9 +1630,11 @@ export class Router {
       if (!sessionId || !rebound || rebound.workerSession?.sessionId !== sessionId) return inactive
       deferred = this.#deferTimerDelivery(rebound, recovering)
       if (deferred) return deferred
-      await this.sessions.prompt({ sessionId, requestId: row.requestId, text })
+      const receipt = await this.sessions.prompt({ sessionId, requestId: row.requestId, text })
+      if (receipt?.accepted === false) throw new RouterError('worker-not-admitted', 'The Host declined the background request.')
       rebuilt = true
     }
+    if (this.store.closed) return inactive
     const latest = this.tasks.getTicket(ticket.id)
     if (!latest) return
     if (!this.#isTerminalTicket(latest)) {
@@ -1567,6 +1643,47 @@ export class Router {
     }
     if (!recovering) this.#mergeTicket(ticket.id, {
       lastDelivery: { state: 'sent', created: !worker, rebuilt, at: this.now() },
+    })
+  }
+
+  /** Stop only the worker captured by an explicit source stop, after any admitted send settles. */
+  async stopBackgroundWorker({ sessionId, targets }) {
+    const skipped = { status: 'skipped' }
+    if (this.store.closed) return skipped
+    const owners = new Set(targets.map(target => this.tasks.getTicket(target.ticketId)?.owner))
+    const [ownerId] = owners
+    if (!ownerId || owners.size !== 1) return skipped
+    return this.#serialized('background-admission:' + ownerId, async () => {
+      const stopTarget = () => {
+        if (this.store.closed || this.registry.isOwnerSession(sessionId) || this.sessions.isArchived?.(sessionId)) return []
+        const stopped = targets.flatMap(({ ticketId, failedAt }) => {
+          const ticket = this.tasks.getTicket(ticketId)
+          return ticket?.owner === ownerId && ticket.stage === 'failed' && ticket.failed?.at === failedAt
+            && ticket.background?.kind === 'github' && ticket.authorization?.source === 'github'
+            && ticket.workerSession?.sessionId === sessionId ? [ticket] : []
+        })
+        if (!stopped.length) return []
+        const conflict = this.store.db.prepare(`
+          SELECT 1 FROM ticket
+          WHERE json_extract(value, '$.stage') NOT IN ('done', 'failed')
+            AND (json_extract(value, '$.workerSession.sessionId') = ? OR json_extract(value, '$.targetSession') = ?)
+          LIMIT 1
+        `).get(sessionId, sessionId)
+        return conflict ? [] : stopped
+      }
+      const stopped = stopTarget()
+      if (!stopped.length) return skipped
+      if (this.sessions.stopBackgroundWork) {
+        const ticketIds = new Set(stopped.map(ticket => ticket.id))
+        const requestIds = this.listOutbox().filter(row => ticketIds.has(row.ticketId)
+          && (['inject', 'background-recovery'].includes(row.kind) || (row.kind === 'deferred-answer' && row.sessionId === sessionId)))
+          .map(row => row.requestId)
+        return this.sessions.stopBackgroundWork({ sessionId, requestIds, isCurrent: () => stopTarget().length > 0 })
+      }
+      if (typeof this.sessions.cancel !== 'function') return skipped
+      const result = await this.sessions.cancel({ sessionId })
+      if (result?.accepted === false) throw new Error('The Host declined the stop request.')
+      return { status: 'cancelled' }
     })
   }
 
@@ -1669,11 +1786,9 @@ export class Router {
 
   #queueBackgroundNotification(ticket, trigger, body, ordinary = false) {
     const source = trigger.source
-    let to, triggerId = trigger.id
-    if (source.kind === 'github' && typeof source.repo === 'string' && /^[a-z0-9_-]+[/][a-z0-9_.-]+$/i.test(source.repo)
-      && Number.isSafeInteger(source.issueNumber) && source.issueNumber > 0) {
-      to = 'github:' + source.repo + ':' + source.issueNumber
-    } else if (source.kind === 'timer' && this.#hasOriginalTimerAuthorization(source, ticket.authorization)) {
+    let to = githubReplyTarget(source)
+    let triggerId = trigger.id
+    if (source.kind === 'timer' && this.#hasOriginalTimerAuthorization(source, ticket.authorization)) {
       to = 'feishu:chat:' + source.origin.chatId
       triggerId = source.origin.triggerId
     }

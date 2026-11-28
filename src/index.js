@@ -211,6 +211,31 @@ export function apply(ctx, rawConfig) {
   const sessionController = ctx.sessionController
   const sessionPersistence = ctx.sessionPersistence
   const promptKey = (sessionId, requestId) => JSON.stringify([store.stateDir, sessionId, requestId])
+  async function hasManagedTurn(sessionId, cursor, requestIds, signal) {
+    if (typeof sessionPersistence.open !== 'function' || !Number.isSafeInteger(cursor) || cursor < 0) return false
+    await sessionPersistence.flush()
+    signal.throwIfAborted()
+    const reader = await sessionPersistence.open(sessionId, 'read', { signal })
+    try {
+      const firstOwn = reader.inheritedEventCount
+      if (reader.id !== sessionId || !Number.isSafeInteger(firstOwn) || firstOwn < 0 || firstOwn > cursor) return false
+      const offset = Math.max(firstOwn, cursor - 511)
+      const { events } = await reader.read(offset, cursor - offset + 1, { signal })
+      if (events.at(-1)?.seq !== cursor) return false
+      let managed = false
+      for (let index = events.length - 1; index >= 0; index--) {
+        const event = events[index]
+        if (event.type === 'turn/end') return false
+        if (event.type === 'turn/start') return managed
+        if (event.type !== 'user/message') continue
+        const { source } = event.data.message ?? event.data
+        if (source?.kind !== 'user' && source?.kind !== 'retry') continue
+        if (!requestIds.has(source.rpcId)) return false
+        managed = true
+      }
+      return false
+    } finally { await reader.close() }
+  }
 
   // The Sessions port of src/router.js over the real sessionController. prompt uses queue mode: an owner Session
   // is event-driven — an injected message wakes it exactly like a person typing (spec「核心原则」2).
@@ -302,6 +327,39 @@ export function apply(ctx, rawConfig) {
     // SessionCancelRequest shape is { sessionId } (no invented fields). Authorization stays with the caller:
     // the router only reaches here after the existing owner/actor check, so this never widens scope.
     cancel: request => sessionController.cancel({ sessionId: request.sessionId }, deadline(30_000)),
+    async stopBackgroundWork({ sessionId, requestIds, isCurrent }) {
+      if (!requestIds.length || typeof sessionController.state !== 'function') return { status: 'skipped' }
+      const signal = deadline(10000)
+      const exactRequests = new Set(requestIds)
+      const address = { sessionId }
+      let accepted = false
+      try {
+        const before = await sessionController.state(address, signal)
+        for (const pending of before.queue ?? []) {
+          if (!exactRequests.has(pending.rpcId) || !isCurrent() || typeof sessionController.updateQueue !== 'function') continue
+          try {
+            const removed = await sessionController.updateQueue({ sessionId, itemId: pending.id, action: { kind: 'remove' } }, signal)
+            accepted ||= removed?.accepted === true
+          } catch (error) {
+            if (error?.code !== 'session/queue-item-not-found') throw error
+          }
+        }
+        if (isCurrent()) {
+          const running = await sessionController.state(address, signal)
+          if (running.running && await hasManagedTurn(sessionId, running.cursor, exactRequests, signal)) {
+            const latest = await sessionController.state(address, signal)
+            if (isCurrent() && latest.running && latest.cursor === running.cursor) {
+              const stopped = await sessionController.cancel(address, signal)
+              if (stopped?.accepted !== true) throw new Error('The Host declined the stop request.')
+              accepted = true
+            }
+          }
+        }
+      } catch (error) {
+        if (error?.code !== 'session/not-found') throw error
+      }
+      return { status: accepted ? 'cancelled' : 'skipped' }
+    },
   }
   // GUI 工作区 (#52): ctx.get 动态探测（不放 inject 声明——旧版 DSH 无该服务时插件仍须可加载）。
   // 会话只能「出生即归位」（create({ workspaceId })）——已创建会话无任何归位 API（cwd 严格校验）。

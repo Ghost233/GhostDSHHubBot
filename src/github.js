@@ -30,6 +30,8 @@ const MAX_GITHUB_ATTEMPTS = 5
 const ISSUE_PAGE_SIZE = 100
 // Leave headroom below the gh buffer even for large, JSON-escaped Markdown bodies.
 const COMMENT_PAGE_SIZE = 30
+const COMMENT_CHECKPOINT_VERSION = 2
+const SOURCE_PAUSED = new Error('GitHub source paused')
 
 // A leading hidden marker survives Markdown rendering without changing the visible reply.
 const REPLY_MARKER = /^<!-- hub-bot-github-reply:([a-f0-9-]{36}) -->\r?\n/
@@ -122,14 +124,13 @@ export class GitHubSource {
 
   /**
    * @param {{ store: import('./store.js').Store, registry: import('./registry.js').OwnerRegistry,
-   *   router: import('./router.js').Router, sessions: object, config: object,
-   *   logger: { info: Function, warn: Function }, gh?: Function, now?: () => string }} deps
+   *   router: import('./router.js').Router, config: object,
+   *   logger: { info: Function, warn: Function }, gh?: Function, git?: Function, now?: () => string }} deps
    */
-  constructor({ store, registry, router, sessions, config, logger, gh, git, now }) {
+  constructor({ store, registry, router, config, logger, gh, git, now }) {
     this.store = store
     this.registry = registry
     this.router = router
-    this.sessions = sessions
     this.config = config ?? {}
     this.logger = logger
     this.gh = gh ?? realGh
@@ -171,23 +172,29 @@ export class GitHubSource {
    * (owner.cwd) resolves its GitHub repo from `git remote get-url origin` — no separate config list to keep
    * in sync. Failures (no origin, not GitHub) are recorded in lastErrors and skipped, never fatal.
    */
-  async #watchedRepos() {
+  async #watchedRepos(canContinue = () => !this.store.closed) {
+    if (!canContinue()) return []
     const watched = []
     const seen = new Set()
     const resolveErrors = {}
     for (const owner of this.registry.list()) {
+      if (!canContinue()) return []
       if (owner.kind !== 'repo' || owner.recycled === true || owner.role === 'chief' || !owner.cwd) continue
+      const registration = { ownerId: owner.id, workspace: owner.workspace, cwd: owner.cwd }
       try {
         const remote = String(await this.git(['-C', owner.cwd, 'remote', 'get-url', 'origin'])).trim()
+        if (!canContinue()) return []
+        if (!this.#registeredOwner(registration)) continue
         const repo = parseGitHubRepo(remote)
         if (!repo) { resolveErrors['owner:' + owner.id] = 'origin is not a GitHub remote: ' + (remote || '(empty)'); continue }
         if (seen.has(repo)) continue
         seen.add(repo)
-        watched.push({ repo, ownerId: owner.id, workspace: owner.workspace, cwd: owner.cwd })
+        watched.push({ repo, ...registration })
       } catch (error) {
         resolveErrors['owner:' + owner.id] = error?.message ?? String(error)
       }
     }
+    if (!canContinue()) return []
     this.resolveErrors = resolveErrors
     this.lastWatched = watched
     return watched
@@ -239,33 +246,51 @@ export class GitHubSource {
   }
 
   async #lookupLogin() {
+    if (!this.#isEnabled()) throw SOURCE_PAUSED
+    let login
     try {
-      const login = await this.#authenticatedLogin()
-      if (this.config.loginAllowlist?.length) return this.config.loginAllowlist
-      this.config.loginAllowlist = [login]
-      this.logger.info('hub-bot github: loginAllowlist resolved from gh auth → %s', login)
-      return this.config.loginAllowlist
+      login = await this.#authenticatedLogin()
     } catch (error) {
+      if (!this.#isEnabled()) throw SOURCE_PAUSED
       if (this.config.loginAllowlist?.length) return this.config.loginAllowlist
       this.logger.warn('hub-bot github: could not resolve the gh login (%s)', error?.message ?? error)
       throw error
     }
+    if (!this.#isEnabled()) throw SOURCE_PAUSED
+    if (this.config.loginAllowlist?.length) return this.config.loginAllowlist
+    this.config.loginAllowlist = [login]
+    this.logger.info('hub-bot github: loginAllowlist resolved from gh auth → %s', login)
+    return this.config.loginAllowlist
+  }
+
+  #isEnabled() {
+    return this.config.enabled === true && !this.store.closed
+  }
+
+  #canUseRepo(repoCfg) {
+    return this.#isEnabled() && Boolean(repoCfg && this.#registeredOwner(repoCfg))
+  }
+
+  #pauseResult() {
+    return this.config.enabled !== true ? { disabled: true } : { skipped: 'source-paused' }
   }
 
   /** One full polling cycle over every repo the registry currently yields. */
   async pollAll() {
     const totals = { triggered: 0, dropped: 0, terminated: 0 }
-    if (this.config.enabled !== true) return { ...totals, disabled: true }
-    const watched = await this.#watchedRepos()
-    if (!watched.length) return totals
+    if (!this.#isEnabled()) return { ...totals, ...this.#pauseResult() }
+    const watched = await this.#watchedRepos(() => this.#isEnabled())
+    if (!this.#isEnabled()) return { ...totals, ...this.#pauseResult() }
+    if (!watched.some(repoCfg => this.#canUseRepo(repoCfg))) return totals
     try {
       await this.#requiredLogin()
     } catch (error) {
+      if (error === SOURCE_PAUSED || !this.#isEnabled()) return { ...totals, ...this.#pauseResult() }
       for (const { repo } of watched) this.lastErrors[repo] = String(error?.message ?? error)
       return totals
     }
     for (const repoCfg of watched) {
-      if (this.config.enabled !== true) break
+      if (!this.#isEnabled()) break
       const result = await this.pollRepo(repoCfg).catch(() => null)
       if (!result) continue
       totals.triggered += result.triggered ?? 0
@@ -273,23 +298,25 @@ export class GitHubSource {
       totals.terminated += result.terminated ?? 0
       if (result.stops?.length) (totals.stops ??= []).push(...result.stops)
     }
-    return totals
+    return this.#isEnabled() ? totals : { ...totals, ...this.#pauseResult() }
   }
 
-  /** Resolves the requested repository from the current registrations each time. */
+  /** Resolves the requested repository from the current registrations before an enabled poll. */
   async pollWatchedRepo(repo) {
-    const watched = await this.#watchedRepos()
+    if (!this.#isEnabled()) return { triggered: 0, dropped: 0, terminated: 0, ...this.#pauseResult() }
+    const watched = await this.#watchedRepos(() => this.#isEnabled())
+    if (!this.#isEnabled()) return { triggered: 0, dropped: 0, terminated: 0, ...this.#pauseResult() }
     const repoCfg = watched.find(w => w.repo === repo)
     return repoCfg ? this.pollRepo(repoCfg) : null
   }
 
   /** A manual and scheduled poll for the same repo share one checkpoint update. */
   async pollRepo(repoCfg) {
-    if (this.config.enabled !== true) return { triggered: 0, dropped: 0, terminated: 0, disabled: true }
+    if (!this.#canUseRepo(repoCfg)) return { triggered: 0, dropped: 0, terminated: 0, ...this.#pauseResult() }
     const { repo } = repoCfg
     if (this.#polls.has(repo)) return this.#polls.get(repo)
     const pending = this.#pollRepo(repoCfg).then(result => {
-      delete this.lastErrors[repo]
+      if (!result.disabled && !result.skipped) delete this.lastErrors[repo]
       return result
     }, error => {
       this.lastErrors[repo] = String(error?.message ?? error)
@@ -304,26 +331,31 @@ export class GitHubSource {
     return this.gh(['api', ...args, '--hostname', 'github.com'])
   }
 
-  async #fetchList(endpoint) {
-    const rows = JSON.parse(String(await this.#githubApi([endpoint])))
+  async #readGitHub(endpoint, canContinue) {
+    if (!canContinue()) throw SOURCE_PAUSED
+    return JSON.parse(String(await this.#githubApi([endpoint])))
+  }
+
+  async #fetchList(endpoint, canContinue) {
+    const rows = await this.#readGitHub(endpoint, canContinue)
     if (!Array.isArray(rows)) throw new Error('Expected GitHub list for ' + endpoint)
     return rows
   }
 
-  async *#commentPages(endpoint, { verifyBoundary = false } = {}) {
+  async *#commentPages(endpoint, canContinue, { verifyBoundary = false } = {}) {
     const separator = endpoint.includes('?') ? '&' : '?'
     const query = endpoint + separator + 'per_page=' + COMMENT_PAGE_SIZE + '&page='
     let previousIds
     // Each page has its own gh deadline and output buffer.
     for (let page = 1; ; page++) {
-      const comments = await this.#fetchList(query + page)
+      const comments = await this.#fetchList(query + page, canContinue)
       for (const comment of comments) {
         if (!isPositiveInteger(comment?.id)) throw new Error('Invalid GitHub comment ID for ' + endpoint)
       }
       // Re-read the preceding page after taking the next offset. A deletion or
       // insertion in the earlier page could otherwise hide an eligible comment.
       if (verifyBoundary && previousIds) {
-        const previous = await this.#fetchList(query + (page - 1))
+        const previous = await this.#fetchList(query + (page - 1), canContinue)
         if (previous.length !== previousIds.length || previous.some((comment, i) => comment?.id !== previousIds[i])) {
           throw new Error('GitHub comment page boundary changed before page ' + page + ' for ' + endpoint)
         }
@@ -334,13 +366,13 @@ export class GitHubSource {
     }
   }
 
-  async #fetchComments(repo, since, cutoff) {
+  async #fetchComments(repo, since, cutoff, canContinue) {
     // GitHub's `since` is exclusive and its timestamps are second-granularity. Revisit
     // the boundary second and let immutable comment IDs prevent replay after edits.
     const inclusive = new Date(Date.parse(since) - 1000).toISOString()
     const endpoint = 'repos/' + repo + '/issues/comments?sort=created&direction=asc&since=' + encodeURIComponent(inclusive)
     const comments = new Map()
-    for await (const page of this.#commentPages(endpoint, { verifyBoundary: true })) {
+    for await (const page of this.#commentPages(endpoint, canContinue, { verifyBoundary: true })) {
       let pastCutoff = false
       for (const comment of page) {
         const created = Date.parse(comment.created_at)
@@ -358,12 +390,12 @@ export class GitHubSource {
     return [...comments.values()].sort((a, b) => a.id - b.id)
   }
 
-  async #fetchNewIssues(repo, floor) {
+  async #fetchNewIssues(repo, floor, canContinue) {
     const pageSize = floor === null ? 1 : ISSUE_PAGE_SIZE
     const endpoint = 'repos/' + repo + '/issues?state=all&sort=created&direction=desc&per_page=' + pageSize
     const fresh = new Map()
     for (let page = 1; ; page++) {
-      const items = await this.#fetchList(endpoint + '&page=' + page)
+      const items = await this.#fetchList(endpoint + '&page=' + page, canContinue)
       let reachedFloor = false
       for (const item of items) {
         if (!isPositiveInteger(item?.number)) throw new Error('Invalid GitHub issue number for ' + endpoint)
@@ -376,49 +408,68 @@ export class GitHubSource {
   }
 
   async #pollRepo(repoCfg) {
-    await this.#requiredLogin()
-    if (this.config.enabled !== true) return { triggered: 0, dropped: 0, terminated: 0, disabled: true }
     const { repo } = repoCfg
-    // Starting the horizon before fetching keeps arrivals during a poll eligible next time.
-    const startedAt = this.now()
-    const wm = this.watermarks.repos[repo] ?? { initialized: false, maxNumber: 0, maxCommentId: 0 }
-    const fresh = await this.#fetchNewIssues(repo, wm.initialized ? (wm.maxNumber ?? 0) : null)
-    const maxNumber = fresh.at(-1)?.number ?? wm.maxNumber ?? 0
-    const cutoff = Date.parse(startedAt)
-    if (!wm.initialized) {
-      // Remember exact historical IDs in the inclusive startup window. A later
-      // arrival in the same GitHub second still has a distinct comment ID.
-      const existing = await this.#fetchComments(repo, startedAt, cutoff)
-      const baselineCommentIds = existing.map(comment => comment.id)
-      this.#saveWatermark(repo, { ...wm, initialized: true, maxNumber, commentsSince: startedAt,
-        ...(baselineCommentIds.length > 0 && { baselineCommentIds }) })
-      return { triggered: 0, initialized: true }
+    const canContinue = () => this.#canUseRepo(repoCfg)
+    const requireCurrent = result => {
+      if (!canContinue() || result?.disabled || result?.skipped === 'source-paused') throw SOURCE_PAUSED
     }
-    let triggered = 0, dropped = 0, terminated = 0
-    for (const item of fresh) {
-      const result = await this.handleIssueEvent(item, repoCfg)
-      if (result.routed) triggered++
-      if (result.dropped && !result.deduped) dropped++
-    }
-    const comments = await this.#fetchComments(repo, wm.commentsSince ?? startedAt, cutoff)
-    const baseline = new Set(wm.baselineCommentIds)
-    let maxCommentId = wm.maxCommentId ?? 0
-    const stops = []
-    for (const c of comments) {
-      maxCommentId = Math.max(maxCommentId, c.id)
-      if (baseline.has(c.id)) continue
-      const result = await this.handleCommentEvent(c, repoCfg)
-      if (result.routed) triggered++
-      if (result.dropped && !result.deduped) dropped++
-      if (!result.deduped && result.transitionedTicketIds) {
-        terminated += result.transitionedTicketIds.length
-        stops.push({ repo, commentId: c.id, ...result })
+    const totals = { triggered: 0, dropped: 0, terminated: 0 }
+    try {
+      await this.#requiredLogin()
+      requireCurrent()
+      // Starting the horizon before fetching keeps arrivals during a poll eligible next time.
+      const startedAt = this.now()
+      const wm = this.watermarks.repos[repo] ?? { initialized: false, maxNumber: 0, maxCommentId: 0 }
+      const fresh = await this.#fetchNewIssues(repo, wm.initialized ? (wm.maxNumber ?? 0) : null, canContinue)
+      requireCurrent()
+      const maxNumber = fresh.at(-1)?.number ?? wm.maxNumber ?? 0
+      const cutoff = Date.parse(startedAt)
+      const checkpoint = { commentsSince: startedAt, commentCheckpointVersion: COMMENT_CHECKPOINT_VERSION }
+      if (!wm.initialized) {
+        // Remember the historical IDs even when newer comments share the startup second.
+        const existing = await this.#fetchComments(repo, startedAt, cutoff, canContinue)
+        requireCurrent()
+        const baselineCommentIds = existing.map(comment => comment.id)
+        this.#saveWatermark(repo, { ...wm, ...checkpoint, initialized: true, maxNumber,
+          ...(baselineCommentIds.length > 0 && { baselineCommentIds }) })
+        return { triggered: 0, initialized: true }
       }
+      for (const item of fresh) {
+        const result = await this.handleIssueEvent(item, repoCfg)
+        if (result.routed) totals.triggered++
+        if (result.dropped && !result.deduped) totals.dropped++
+        requireCurrent(result)
+      }
+      const comments = await this.#fetchComments(repo, wm.commentsSince ?? startedAt, cutoff, canContinue)
+      requireCurrent()
+      const baseline = new Set(wm.baselineCommentIds)
+      let maxCommentId = wm.maxCommentId ?? 0
+      // Older versions used a processed-ID floor. Keep it fixed so future lower IDs above it remain eligible.
+      const legacyCommentFloor = wm.commentCheckpointVersion === COMMENT_CHECKPOINT_VERSION || Array.isArray(wm.baselineCommentIds)
+        ? wm.legacyCommentFloor ?? 0 : maxCommentId
+      for (const c of comments) {
+        maxCommentId = Math.max(maxCommentId, c.id)
+        if (c.id <= legacyCommentFloor || baseline.has(c.id)) continue
+        const result = await this.handleCommentEvent(c, repoCfg)
+        if (result.routed) totals.triggered++
+        if (result.dropped && !result.deduped) totals.dropped++
+        if (!result.deduped && result.transitionedTicketIds) {
+          totals.terminated += result.transitionedTicketIds.length
+          const stops = totals.stops ??= []
+          stops.push({ repo, commentId: c.id, ...result })
+        }
+        requireCurrent(result)
+      }
+      const closures = await this.checkClosures(repoCfg)
+      totals.terminated += closures.terminated.length
+      requireCurrent(closures)
+      this.#saveWatermark(repo, { ...wm, ...checkpoint, maxNumber, maxCommentId,
+        ...(legacyCommentFloor > 0 && { legacyCommentFloor }) })
+      return totals
+    } catch (error) {
+      if (error !== SOURCE_PAUSED && canContinue()) throw error
+      return { ...totals, ...this.#pauseResult() }
     }
-    const closures = await this.checkClosures(repoCfg)
-    terminated += closures.terminated.length
-    this.#saveWatermark(repo, { ...wm, maxNumber, maxCommentId, commentsSince: startedAt })
-    return { triggered, dropped, terminated, ...(stops.length > 0 && { stops }) }
   }
 
   /** Event references use the item number for issues and PRs, and the immutable ID for comments. */
@@ -458,6 +509,7 @@ export class GitHubSource {
 
   /** Policy and acknowledgement for a newly seen issue or PR. */
   async handleIssueEvent(item, repoCfg) {
+    if (!this.#canUseRepo(repoCfg)) return this.#pauseResult()
     const norm = this.normalizeIssue(item, repoCfg)
     if (!isPositiveInteger(norm.number)) return { dropped: 'malformed' }
     const ref = this.#refFor(norm.repo, norm.kind, norm.number)
@@ -475,21 +527,33 @@ export class GitHubSource {
     const drop = reason => this.#recordDrop({ id: dropId, source, addressing, author: norm.author, title: norm.title, at }, reason)
     if (norm.labels.includes('bot:ignore')) return drop('bot-ignore')
     if (!(this.config.loginAllowlist ?? []).includes(norm.author)) return drop('not-allowlisted')
-    const ownerId = this.#registeredOwner(repoCfg)
     const authorization = { actor: norm.author, source: 'github', addressing, messageId: source.url, at }
     const message = norm.kind === 'pr' ? this.#prText(norm) : this.#issueText(norm)
-    const receipt = await this.router.routeBackground({ ownerId, message, triggerRef: ref, authorization, source })
-    if (receipt.ticketId && norm.kind === 'issue') this.#ackIssue(norm, ref, receipt.ticketId)
-    return receipt.deduped ? { deduped: true, ticketId: receipt.ticketId }
-      : { routed: true, ticketId: receipt.ticketId, ownerId: receipt.ownerId }
+    return this.#routeBackground(repoCfg, { message, triggerRef: ref, authorization, source })
   }
 
   #registeredOwner(repoCfg) {
     const owner = this.registry.get(repoCfg.ownerId ?? 'repo-' + repoCfg.workspace)
-    if (!owner || owner.kind !== 'repo' || owner.role === 'chief' || owner.recycled) {
-      throw new Error('GitHub repository ' + repoCfg.repo + ' has no registered owner')
-    }
+    if (!owner || owner.kind !== 'repo' || owner.role === 'chief' || owner.recycled || !owner.cwd) return undefined
+    if (repoCfg.ownerId && (owner.cwd !== repoCfg.cwd || owner.workspace !== repoCfg.workspace)) return undefined
     return owner.id
+  }
+
+  async #routeBackground(repoCfg, { message, triggerRef, authorization, source }) {
+    const ownerId = this.#registeredOwner(repoCfg)
+    const canAdmit = () => this.#canUseRepo(repoCfg) && (this.config.loginAllowlist ?? []).includes(authorization.actor)
+    let receipt
+    try {
+      receipt = await this.router.routeBackground({ ownerId, message, triggerRef, authorization, source, canAdmit })
+    } catch (error) {
+      if (error?.code === 'background-source-paused') return this.#pauseResult()
+      throw error
+    }
+    if (receipt.ticketId && source.event === 'issue' && this.#canUseRepo(repoCfg)) {
+      this.#ackIssue({ repo: source.repo, number: source.issueNumber }, triggerRef, receipt.ticketId)
+    }
+    return receipt.deduped ? { deduped: true, ticketId: receipt.ticketId }
+      : { routed: true, ticketId: receipt.ticketId, ...(source.event !== 'comment' && { ownerId: receipt.ownerId }) }
   }
 
   #ackIssue({ repo, number }, triggerId, ticketId) {
@@ -520,6 +584,7 @@ export class GitHubSource {
 
   /** An allowlisted work comment starts its own task. A stop comment only ends work for its item. */
   async handleCommentEvent(c, repoCfg) {
+    if (!this.#canUseRepo(repoCfg)) return this.#pauseResult()
     const { repo } = repoCfg
     const item = githubCommentItem(c)
     const issueNumber = item?.number
@@ -564,15 +629,12 @@ export class GitHubSource {
       const workerOutcomes = await this.#cancelStoppedWorkers(trigger)
       return { transitionedTicketIds: ticketIds, workerOutcomes }
     }
-    const ownerId = this.#registeredOwner(repoCfg)
     const label = addressing === 'mention' ? '评论提及' : '新评论'
     const message = GITHUB_SOURCE_MARK + repo + '#' + issueNumber + '] ' + label + '（作者 ' + author + '）：' + body.slice(0, 1000)
       + (source.url ? '\n' + source.url : '')
       + '\n对该 Issue/PR 的回复用 reply_source to=\'github:' + repo + ':' + issueNumber + '\'。'
       + '需要改动时使用 worktree 并提 PR（永不直推主分支，合并永远由人）。产出结尾必须带 dsh-badge：' + DSH_BADGE
-    const receipt = await this.router.routeBackground({ ownerId, message, triggerRef: ref, authorization, source })
-    return receipt.deduped ? { deduped: true, ticketId: receipt.ticketId }
-      : { routed: true, ticketId: receipt.ticketId }
+    return this.#routeBackground(repoCfg, { message, triggerRef: ref, authorization, source })
   }
 
   #recordDrop({ id, source, addressing, author, title, at }, reason) {
@@ -647,7 +709,17 @@ export class GitHubSource {
     for (const ticketId of ticketIds) {
       const ticket = this.router.tasks.getTicket(ticketId)
       if (!ticket || !canTransition(ticket.stage, 'failed')) continue
-      this.router.tasks.fail({ ticketId, reason: '源头' + why + '：' + item + '（让位于人）' })
+      const failed = this.router.tasks.fail({ ticketId, reason: '源头' + why + '：' + item + '（让位于人）' })
+      const trigger = failed.background?.kind === 'github' && failed.authorization?.source === 'github'
+        ? this.#getTrigger(failed.triggerId) : null
+      if (trigger?.kind === 'github' && !trigger.dropped && trigger.id === failed.triggerId && trigger.source?.kind === 'github'
+        && (!trigger.ownerId || trigger.ownerId === failed.owner) && trigger.source.repo === repo && trigger.source.issueNumber === number) {
+        const { runs } = this.router
+        runs.ensure({ ticketId, triggerRef: trigger.id, ownerId: failed.owner, source: trigger.source, at: failed.createdAt })
+        runs.recordResult(ticketId, { kind: 'failure', at: failed.failed.at })
+        // The termination notice is a chief inbox message. RunAudit tracks external channel receipts.
+        runs.recordNotNotified(ticketId, 'local-panel')
+      }
       if (notify) this.#notice(ticketId, ticket.triggerId, '[hub-bot ' + item + '] 源头' + why + '，任务 ' + ticketId + ' 已终止（让位于人）。')
       terminated.push(ticketId)
     }
@@ -670,35 +742,15 @@ export class GitHubSource {
     return workers
   }
 
-  #canCancelStoppedWorker(sessionId, targets) {
-    if (this.registry.isOwnerSession(sessionId)) return false
-    const stillStopped = targets.some(({ ticketId, failedAt }) => {
-      const ticket = this.router.tasks.getTicket(ticketId)
-      return ticket?.stage === 'failed' && ticket.failed?.at === failedAt && ticket.workerSession?.sessionId === sessionId
-    })
-    if (!stillStopped) return false
-    const otherWork = this.store.db.prepare(`
-      SELECT 1 FROM ticket
-      WHERE json_extract(value, '$.stage') NOT IN ('done', 'failed')
-        AND (json_extract(value, '$.workerSession.sessionId') = ? OR json_extract(value, '$.targetSession') = ?)
-      LIMIT 1
-    `).get(sessionId, sessionId)
-    return !otherWork
-  }
-
   async #cancelStoppedWorkers(trigger) {
     const { workers, ticketIds } = trigger.stop
     const outcomes = []
     for (const sessionId of new Set(workers.map(target => target.sessionId))) {
       if (this.store.closed) break
       const targets = workers.filter(target => target.sessionId === sessionId)
-      if (typeof this.sessions?.cancel !== 'function' || !this.#canCancelStoppedWorker(sessionId, targets)) {
-        outcomes.push({ sessionId, status: 'skipped' })
-        continue
-      }
       try {
-        await this.sessions.cancel({ sessionId })
-        outcomes.push({ sessionId, status: 'cancelled' })
+        const outcome = await this.router.stopBackgroundWorker({ sessionId, targets })
+        outcomes.push({ sessionId, status: outcome.status })
       } catch (error) {
         const message = String(error?.message ?? error)
         this.logger.warn('hub-bot github: stop %s failed for %s: %s', trigger.id, sessionId, message)
@@ -713,7 +765,7 @@ export class GitHubSource {
         const worker = workers.find(target => target.ticketId === ticketId)
         const outcome = outcomes.find(result => result.sessionId === worker?.sessionId)
         let workerStatus = '未调用执行会话停止。'
-        if (outcome?.status === 'cancelled') workerStatus = '执行会话已停止。'
+        if (outcome?.status === 'cancelled') workerStatus = '执行会话停止请求已受理。'
         if (outcome?.status === 'failed') workerStatus = '执行会话停止失败：' + outcome.error
         this.#notice(ticketId, trigger.id, item + '收到喊停，任务 ' + ticketId + ' 已标记为失败。' + workerStatus)
       }
@@ -724,6 +776,9 @@ export class GitHubSource {
   /** Rechecks each item with running or pending work, including work started by comments. */
   async checkClosures(repoCfg) {
     const { repo } = repoCfg
+    const canContinue = () => this.#canUseRepo(repoCfg)
+    const terminated = []
+    if (!canContinue()) return { terminated, ...this.#pauseResult() }
     const items = new Map()
     for (const { ticket, number, pr } of this.#liveSourceTickets(repo)) {
       if (!canTransition(normalizeStage(ticket.stage), 'failed')) continue
@@ -732,18 +787,23 @@ export class GitHubSource {
       item.tickets.push(ticket.id)
       item.pr ||= pr
     }
-    const terminated = []
-    for (const [number, tracked] of items) {
-      const item = JSON.parse(String(await this.#githubApi(['repos/' + repo + '/issues/' + number])))
-      if (item.state !== 'closed') continue
-      let why = '已关闭'
-      if (item.pull_request || tracked.pr) {
-        const pr = JSON.parse(String(await this.#githubApi(['repos/' + repo + '/pulls/' + number])))
-        why = pr.merged_at ? '已合并' : '已关闭未合并'
+    try {
+      for (const [number, tracked] of items) {
+        const item = await this.#readGitHub('repos/' + repo + '/issues/' + number, canContinue)
+        if (item.state !== 'closed') continue
+        let why = '已关闭'
+        if (item.pull_request || tracked.pr) {
+          const pr = await this.#readGitHub('repos/' + repo + '/pulls/' + number, canContinue)
+          why = pr.merged_at ? '已合并' : '已关闭未合并'
+        }
+        if (!canContinue()) return { terminated, ...this.#pauseResult() }
+        terminated.push(...this.#writeFacts(() => this.#terminateTasks(tracked.tickets, repo, number, why)))
       }
-      terminated.push(...this.#writeFacts(() => this.#terminateTasks(tracked.tickets, repo, number, why)))
+      return { terminated }
+    } catch (error) {
+      if (error !== SOURCE_PAUSED && canContinue()) throw error
+      return { terminated, ...this.#pauseResult() }
     }
-    return { terminated }
   }
 
   #isOwnComment(repo, number, comment) {
@@ -788,9 +848,9 @@ export class GitHubSource {
     }
   }
 
-  async #findAttemptedReply(endpoint, attempt) {
+  async #findAttemptedReply(endpoint, attempt, canContinue) {
     // Fetch only this item's comments. A failed page propagates and never permits a new POST.
-    for await (const page of this.#commentPages(endpoint)) {
+    for await (const page of this.#commentPages(endpoint, canContinue)) {
       const sent = page.find(comment => {
         const item = githubCommentItem(comment)
         return item?.repo === attempt.repo && item.number === attempt.number && matchesReplyMarker(comment, attempt)
@@ -800,13 +860,14 @@ export class GitHubSource {
     return null
   }
 
-  async #reconcileReply({ repo, number, endpoint, outboxId, receiptKey }, attempt) {
+  async #reconcileReply({ repo, number, endpoint, outboxId, receiptKey }, attempt, canContinue) {
     if (attempt.repo !== repo.toLowerCase() || attempt.number !== number) throw new Error('GitHub reply target changed after its first attempt')
     let sent
     try {
-      sent = await this.#findAttemptedReply(endpoint, attempt)
+      sent = await this.#findAttemptedReply(endpoint, attempt, canContinue)
     } catch (cause) {
       if (!this.store.closed && this.store.get(receiptKey)) return
+      if (cause === SOURCE_PAUSED || !canContinue()) return false
       throw new Error('GitHub reply outcome unknown: marker lookup failed: ' + String(cause?.message ?? cause), { cause })
     }
     if (sent) {
@@ -814,6 +875,7 @@ export class GitHubSource {
       return
     }
     if (!this.store.closed && this.store.get(receiptKey)) return
+    if (!canContinue()) return false
     // An empty listing can be stale after a POST whose response was lost.
     throw new Error('GitHub reply outcome unknown: reply marker is not visible yet')
   }
@@ -821,14 +883,24 @@ export class GitHubSource {
   async #postReply({ repo, number }, body, outboxId) {
     const receiptKey = replyReceiptKey(outboxId)
     if (this.store.get(receiptKey)) return
+    const watched = await this.#watchedRepos(() => this.#isEnabled())
+    const repoCfg = watched.find(w => w.repo.toLowerCase() === repo.toLowerCase())
+    const canContinue = () => this.#canUseRepo(repoCfg)
+    if (!canContinue()) return false
     const attemptKey = replyAttemptKey(outboxId)
     const endpoint = 'repos/' + repo + '/issues/' + number + '/comments'
     const recovery = { repo, number, endpoint, outboxId, receiptKey }
     const previous = this.store.get(attemptKey)
-    if (previous && !isConfirmedReplyRejection(previous.rejectedStatus)) return this.#reconcileReply(recovery, previous)
+    if (previous && !isConfirmedReplyRejection(previous.rejectedStatus)) return this.#reconcileReply(recovery, previous, canContinue)
 
-    const login = (await this.#authenticatedLogin()).toLowerCase()
-    if (this.store.closed) return
+    let login
+    try {
+      login = (await this.#authenticatedLogin()).toLowerCase()
+    } catch (error) {
+      if (!canContinue()) return false
+      throw error
+    }
+    if (!canContinue()) return false
     let reconcile
     const attempt = this.#writeFacts(() => {
       if (this.store.get(receiptKey)) return null
@@ -848,7 +920,7 @@ export class GitHubSource {
       if (!latest) this.store.set(replyMarkerKey(next.marker), outboxId)
       return next
     })
-    if (reconcile) return this.#reconcileReply(recovery, reconcile)
+    if (reconcile) return this.#reconcileReply(recovery, reconcile, canContinue)
     if (!attempt) return
 
     // The Router caps the visible body before this transport-only prefix is attached.
@@ -886,6 +958,7 @@ export class GitHubSource {
 
   /** Posts recorded reply intents and saves the returned comment identity before marking them sent. */
   async deliverReplies() {
+    if (!this.#isEnabled()) return { delivered: 0, ...this.#pauseResult() }
     return deliverRecordedReplies({
       store: this.store, logger: this.logger, now: this.now,
       channel: 'github', prefix: 'github:', maxAttempts: MAX_GITHUB_ATTEMPTS,
@@ -896,11 +969,11 @@ export class GitHubSource {
         const number = Number(target.slice(cut + 1))
         return repo && isPositiveInteger(number) ? { repo, number } : null
       },
-      canContinue: () => !this.store.closed,
+      canContinue: () => this.#isEnabled(),
       prepareBody: body => body.includes('powered_by-dsh') ? body : body + '\n\n' + DSH_BADGE,
       send: async (target, body, row) => {
-        await this.#postReply(target, body, row.id)
-        // The shared driver settles this snapshot after the send callback succeeds.
+        if (await this.#postReply(target, body, row.id) === false) return false
+        // Settle the admitted send even if GitHub was disabled while the POST was in flight.
         if (row.lastError) row.lastError = null
       },
     })

@@ -93,6 +93,7 @@ test('路由新票命中黑名单: 票转 person/confirm 不注入, 意图(actio
 test('确认后放行: 面板 confirm → 原消息注入 owner 会话, 票转 working, confirmOutcome 落票面', async () => {
   const f = fixture()
   try {
+    f.registry.bindSession(f.owner.id, 'session-o1')
     const r = await f.router.routeToOwner({ ownerId: f.owner.id, message: 'rm -rf /tmp/build' })
     const c = await f.router.routeToOwner({ ownerId: f.owner.id, ticketId: r.ticketId, resolution: 'confirm', message: '确认' })
     assert.equal(c.confirmed, true)
@@ -179,6 +180,7 @@ async function ownerToolsHarness(f) {
   const prompts = []
   const api = {
     registry: f.registry,
+    store: f.store,
     tasks: f.router.tasks,
     config: { security: { dangerousPatterns: [...DEFAULT_DANGEROUS_PATTERNS] } },
   }
@@ -206,6 +208,7 @@ test('inject_session 命中黑名单 (带 ticketId): 抛错不注入, 票转 per
   const f = fixture()
   try {
     const r = await f.router.routeToOwner({ ownerId: f.owner.id, message: '正常任务' })
+    f.router.tasks.bindWorkerSession(r.ticketId, { sessionId: 'session-w1', cwd: join(f.owner.cwd, 'worker') })
     const h = await ownerToolsHarness(f)
     await assert.rejects(
       () => h.tools.get('inject_session').execute({ sessionId: 'session-w1', text: 'rm -rf /tmp/x', ticketId: r.ticketId }, h.exec),
@@ -234,6 +237,8 @@ test('inject_session 命中黑名单 (带 ticketId): 抛错不注入, 票转 per
 test('inject_session 无 ticketId 命中: 直接拒绝 (无票可挂确认); 干净文本照常注入', async () => {
   const f = fixture()
   try {
+    const work = await f.router.routeToOwner({ ownerId: f.owner.id, message: '受管合成工作' })
+    f.router.tasks.bindWorkerSession(work.ticketId, { sessionId: 'session-w1', cwd: join(f.owner.cwd, 'worker') })
     const h = await ownerToolsHarness(f)
     await assert.rejects(
       () => h.tools.get('inject_session').execute({ sessionId: 'session-w1', text: 'sudo mkfs /dev/sda' }, h.exec),

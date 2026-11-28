@@ -35,6 +35,7 @@
  * and only then marks them sent. Failures keep the row recorded with feishuAttempts++; five consecutive
  * failures fail the row and report a system problem (same discipline as the OutboxRunner).
  */
+import { createHash } from 'node:crypto'
 import { deliverRecordedReplies } from './outbox.js'
 import { CredentialsError, MISSING, UNAVAILABLE, createFeishuCredentialsPort } from './feishu-credentials.js'
 
@@ -334,7 +335,17 @@ export class FeishuSource {
         'im.message.receive_v1': async data => {
           if (!current()) return
           this.logger.info('hub-bot feishu: event received message_id=%s chat_type=%s', data?.message?.message_id, data?.message?.chat_type)
-          try { await this.handleEvent(data) } catch (error) { this.logger.warn('hub-bot feishu: event handling failed: %s', error?.message ?? error) }
+          try {
+            await this.handleEvent(data)
+          } catch (error) {
+            const detail = error?.code === 'ERR_SQLITE_ERROR' && Number.isInteger(error.errcode)
+              ? ` (SQLite ${error.errcode})`
+              : ''
+            const message = 'hub-bot feishu: event handling failed' + detail
+            this.logger.warn(message)
+            // The SDK logs this error and sends a failure ACK when the handler rejects.
+            throw new Error(message)
+          }
         },
       })
       await socket.start({ eventDispatcher: dispatcher })
@@ -475,11 +486,13 @@ export class FeishuSource {
       channel: 'feishu', prefix: 'feishu:', maxAttempts: MAX_FEISHU_ATTEMPTS,
       canContinue: () => !this.store.closed && this.config.enabled === true && this.credentials === credentials,
       parseTarget: to => to.startsWith('feishu:chat:') ? to.slice('feishu:chat:'.length) : to.slice('feishu:'.length),
-      send: async (chatId, body) => {
+      send: async (chatId, body, row) => {
         try {
+          // Use the persisted row ID across remounts. Feishu controls the deduplication window.
+          const uuid = createHash('sha256').update('hub-bot:feishu:' + row.id).digest('hex').slice(0, 50)
           const resp = await client.im.message.create({
             params: { receive_id_type: 'chat_id' },
-            data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text: body }) },
+            data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text: body }), uuid },
           })
           if (resp && typeof resp.code === 'number' && resp.code !== 0) throw new Error('feishu api code ' + resp.code + ': ' + (resp.msg ?? ''))
         } catch (error) {

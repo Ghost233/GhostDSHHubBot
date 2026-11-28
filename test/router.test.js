@@ -628,6 +628,135 @@ test('retry on a new owner requires verified absence at the attempted recipient'
   }
 })
 
+test('an explicit GitHub stop waits for the captured in-flight worker admission', async () => {
+  const env = handoffFixture()
+  const { router, owner, sessions } = env
+  const entered = Promise.withResolvers()
+  const permit = Promise.withResolvers()
+  const order = []
+  const send = sessions.prompt
+  let launching, stopping
+  try {
+    sessions.prompt = async request => {
+      entered.resolve(request)
+      await permit.promise
+      order.push('admitted')
+      return send(request)
+    }
+    sessions.stopBackgroundWork = async ({ sessionId, requestIds, isCurrent }) => {
+      order.push('stopped')
+      const request = await entered.promise
+      assert.equal(sessionId, request.sessionId)
+      assert.deepEqual(requestIds, [request.requestId])
+      assert.ok(isCurrent())
+      return { status: 'cancelled' }
+    }
+    const triggerRef = 'github:fixture/demo:issue:51'
+    launching = router.routeBackground({ ownerId: owner.id, triggerRef, message: 'Synthetic work',
+      authorization: { source: 'github', actor: 'fixture', at: router.now() },
+      source: { kind: 'github', repo: 'fixture/demo', issueNumber: 51, event: 'issue' } })
+    const request = await entered.promise
+    const [run] = router.runs.list({ triggerRef })
+    const failed = router.tasks.fail({ ticketId: run.ticketId, reason: 'Explicit source stop' })
+    stopping = router.stopBackgroundWorker({ sessionId: request.sessionId,
+      targets: [{ ticketId: run.ticketId, sessionId: request.sessionId, failedAt: failed.failed.at }] })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(order, [])
+    permit.resolve()
+    await launching
+    assert.deepEqual(await stopping, { status: 'cancelled' })
+    assert.deepEqual(order, ['admitted', 'stopped'])
+    assert.equal(router.getTicket(run.ticketId).stage, 'failed')
+    assert.equal(router.getTicket(run.ticketId).lastDelivery.state, 'sent')
+  } finally {
+    permit.resolve()
+    await Promise.allSettled([launching, stopping])
+    env.cleanup()
+  }
+})
+
+test('an expired GitHub worker question notifies its original item and links the run', async () => {
+  const env = handoffFixture()
+  const { router, owner, deferred, advance } = env
+  try {
+    const work = await router.routeBackground({ ownerId: owner.id, message: 'Synthetic work', triggerRef: 'github:fixture/demo:issue:42',
+      authorization: { source: 'github', actor: 'fixture', at: router.now() },
+      source: { kind: 'github', repo: 'fixture/demo', issueNumber: 42, event: 'issue' } })
+    router.askWorker({ ticketId: work.ticketId, sessionId: work.workerSession.sessionId, question: 'Which fixture?' })
+    const { requestId } = router.getTicket(work.ticketId).deferred
+    advance(1000)
+    await router.tick()
+    await router.tick()
+    assert.equal(deferred.get(requestId).status, 'expired')
+    assert.equal(router.getTicket(work.ticketId).stage, 'blocked')
+    const notices = router.listOutbox().filter(item => item.id === 'out-expiry-' + requestId)
+    assert.equal(notices.length, 1)
+    assert.equal(notices[0].to, 'github:fixture/demo:42')
+    assert.equal(notices[0].state, 'recorded')
+    const run = router.runs.get('run-' + work.ticketId)
+    assert.equal(run.notification.id, notices[0].id)
+    assert.equal(run.result.kind, 'blocked')
+  } finally { env.cleanup() }
+})
+
+test('a merged Feishu intake retry reconciles the original chief admission across replacement and restart', async t => {
+  for (const mode of ['accepted', 'verified absent', 'unavailable']) {
+    await t.test(mode, async () => {
+      const env = handoffFixture()
+      const { router, registry, ownerSwitch, sessions, host, prompts, store, advance } = env
+      try {
+        const original = 'chief-original-fixture'
+        host.set(original, { status: 'idle', cwd: '/repos', agentPreset: 'hub-bot-router' })
+        registry.bindSession('chief', original)
+        const create = sessions.create
+        sessions.create = ({ owner, ...request }) => create({ owner, ...request, agentPreset: owner?.role === 'chief' ? 'hub-bot-router' : request.agentPreset })
+        const requestId = 'hub-bot-feishu-om_original_fixture'
+        const send = sessions.prompt
+        let calls = 0
+        sessions.prompt = async request => {
+          if (request.requestId === requestId && calls++ === 0) {
+            if (mode === 'accepted') await send(request)
+            throw new Error('Synthetic response lost')
+          }
+          return send(request)
+        }
+        const reference = []
+        for (const serial of ['original', 'companion']) {
+          const messageId = 'om_' + serial + '_fixture'
+          const id = 'feishu-' + messageId
+          reference.push(id)
+          await router.acceptFeishuTrigger({ id, kind: 'feishu', message: 'fixture intake ' + serial, at: router.now(),
+            source: { kind: 'feishu', chatId: 'oc_fixture', openId: 'fixture-user', messageId, addressing: 'direct' },
+            authorization: { source: 'feishu', actor: 'fixture-user', messageId, addressing: 'direct', at: router.now() } })
+        }
+        await router.tick()
+        assert.deepEqual(router.getTrigger(reference[0]).intakeCohort.triggerIds, reference)
+        const row = () => router.listOutbox().find(item => item.requestId === requestId)
+        assert.equal(row().state, 'queued')
+        assert.equal(row().attempts, 1)
+        const operation = ownerSwitch.request({ ownerId: 'chief', expectedSessionId: original, mode: 'wait' })
+        await ownerSwitch.tick()
+        await ownerSwitch.tick()
+        assert.equal(registry.get('chief').sessionId, operation.newSessionId)
+        assert.equal(host.get(original).archived, true)
+        store.close()
+        const current = env.open()
+        if (mode === 'unavailable') sessions.hasPromptReceipt = async () => undefined
+        await current.router.markRestart()
+        for (const waitMs of [2000, 2000, 4000]) { advance(waitMs); await current.router.tick() }
+        const admissions = prompts.filter(prompt => prompt.requestId === requestId)
+        const destination = mode === 'accepted' ? original : operation.newSessionId
+        assert.deepEqual(admissions.map(prompt => prompt.sessionId), mode === 'unavailable' ? [] : [destination])
+        for (const id of reference) {
+          const trigger = current.router.getTrigger(id)
+          assert.equal(trigger.injectedSessionId, mode === 'unavailable' ? undefined : destination)
+        }
+        assert.equal(current.router.listOutbox().find(item => item.requestId === requestId).state, mode === 'unavailable' ? 'failed' : 'sent')
+      } finally { env.cleanup() }
+    })
+  }
+})
+
 test('an explicit chief switch fences same-chat messages around the durable control', async () => {
   const { router, registry, calls, advance, cleanup } = fixture()
   try {
@@ -1027,7 +1156,7 @@ test('chief ticket resolution passes the state machine (面板裁决不是路由
       id: 'tsk-chief-1', owner: 'chief', stage: 'person/confirm', requestId: 'req-1',
       createdAt: '2026-11-15T00:00:00.000Z', updatedAt: '2026-11-15T00:00:00.000Z',
       authorization: { actor: 'ghost', source: 'feishu', at: '2026-11-15T00:00:00.000Z' },
-      pendingConfirm: { text: '改动会推送到 main，确认执行？' },
+      pendingConfirm: { text: '改动会推送到 main，确认执行？', at: router.now() },
       assignments: [],
     }
     store.db.prepare('INSERT INTO ticket (id, value) VALUES (?, ?)').run(ticket.id, JSON.stringify(ticket))
@@ -2114,6 +2243,7 @@ test('a replaced confirmation cannot dispatch or bind work using the earlier app
       const { ticketId } = await router.routeToOwner({ ownerId: owner.id, message: 'prepare fixture' })
       const sessionId = 'original-worker'
       const worker = { sessionId, cwd: '/repos/fixture' }
+      router.tasks.bindWorkerSession(ticketId, worker)
       let entered, release
       const reachedHost = new Promise(resolve => { entered = resolve })
       const gate = new Promise(resolve => { release = resolve })
@@ -2145,7 +2275,7 @@ test('a replaced confirmation cannot dispatch or bind work using the earlier app
       } finally { release() }
       await rejected
       assert.equal(router.getTicket(ticketId).stage, 'person/confirm')
-      assert.equal(router.getTicket(ticketId).workerSession, undefined)
+      assert.equal(router.getTicket(ticketId).workerSession.sessionId, sessionId)
       assert.equal(calls.prompt.some(prompt => prompt.sessionId === sessionId), false)
       if (actionType === 'fork') assert.deepEqual(requestedFork, { sessionId, atSeq: 17 })
     } finally { cleanup() }

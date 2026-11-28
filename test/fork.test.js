@@ -68,6 +68,7 @@ async function seedPendingFork({ router }) {
   const owner = router.registry.get('repo-W') ?? router.registry.create({ kind: 'repo', workspace: 'W', cwd: '/w' })
   const receipt = await router.routeToOwner({ ownerId: owner.id, message: '开发登录功能' })
   const action = buildForkAction({ sessionId: 'session-l3-polluted', cwd: '/w', reason: '原会话上下文被无关实验污染，fork 干净副本续作' })
+  router.tasks.bindWorkerSession(receipt.ticketId, { sessionId: action.sessionId, cwd: action.cwd })
   router.tasks.askConfirm({ ticketId: receipt.ticketId, question: forkConfirmText(action, receipt.ticketId), action })
   return { owner, ticketId: receipt.ticketId, action }
 }
@@ -188,6 +189,20 @@ test('resolution:"confirm" executes the fork, rebinds the task and wakes the own
     assert.match(wake.body, /原会话保留可查/)
     assert.match(wake.body, /授权：user 经 dsh/)
     assert.equal(calls.prompt.length, promptsBefore + 1)
+  } finally { cleanup() }
+})
+
+test('a pending legacy fork cannot use a worker after its ticket binding changes', async () => {
+  const { router, calls, cleanup } = routerFixture()
+  try {
+    const { owner, ticketId } = await seedPendingFork({ router })
+    const original = router.getTicket(ticketId)
+    router.tasks.bindWorkerSession(ticketId, { sessionId: 'fixture-new-worker', cwd: owner.cwd })
+    await assert.rejects(router.routeToOwner({ ownerId: owner.id, ticketId, resolution: 'confirm', message: 'Approve the old fixture' }),
+      { code: 'legacy-confirm-target-invalid' })
+    assert.deepEqual(calls.fork, [])
+    assert.equal(router.getTicket(ticketId).stage, 'person/confirm')
+    assert.deepEqual(router.getTicket(ticketId).pendingConfirm, original.pendingConfirm)
   } finally { cleanup() }
 })
 

@@ -130,7 +130,7 @@ export function updateOutboxRow(store, row) {
  * @param {{ store: import('./store.js').Store, logger: { warn: Function }, now: () => string,
  *   channel: string, prefix: string, maxAttempts: number,
  *   parseTarget: (to: string) => unknown,  // null = unparseable → the row fails immediately
- *   send: (target: unknown, body: string, row: object) => Promise<void>,
+ *   send: (target: unknown, body: string, row: object) => Promise<void | false>, // false leaves the row available for a later pass
  *   prepareBody?: (body: string) => string, canContinue?: () => boolean }} deps
  */
 /**
@@ -168,10 +168,12 @@ async function deliverRecordedRepliesPass({ store, logger, now, channel, prefix,
     }
     const body = prepareBody ? prepareBody(row.body) : row.body
     try {
-      await send(target, body, row)
+      if (await send(target, body, row) === false) continue
+      if (store.closed) break
       updateOutboxRow(store, { ...row, state: 'sent', sentAt: now() })
       delivered++
     } catch (error) {
+      if (store.closed) break
       const attempts = (row.attempts ?? 0) + 1
       logger.warn('hub-bot %s: reply to %s failed (%s)', channel, row.to, error?.message ?? error)
       if (attempts >= maxAttempts) {
