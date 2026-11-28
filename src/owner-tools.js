@@ -245,11 +245,13 @@ export function apply(ctx) {
       if (!isWithinCwd(norm(owner.cwd), cwd)) {
         throw new Error('create_session: cwd ' + cwd + ' is outside this owner\'s subtree ' + owner.cwd + ' — do NOT act across repos; call escalate with the reason instead')
       }
-      // Deliberately no agentPreset: worker Sessions run the deployment default — the user's own preset.
+      if (args.ticketId !== undefined) mustOwnTicket(api, owner, args.ticketId)
+      // Worker sessions use the deployment's default preset.
       const created = await ctx.sessionController.create({ cwd })
       const sessionId = created.sessionId ?? created.session?.id
       if (!sessionId) throw new Error('create_session: the controller returned no sessionId')
       if (args.ticketId !== undefined) {
+        if (api.registry.findByCurrentSession(owner.sessionId)?.id !== owner.id) throw new Error('the calling session is no longer the current owner binding')
         mustOwnTicket(api, owner, args.ticketId)
         api.tasks.bindWorkerSession(args.ticketId, { sessionId, cwd })
       }
@@ -263,7 +265,7 @@ export function apply(ctx) {
     parameters: {
       type: 'object',
       properties: {
-        sessionId: { type: 'string', description: '目标会话 id（必须在责任边界内）' },
+        sessionId: { type: 'string', description: '目标会话 id（必须在责任边界内，且为执行会话）' },
         text: { type: 'string', description: '注入正文' },
         ticketId: { type: 'string', description: '可选：关联任务票，注入文本携带其授权记录' },
         requestId: { type: 'string', description: '可选：幂等键，缺省自动生成' },

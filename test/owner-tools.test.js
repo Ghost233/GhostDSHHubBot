@@ -88,6 +88,7 @@ function ownerToolsHarness(f, { agentId = f.ownerSessionId, extraSessions = [], 
   const tools = new Map()
   const pageRequests = []
   const prompts = []
+  const creates = []
   const api = { registry: f.registry, tasks: f.router.tasks, store: f.store, router: f.router }
   const ctx = {
     reflect: { get: () => api },
@@ -104,11 +105,11 @@ function ownerToolsHarness(f, { agentId = f.ownerSessionId, extraSessions = [], 
       page: async request => { pageRequests.push(request); return transcriptPage() },
       search: async () => ({ items: searchItems }),
       prompt: async request => { prompts.push(request); return { accepted: true } },
-      create: async () => ({ sessionId: 'session-unused' }),
+      create: async request => { creates.push(request); return { sessionId: 'session-worker-created' } },
     },
   }
   ownerTools.apply(ctx)
-  return { tools, pageRequests, prompts, exec: { agent: agentId === undefined ? {} : { id: agentId }, signal: new AbortController().signal } }
+  return { tools, pageRequests, prompts, creates, exec: { agent: agentId === undefined ? {} : { id: agentId }, signal: new AbortController().signal } }
 }
 
 /** Every safe-integer number reachable in a tool result: bare numbers plus digit runs inside strings. */
@@ -375,5 +376,15 @@ test('legacy owner presets are not exposed as workers when old bindings were nev
     await assert.rejects(h.tools.get('fork_session').execute({ sessionId, ticketId: 'fixture', reason: 'fixture' }, h.exec), /is an owner session/)
     assert.equal(h.pageRequests.length, 0)
     assert.equal(h.prompts.length, 0)
+  } finally { f.cleanup() }
+})
+
+test('create_session checks ticket ownership before creating a worker', async () => {
+  const f = fixture()
+  try {
+    const h = ownerToolsHarness(f)
+    const tool = h.tools.get('create_session')
+    await assert.rejects(tool.execute({ ticketId: 'missing-ticket' }, h.exec), /unknown ticket/)
+    assert.equal(h.creates.length, 0)
   } finally { f.cleanup() }
 })
