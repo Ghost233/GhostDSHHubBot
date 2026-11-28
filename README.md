@@ -66,7 +66,7 @@ patch 结构测试复用仓内先例 `scripts/test-runtime.mjs` 的解析链：`
 ## 任务三态与 L2 执行闭环（#65）
 
 - **三态机（src/tasks.js）**：`working → review → done`；review 是挡板，done 只能由 review 经用户验收（resolution:"accept"）到达。追问把 review 恢复为 working（resume, by:'route'），验收 by:'user'；非法迁移拒绝（如 working 直接 accept、done 后追问、double-report）。全部迁移记 transitions 审计数组。
-- **L2 六工具（src/owner-tools.js，owner preset 静态行）**：search_sessions / read_session / inject_session / create_session / report / escalate。身份解析：工具执行的 exec.agent 经 workingDirectory.ensure 拿会话 cwd，须等于注册表某 owner 的 cwd，否则拒执。
+- **L2 负责人管理工具**：`search_sessions`、`read_session`、`inject_session`、`create_session`、`fork_session`、`report` 和 `escalate`。仅当前绑定的负责人会话可调用，目录也须与注册表一致。旧绑定和具有负责人 preset 的历史会话会标明角色，读取、注入和 fork 只接受责任范围内的执行会话。
 - **越界拒执**：create/inject/read 的目标会话（或 create_session 的目标 cwd）必须落在 owner 责任子树内（isWithinCwd 路径段感知，`/a/b` 不含 `/a/bc`）；越界抛错并指向 escalate。escalate 不改票阶段、打 escalated 标记并写 outbox(kind=escalation)，L1 经 query_tasks 可见。
 - **执行会话保持用户 preset**：create_session 不传 agentPreset（部署默认），插件永不改写执行会话配置。
 - **授权不可变**：Ticket 创建时记 authorization{actor,source,at}，注入执行会话的文本自动携带它；追问注入文本带"改完请再次 report"提示（首跑实证：L2 追问后忘了再次 report，票卡在 working）。
@@ -165,4 +165,4 @@ patch 结构测试复用仓内先例 `scripts/test-runtime.mjs` 的解析链：`
 - 插件配置校验为手写 resolveConfig，未引 schemastery——零运行时依赖的取舍；后续若接 DSH 设置 UI 再评估。
 - 危险命令黑名单是**大小写不敏感子串匹配**的启发式兜底：减少误操作与明显危险注入，不能防御刻意混淆（base64/变量拼接等）；真正的边界仍是渠道侧授权 + preset 工具面 + 用户确认裁决。
 - 被删重建依赖"注入失败"这一信号：`session "<id>" not found` 与 `ApiSessionNotFound` 之外的删除表现（如静默丢弃）不会被识别为重建触发。
-- **owner 重建后的孤儿会话**（#65 首跑实证）：负责人会话被删重建后，旧会话仍在且保持 owner preset；它出现在 search_sessions 结果里（registry 已指向新会话，无法标记 role:'owner'），可能被 L2 误当执行会话注入，形成嵌套委托。功能上闭环仍成立（嵌套层也是 owner，最终完成并 report），但属噪声；后续可考虑按会话的 preset 名或启动侧写登记来识别孤儿。
+- **旧负责人会话**：注册表保留近期历史绑定。未记录在注册表里的旧负责人也可通过 DSH 保存的负责人 preset 识别。清单和内容搜索均标记这些会话的角色。
