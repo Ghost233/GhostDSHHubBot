@@ -118,7 +118,7 @@ function confirmActions(t) {
     const label = resolution === 'confirm' ? '确认' : '拒绝'
     // 破坏性动作需确认 (spec 面板原则)
     if (!window.confirm(label + '任务 ' + shortId(t.id) + '？\n' + (t.pendingConfirm?.text ?? ''))) return
-    await api('tickets/resolve', { method: 'POST', body: { ticketId: t.id, resolution } })
+    await api('tickets/resolve', { method: 'POST', body: { ticketId: t.id, resolution, requestId: t.deferred?.requestId } })
     await refresh()
   }
   wrap.append(
@@ -126,6 +126,15 @@ function confirmActions(t) {
     el('button', { class: 'btn danger', onclick: () => void act('reject').catch(showError) }, text('拒绝')),
   )
   return wrap
+}
+
+function answerAction(t) {
+  return el('button', { class: 'btn', type: 'button', onclick: () => void (async () => {
+    const message = window.prompt(t.question?.text ?? '回复')?.trim()
+    if (!message) return
+    await api('tickets/resolve', { method: 'POST', body: { ticketId: t.id, resolution: 'answer', message, requestId: t.deferred?.requestId } })
+    await refresh()
+  })().catch(showError) }, text('回复'))
 }
 
 function ticketRow(t, { actions } = {}) {
@@ -139,6 +148,7 @@ function ticketRow(t, { actions } = {}) {
   row.append(head)
   if (t.pendingConfirm) row.append(el('div', { class: 'pending-confirm' }, text('待确认：' + t.pendingConfirm.text)))
   if (t.question) row.append(el('div', { class: 'pending-confirm' }, text('等您回复：' + t.question.text)))
+  if (t.deferred?.status === 'pending') row.append(el('p', { class: 'quiet small' }, text('截止时间 ' + fmtTime(t.deferred.expiresAt))))
   row.append(el('details', {}, el('summary', {}, text('详情')), ticketDetails(t)))
   return row
 }
@@ -153,7 +163,8 @@ function renderBoard(overview) {
   needBox.replaceChildren()
   if (!needs.length) needBox.append(el('p', { class: 'quiet' }, text('没有 — 安静默认。')))
   for (const t of needs) {
-    needBox.append(ticketRow(t, { actions: t.stage === 'person/confirm' ? confirmActions(t) : undefined }))
+    needBox.append(ticketRow(t, { actions: t.stage === 'person/confirm' ? confirmActions(t)
+      : t.stage === 'person/answer' ? answerAction(t) : undefined }))
   }
 
   // Q2 什么状态: 按阶段分组, 组头计数 = 列表长度 (诚实状态)
@@ -200,6 +211,7 @@ function renderBoard(overview) {
   }
 
   // 投喂口径（只读观测面）：飞书入口与负责人路由各自生效的受理口径/去重/队列状态
+  renderTimers(overview.timers, owners)
   renderIntake(overview.intake)
 
   // 最近触发（观测面）：渠道消息与处置——直读 trigger 表，异步加载不阻塞三问
@@ -221,6 +233,42 @@ function renderBoard(overview) {
     }
     trigBox.append(table)
   }).catch(() => trigBox.replaceChildren(el('p', { class: 'quiet small' }, text('触发记录加载失败。'))))
+}
+
+function renderTimers(timers, owners) {
+  const box = $('#timers')
+  const available = Array.isArray(timers)
+  $('#timers-title').hidden = !available
+  box.replaceChildren()
+  if (!available) return
+  if (!timers.length) box.append(el('p', { class: 'quiet' }, text('暂无提醒。')))
+  const states = { pending: '待触发', paused: '已暂停', firing: '正在提交', fired: '已建任务', cancelled: '已取消', failed: '失败' }
+  for (const timer of timers) {
+    const label = owners.find(owner => owner.id === timer.ownerId)?.workspace ?? timer.ownerId
+    const actions = timer.status === 'pending' ? [['pause', '暂停'], ['cancel', '取消提醒']]
+      : timer.status === 'paused' ? [['resume', '恢复'], ['cancel', '取消提醒']] : timer.status === 'firing' || (timer.status === 'fired' && timer.delivery?.state === 'queued') ? [['cancel', '取消提醒']] : []
+    const row = el('div', { class: 'ticket-row' }, el('strong', {}, text(timer.message)),
+      el('p', { class: 'quiet small' }, text([label, fmtTime(timer.fireAt), states[timer.status], timer.late ? '已迟到' : null].filter(Boolean).join(' · '))))
+    if (timer.delivery?.ticketId) row.append(el('p', { class: 'quiet small' }, text('任务 ' + timer.delivery.ticketId)))
+    const delivery = ({ queued: '待投递', sent: '已接管', failed: '投递失败' })[timer.delivery?.state]
+    if (delivery) row.append(el('p', { class: 'quiet small' }, text(delivery)))
+    if (timer.delivery?.workerSession?.sessionId) row.append(el('p', { class: 'quiet small' }, text('会话 ' + timer.delivery.workerSession.sessionId)))
+    if (timer.lastError?.message) row.append(el('p', { role: 'alert', class: 'warn-text' }, text(timer.lastError.message)))
+    for (const [action, name] of actions) {
+      const button = el('button', { class: 'btn', type: 'button' }, text(name))
+      button.addEventListener('click', async () => {
+        if (action === 'cancel' && !window.confirm('取消提醒「' + timer.message + '」？')) return
+        button.disabled = true
+        try {
+          await api('timers/manage', { method: 'POST', body: { id: timer.id, action } })
+          await refresh()
+        } catch (error) { showError(error) }
+        finally { button.disabled = false }
+      })
+      row.append(button)
+    }
+    box.append(row)
+  }
 }
 
 /* ---------- 投喂口径（只读） ---------- */

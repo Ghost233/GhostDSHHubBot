@@ -50,7 +50,7 @@ export function forkConfirmText(action, ticketId) {
  *
  * @returns {{ ticket: object, fromSessionId: string, sessionId: string, cwd: string, atSeq?: number }}
  */
-export async function confirmTicketFork({ tasks, sessions, ticketId }) {
+export async function confirmTicketFork({ tasks, sessions, ticketId, checkConfirmation }) {
   const ticket = tasks.getTicket(ticketId)
   if (!ticket) throw new TaskError('unknown-ticket', 'unknown ticket "' + ticketId + '"')
   if (ticket.stage !== 'person/confirm') throw new TaskError('illegal-transition', 'ticket ' + ticketId + ': confirm requires person/confirm, got ' + ticket.stage)
@@ -65,6 +65,7 @@ export async function confirmTicketFork({ tasks, sessions, ticketId }) {
   }
   const sessionId = forked?.sessionId ?? forked?.session?.id
   if (typeof sessionId !== 'string' || !sessionId) throw new TaskError('fork-empty', 'sessions.fork returned no session id')
+  checkConfirmation?.()
   const confirmed = tasks.confirm({ ticketId, result: { fork: { fromSessionId: action.sessionId, sessionId } }, by: 'user' })
   const bound = tasks.bindWorkerSession(ticketId, { sessionId, cwd: action.cwd, mechanism: 'fork' })
   void confirmed

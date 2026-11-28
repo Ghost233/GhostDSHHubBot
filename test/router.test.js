@@ -13,6 +13,7 @@ import { join } from 'node:path'
 import { Store } from '../src/store.js'
 import { OwnerRegistry } from '../src/registry.js'
 import { Router, RouterError, RECOVERY_NOTE } from '../src/router.js'
+import { DeferredRegistry } from '../src/deferred.js'
 
 /** A registry+router with a scriptable fake Sessions port and a deterministic clock. */
 function fixture({ failSessions = [], config } = {}) {
@@ -852,4 +853,185 @@ test('overlapping stop requests are recorded without interrupting the next turn'
     store.close()
     rmSync(directory, { recursive: true, force: true })
   }
+})
+
+test('background GitHub work stays independent and respects its stable owner’s slots', async () => {
+  const { router, registry, calls, cleanup } = fixture({ config: { concurrency: { slotsPerOwner: 2 } } })
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Fixture project', cwd: '/repos/project' })
+    registry.bindSession(owner.id, 'owner-before')
+    await router.routeToOwner({ ownerId: owner.id, message: 'regular owner work' })
+    const authorization = { actor: 'fixture-user', source: 'github', at: '2026-11-15T00:00:00.000Z' }
+    const event = number => ({
+      ownerId: owner.id, triggerRef: 'github:fixture/project:issue:' + number, authorization,
+      source: { kind: 'github', repo: 'fixture/project', issueNumber: number }, message: 'fixture issue ' + number,
+    })
+    const first = await router.routeBackground(event(1))
+    const second = await router.routeBackground(event(2))
+    const duplicate = await router.routeBackground(event(1))
+    assert.equal(first.stage, 'working')
+    assert.equal(second.stage, 'queued')
+    assert.equal(duplicate.ticketId, first.ticketId)
+    const worker = router.getTicket(first.ticketId).workerSession.sessionId
+    assert.notEqual(worker, 'owner-before')
+    assert.equal(calls.create.length, 1)
+    assert.equal(calls.create[0].agentPreset, undefined)
+    assert.equal(router.getTrigger(event(1).triggerRef).policy.mode, 'independent')
+    assert.deepEqual(router.getTicket(first.ticketId).authorization, authorization)
+    await assert.rejects(router.reportBackground({ ticketId: first.ticketId, sessionId: 'owner-before', summary: 'wrong caller' }), { code: 'background-worker-mismatch' })
+    registry.bindSession(owner.id, 'owner-after')
+    await router.reportBackground({ ticketId: first.ticketId, sessionId: worker, summary: 'fixture finished' })
+    await router.tick()
+    assert.equal(router.getTicket(first.ticketId).stage, 'person/review')
+    const secondWorker = router.getTicket(second.ticketId).workerSession.sessionId
+    assert.notEqual(secondWorker, worker)
+    assert.equal(registry.get(owner.id).sessionId, 'owner-after')
+    assert.ok(calls.prompt.some(prompt => prompt.sessionId === 'owner-after' && prompt.text.includes('fixture finished')))
+  } finally { cleanup() }
+})
+
+test('separate occurrences reuse the same follow-up worker without reusing the owner', async () => {
+  const { router, registry, calls, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Fixture project', cwd: '/repos/project' })
+    registry.bindSession(owner.id, 'fixture-owner')
+    const authorization = { actor: 'fixture-user', source: 'timer', at: '2026-11-15T00:00:00.000Z' }
+    const fire = n => router.routeBackground({
+      ownerId: owner.id, triggerRef: 'timer:fixture-timer:' + n, authorization, message: 'fixture follow-up',
+      source: { kind: 'timer', timerId: 'fixture-timer', occurrenceId: String(n) },
+    })
+    const first = await fire(1)
+    const second = await fire(2)
+    const ticket1 = router.getTicket(first.ticketId)
+    const ticket2 = router.getTicket(second.ticketId)
+    assert.notEqual(ticket1.id, ticket2.id)
+    assert.equal(ticket1.workerSession.sessionId, ticket2.workerSession.sessionId)
+    assert.notEqual(ticket1.workerSession.sessionId, 'fixture-owner')
+    assert.equal(calls.create.length, 1)
+    assert.equal(calls.prompt.length, 2)
+    assert.notEqual(calls.prompt[0].requestId, calls.prompt[1].requestId)
+  } finally { cleanup() }
+})
+
+test('a replaced confirmation cannot dispatch or bind work using the earlier approval', async () => {
+  for (const actionType of ['dangerous-inject', 'fork']) {
+    const { router, registry, store, calls, cleanup } = fixture()
+    try {
+      const owner = registry.create({ kind: 'repo', workspace: 'Fixture approval', cwd: '/repos/fixture' })
+      registry.bindSession(owner.id, 'approval-owner')
+      router.installDeferred(new DeferredRegistry({ store, tasks: router.tasks, now: router.now,
+        owners: { currentBinding: id => registry.get(id), isOwnerSession: id => registry.isOwnerSession(id) } }))
+      const { ticketId } = await router.routeToOwner({ ownerId: owner.id, message: 'prepare fixture' })
+      const sessionId = 'original-worker'
+      const worker = { sessionId, cwd: '/repos/fixture' }
+      let entered, release
+      const reachedHost = new Promise(resolve => { entered = resolve })
+      const gate = new Promise(resolve => { release = resolve })
+      router.sessions.workerInfo = async () => {
+        if (actionType === 'dangerous-inject') {
+          entered()
+          await gate
+        }
+        return worker
+      }
+      let requestedFork
+      router.sessions.fork = async args => {
+        requestedFork = args
+        entered()
+        await gate
+        return { sessionId: 'fixture-fork' }
+      }
+      const action = actionType === 'fork'
+        ? { type: actionType, sessionId, cwd: worker.cwd, atSeq: 17, reason: 'fixture fork' }
+        : { type: actionType, entry: 'owner-inject', sessionId, text: 'approved fixture' }
+      const waiting = router.openQuestion({ ticketId, question: 'Approve the first request?', action })
+      const approval = router.resolveDeferred({ ticketId, requestId: waiting.deferred.requestId, decision: 'approve', channel: 'panel' })
+      const rejected = assert.rejects(approval, { code: 'fulfillment-failed' })
+      await Promise.race([reachedHost, approval])
+      try {
+        router.tasks.rejectConfirm({ ticketId, reason: 'The earlier wait was superseded' })
+        router.tasks.resume(ticketId)
+        router.tasks.askConfirm({ ticketId, question: 'Approve the later request?', action })
+      } finally { release() }
+      await rejected
+      assert.equal(router.getTicket(ticketId).stage, 'person/confirm')
+      assert.equal(router.getTicket(ticketId).workerSession, undefined)
+      assert.equal(calls.prompt.some(prompt => prompt.sessionId === sessionId), false)
+      if (actionType === 'fork') assert.deepEqual(requestedFork, { sessionId, atSeq: 17 })
+    } finally { cleanup() }
+  }
+})
+
+test('a timely Feishu answer arriving before dequeue expiry goes to the current owner exactly once', async () => {
+  const { router, registry, store, calls, advance, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Fixture owner', cwd: '/repos/fixture' })
+    registry.bindSession(owner.id, 'owner-before-answer')
+    router.installDeferred(new DeferredRegistry({
+      store, tasks: router.tasks, now: router.now, ttlMs: 1000,
+      owners: { currentBinding: id => registry.get(id), isOwnerSession: id => registry.isOwnerSession(id) },
+    }))
+    function receive(messageId, message) {
+      return router.acceptFeishuTrigger({
+        id: 'feishu-' + messageId, kind: 'feishu', message, at: router.now(),
+        source: { kind: 'feishu', chatId: 'fixture-origin-chat', messageId, openId: 'fixture-original-user', addressing: 'direct' },
+        authorization: { actor: 'fixture-original-user', source: 'feishu', at: router.now() },
+      })
+    }
+    const original = await receive('question-origin', 'boot fixture')
+    const { ticketId } = await router.routeToOwner({ ownerId: owner.id, triggerRef: original.triggerId, message: 'fixture request' })
+    const waiting = router.openQuestion({ ticketId, question: 'Which fixture file?' })
+    const { requestId } = waiting.deferred
+    assert.equal(waiting.stage, 'person/answer')
+    const responseIntent = router.listOutbox().find(row => row.requestId === 'hub-bot-question-' + requestId)
+    assert.equal(responseIntent.to, 'feishu:chat:fixture-origin-chat')
+    assert.equal(responseIntent.triggerId, original.triggerId)
+    await assert.rejects(router.resolveDeferred({ requestId, decision: 'answer', text: 'untrusted', channel: 'feishu',
+      chatId: 'different-chat', actor: 'fixture-original-user' }), { code: 'deferred-actor-mismatch' })
+    await receive('plain-text', 'answer ordinary chat')
+    await router.tick()
+    assert.equal(router.getTicket(ticketId).stage, 'person/answer')
+    registry.bindSession(owner.id, 'owner-after-answer')
+    advance(900)
+    const response = '/hub-answer ' + requestId + ' answer Use the checked fixture.'
+    await receive('answer-receipt', response)
+    advance(1100)
+    await router.tick()
+    await receive('answer-receipt', response)
+    await router.tick()
+    const delivered = calls.prompt.filter(prompt => prompt.requestId === 'hub-bot-answer-' + requestId)
+    assert.equal(delivered.length, 1)
+    assert.equal(delivered[0].sessionId, 'owner-after-answer')
+    assert.match(delivered[0].text, /Use the checked fixture/)
+    assert.equal(router.getTicket(ticketId).stage, 'working')
+  } finally { cleanup() }
+})
+
+test('a background question resumes its bound worker instead of the current owner', async () => {
+  const { router, registry, store, calls, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Fixture worker', cwd: '/repos/fixture' })
+    registry.bindSession(owner.id, 'owner-worker-before')
+    router.installDeferred(new DeferredRegistry({ store, tasks: router.tasks, now: router.now,
+      owners: { currentBinding: id => registry.get(id), isOwnerSession: id => registry.isOwnerSession(id) } }))
+    const work = await router.routeBackground({
+      ownerId: owner.id, triggerRef: 'timer:fixture-question:1', message: 'fixture timer',
+      authorization: { actor: 'fixture-creator', source: 'timer', at: router.now() },
+      source: { kind: 'timer', timerId: 'fixture-question', fireAt: router.now() },
+    })
+    const { ticketId } = work
+    const sessionId = router.getTicket(ticketId).workerSession.sessionId
+    router.askBackground({ ticketId, sessionId, question: 'Choose fixture input.' })
+    const { requestId } = router.getTicket(ticketId).deferred
+    registry.bindSession(owner.id, 'owner-worker-after')
+    const answer = { requestId, ticketId, decision: 'answer', text: 'Use this fixture.', channel: 'panel' }
+    const done = await router.resolveDeferred(answer)
+    assert.equal(done.outcome, 'answered')
+    assert.equal((await router.resolveDeferred(answer)).duplicate, true)
+    await router.tick()
+    const delivered = calls.prompt.filter(prompt => prompt.requestId === 'hub-bot-answer-' + requestId)
+    assert.equal(delivered.length, 1)
+    assert.equal(delivered[0].sessionId, sessionId)
+    assert.equal(router.getTicket(ticketId).stage, 'working')
+  } finally { cleanup() }
 })

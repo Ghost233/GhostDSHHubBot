@@ -14,7 +14,7 @@ import { DEFAULT_DANGEROUS_PATTERNS, validateDangerousPatterns } from './securit
 import { DEFAULT_FEISHU_CREDENTIAL_REF, isFeishuCredentialRef } from './feishu-credentials.js'
 
 /** The configuration keys this plugin understands. Anything else is rejected so typos cannot pass silently. */
-const KNOWN_KEYS = new Set(['stateDir', 'homeRepo', 'devApi', 'reporting', 'feishu', 'github', 'concurrency', 'security', 'chief', 'workspaces'])
+const KNOWN_KEYS = new Set(['stateDir', 'homeRepo', 'devApi', 'reporting', 'feishu', 'github', 'concurrency', 'security', 'deferred', 'chief', 'workspaces'])
 
 /** The keys the scheduled auto-summary understands (#67 定时汇总自动汇报 — OFF by default). */
 const KNOWN_REPORTING_KEYS = new Set(['auto', 'intervalMs'])
@@ -102,6 +102,25 @@ export function resolveConfig(config) {
   if (typeof homeRepo !== 'string') throw new ConfigError('hub-bot config.homeRepo must be a string')
   if (!isAbsolute(homeRepo)) throw new ConfigError(`hub-bot config.homeRepo must be absolute, got "${homeRepo}"`)
   const resolved = { stateDir, homeRepo }
+
+  if (raw.deferred !== undefined) {
+    const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value)
+    const config = raw.deferred
+    if (!isObject(config) || Object.keys(config).some(key => !['ttlMs', 'ttlByAction'].includes(key))) {
+      throw new ConfigError('hub-bot config.deferred must contain only ttlMs and ttlByAction')
+    }
+    const validDuration = value => Number.isSafeInteger(value) && value > 0
+    if (config.ttlMs !== undefined && !validDuration(config.ttlMs)) {
+      throw new ConfigError('hub-bot config.deferred.ttlMs must be a positive integer')
+    }
+    const byAction = config.ttlByAction
+    if (byAction !== undefined && (!isObject(byAction) || Object.entries(byAction).some(
+      ([type, ttl]) => !['fork', 'dangerous-inject', 'ask-user'].includes(type) || !validDuration(ttl),
+    ))) {
+      throw new ConfigError('hub-bot config.deferred.ttlByAction expects positive durations for fork, dangerous-inject, or ask-user')
+    }
+    resolved.deferred = config
+  }
   // devApi 空对象 = 未配置（cordis Config schema 会把缺省段回填为 {}——视为没写，API 不启用）。
   if (raw.devApi !== undefined && !(typeof raw.devApi === 'object' && raw.devApi !== null && !Array.isArray(raw.devApi) && Object.keys(raw.devApi).length === 0)) {
     const devApi = raw.devApi

@@ -43,6 +43,8 @@ import { GitHubSource } from './github.js'
 import { Recycler } from './recycle.js'
 import { WorkspacePlacer } from './workspaces.js'
 import { HubBotSettingsService } from './settings-service.js'
+import { TimerService } from './timers.js'
+import { DeferredRegistry } from './deferred.js'
 
 export const name = 'hub-bot'
 export const inject = ['sessionController', 'sessionPersistence', 'webServer']
@@ -85,6 +87,14 @@ export const Config = z.object({
   concurrency: z.object({
     slotsPerOwner: z.number().description('同 owner 并发 working 任务上限（默认 3）。'),
   }).description('执行槽 (#72)。'),
+  deferred: z.object({
+    ttlMs: z.number().description('确认和问答的默认期限（毫秒，缺省 24 小时）。'),
+    ttlByAction: z.object({
+      fork: z.number().description('Fork 确认的期限。'),
+      'dangerous-inject': z.number().description('高风险注入确认的期限。'),
+      'ask-user': z.number().description('用户问题的期限。'),
+    }),
+  }),
   reporting: z.object({
     auto: z.boolean().description('定时汇总自动汇报开关（默认关）。'),
     intervalMs: z.number().description('汇总间隔毫秒（默认 60000）。'),
@@ -193,11 +203,19 @@ export function apply(ctx, rawConfig) {
   const sessions = {
     create: async request => {
       const value = await sessionController.create(request, deadline(30_000))
-      return { sessionId: value.sessionId ?? value.session?.id }
+      return { sessionId: value.sessionId ?? value.session?.id, agentPreset: value.agentPreset }
     },
-    prompt: async ({ sessionId, requestId, text }) => {
+    isArchived: sessionId => (safeGetService(ctx, 'workspaceRegistry')?.archivedSessionIds ?? []).includes(sessionId),
+    workerInfo: async sessionId => {
+      const listed = await sessionController.list({}, deadline(10_000))
+      const item = (listed.items ?? []).find(entry => entry.sessionId === sessionId)
+      if (!item) return undefined
+      const stored = await ctx.sessionPersistence.stat(sessionId, { signal: deadline(10_000) })
+      return { cwd: item.cwd, agentPreset: stored?.header?.agentPreset ?? item.projections?.values?.agentPreset }
+    },
+    prompt: async ({ sessionId, requestId, text, content }) => {
       const value = await sessionController.prompt({
-        requestId, sessionId, mode: 'queue', content: [{ type: 'text', text }],
+        requestId, sessionId, mode: 'queue', content: content ?? [{ type: 'text', text }],
       }, deadline(30_000))
       await ctx.sessionPersistence.flush()
       return value
@@ -229,9 +247,121 @@ export function apply(ctx, rawConfig) {
   const placer = new WorkspacePlacer({ workspaceController: safeGetService(ctx, 'workspaceController'), homeRepo: config.homeRepo, workspaces: config.workspaces, logger: ctx.logger, registryList: () => safeGetService(ctx, 'workspaceRegistry')?.list?.() ?? [], archivedList: () => { try { return safeGetService(ctx, 'workspaceRegistry')?.archivedSessionIds ?? [] } catch { return [] } } })
   const hub = new Hub({ store, config, sessions, onSystemProblem: p => ctx.logger.warn('hub-bot system problem: %s (ticket %s, row %s)', p.reason, p.ticketId, p.rowId), placer })
   const chief = hub.registry.ensureChief({ cwd: config.homeRepo, workspace: basename(config.homeRepo) })
+  hub.router.installDeferred(new DeferredRegistry({
+    store, tasks: hub.tasks, now: hub.router.now, ...config.deferred,
+    owners: {
+      currentBinding: ownerId => hub.registry.get(ownerId),
+      isOwnerSession: sessionId => hub.registry.isOwnerSession(sessionId),
+    },
+  }))
   // Owner preset subtrees resolve the Hub through the Host root context.
   const unprovide = ctx[Context.root].reflect.provide('hubBot', hub)
   setHub(hub)
+  const timers = new TimerService({ store, getOwner: id => hub.registry.get(id), getTicket: id => hub.router.getTicket(id),
+    routeBackground: request => hub.router.routeBackground(request) })
+  hub.router.timerCanDeliver = (id, ref) => timers.canDeliver(id, ref)
+  const timerAction = ({ id, action } = {}) => {
+    if (!['pause', 'resume', 'cancel'].includes(action) || typeof id !== 'string' || !id) {
+      throw new HttpError(400, 'A timer ID and pause, resume, or cancel are required.')
+    }
+    try {
+      return timers[action](id)
+    } catch (error) {
+      if (error?.name === 'TimerError') throw new HttpError(error.code === 'timer-not-found' ? 404 : 400, error.message)
+      throw error
+    }
+  }
+  const overview = async () => ({
+    ...buildOverview({ store, registry: hub.registry, health: await buildHealth() }),
+    timers: timers.list(),
+  })
+  ctx.inject(['tools'], scope => {
+    scope.tools.register({
+      name: 'report_background',
+      description: '记录当前后台任务的结果或失败原因，交给对应负责人。',
+      parameters: {
+        type: 'object', required: ['ticketId'], additionalProperties: false,
+        properties: { ticketId: { type: 'string' }, summary: { type: 'string' }, failure: { type: 'string' }, evidence: { type: 'string' } },
+      },
+      output: {
+        schema: { type: 'object', required: ['ticketId', 'stage'], additionalProperties: false,
+          properties: { ticketId: { type: 'string' }, stage: { type: 'string' } } },
+        render: (_args, value) => [{ type: 'text', text: '后台任务 ' + value.ticketId + ' 的结果已记录。' }],
+      },
+      execute: (args, exec) => hub.router.reportBackground({ ...args, sessionId: exec.agent?.id }),
+    }, { when: ({ agent }) => hub.router.isBackgroundWorker(agent.id) })
+    scope.tools.register({
+      name: 'ask_background', description: '请用户回答当前后台任务的问题。随后等待这条请求的明确答复。',
+      parameters: { type: 'object', properties: { ticketId: { type: 'string' }, question: { type: 'string' } },
+        required: ['ticketId', 'question'], additionalProperties: false },
+      output: { schema: { type: 'object', properties: { ticketId: { type: 'string' }, stage: { type: 'string' } },
+        required: ['ticketId', 'stage'], additionalProperties: false },
+        render: (_args, value) => [{ type: 'text', text: '任务 ' + value.ticketId + ' 正等待用户回复。' }] },
+      execute: async (args, exec) => hub.router.askBackground({ ...args, sessionId: exec.agent?.id }),
+    }, { when: ({ agent }) => hub.router.isBackgroundWorker(agent.id) })
+    const getManager = sessionId => {
+      if (store.closed) return undefined
+      const owner = hub.registry.findByCurrentSession(sessionId)
+      return owner && !owner.transient ? owner : undefined
+    }
+    const managerFor = (exec, ownerId) => {
+      const manager = getManager(exec.agent?.id)
+      if (!manager || (ownerId && manager.role !== 'chief' && ownerId !== manager.id)) {
+        throw new Error('This session cannot manage timers for that owner.')
+      }
+      return manager
+    }
+    const managerTool = { when: ({ agent }) => Boolean(getManager(agent.id)) }
+    const textProperty = { type: 'string' }
+    const timerResult = {
+      schema: { type: 'object', properties: { timer: { type: 'object' }, changed: { type: 'boolean' } },
+        required: ['timer'], additionalProperties: false },
+      render: (_args, value) => [{ type: 'text', text: value.timer.id + ' · ' + value.timer.status + ' · ' + value.timer.fireAt }],
+    }
+    scope.tools.register({
+      name: 'timer_create',
+      description: '安排一次性后台跟进。fireAt 使用带时区的绝对时间。飞书交代的提醒可带原消息 triggerRef，以便后续问答回原处。',
+      parameters: { type: 'object', properties: { ownerId: textProperty, fireAt: textProperty, message: textProperty, triggerRef: textProperty },
+        required: ['fireAt', 'message'], additionalProperties: false },
+      output: timerResult,
+      async execute({ ownerId, fireAt, message, triggerRef }, exec) {
+        const manager = managerFor(exec, ownerId)
+        let origin
+        if (triggerRef) {
+          const trigger = hub.router.getTrigger(triggerRef)
+          const sender = trigger?.authorization?.actor
+          const isFeishu = trigger?.kind === 'feishu' && !trigger.dropped && trigger.source?.chatId && sender
+            && trigger.source.openId === sender && trigger.authorization.source === 'feishu'
+          const withinOwner = manager.role === 'chief' || hub.router.queryTasks({ owner: manager.id }).some(ticket => ticket.triggerId === triggerRef)
+          if (!isFeishu || !withinOwner) throw new Error('The Feishu source for this reminder cannot be verified.')
+          origin = { kind: 'feishu', triggerId: trigger.id, chatId: trigger.source.chatId, actor: sender }
+        }
+        return { timer: timers.create({ ownerId: ownerId ?? manager.id, createdBy: exec.agent.id, fireAt, message, origin }) }
+      },
+    }, managerTool)
+    scope.tools.register({
+      name: 'timer_list', description: '查看提醒的到期时间、状态和关联任务。',
+      parameters: { type: 'object', properties: { ownerId: textProperty }, additionalProperties: false },
+      output: { schema: { type: 'object', properties: { timers: { type: 'array' } }, required: ['timers'], additionalProperties: false },
+        render: (_args, value) => [{ type: 'text', text: JSON.stringify(value.timers) }] },
+      async execute({ ownerId }, exec) {
+        const manager = managerFor(exec, ownerId)
+        return { timers: timers.list({ ownerId: ownerId ?? (manager.role === 'chief' ? undefined : manager.id) }) }
+      },
+    }, managerTool)
+    scope.tools.register({
+      name: 'timer_manage', description: '暂停、恢复或取消提醒。取消不会停止已经开始的执行会话。',
+      parameters: { type: 'object', properties: { id: textProperty, action: { type: 'string', enum: ['pause', 'resume', 'cancel'] } },
+        required: ['id', 'action'], additionalProperties: false },
+      output: timerResult,
+      async execute(args, exec) {
+        const timer = timers.get(args.id)
+        if (!timer) throw new Error('Unknown timer.')
+        managerFor(exec, timer.ownerId)
+        return timerAction(args)
+      },
+    }, managerTool)
+  })
   // 飞书入口 (#68): OFF unless config.feishu.enabled. With credentials present the WSClient long connection
   // starts at boot; the same source scans recorded feishu reply intents on the 1s tick (阶段 2 留的通道).
   const feishu = new FeishuSource({
@@ -272,6 +402,7 @@ export function apply(ctx, rawConfig) {
   })().catch(error => ctx.logger.warn('hub-bot workspace warmup failed (non-fatal): %s', error?.message ?? error))
   void hub.router.tick().catch(error => ctx.logger.warn('hub-bot delivery resume failed: %s', error?.message ?? error))
   const deliveryTimer = setInterval(() => {
+    void timers.tick().catch(error => ctx.logger.warn('hub-bot timer tick failed: %s', error?.message ?? error))
     void hub.router.tick().catch(error => ctx.logger.warn('hub-bot delivery tick failed: %s', error?.message ?? error))
     void hub.router.autoReportTick().catch(error => ctx.logger.warn('hub-bot auto-report tick failed: %s', error?.message ?? error))
     if (config.feishu.enabled && feishu.credentialState === 'ok') {
@@ -442,6 +573,7 @@ export function apply(ctx, rawConfig) {
     modelCatalog: forwardDep('modelCatalog'),
     overview: forwardDep('overview'),
     messageDetail: forwardDep('messageDetail'),
+    timerAction,
     resolveTicket: forwardDep('resolveTicket'),
     startFeishuRegister: forwardDep('startFeishuRegister'),
     listWorkspaces: forwardDep('listWorkspaces'),
@@ -480,7 +612,7 @@ export function apply(ctx, rawConfig) {
         return out
       } catch { return {} }
     },
-    overview: async () => buildOverview({ store, registry: hub.registry, health: await buildHealth() }),
+    overview,
     messageDetail: triggerId => readMessageDetail(store, triggerId),
     resolveTicket: request => resolveTicket(request),
     startFeishuRegister,
@@ -623,7 +755,19 @@ export function apply(ctx, rawConfig) {
   const resolveTicket = async body => {
     const ticketId = requireString(body, 'ticketId')
     const resolution = requireString(body, 'resolution')
-    if (!['confirm', 'reject', 'answer', 'accept', 'retry', 'cancel'].includes(resolution)) throw new HttpError(400, 'resolution must be "confirm", "reject", "answer", "accept", "retry" or "cancel"')
+    if (!['confirm', 'reject', 'answer', 'accept', 'retry', 'cancel'].includes(resolution)) throw new HttpError(400, 'Invalid ticket resolution.')
+    const requestId = optionalString(body, 'requestId')
+    if (requestId) {
+      const decision = ({ confirm: 'approve', reject: 'reject', answer: 'answer', cancel: 'cancel' })[resolution]
+      if (!decision) throw new HttpError(400, 'This operation is not a deferred decision.')
+      try {
+        return await hub.router.resolveDeferred({ requestId, ticketId, decision,
+          channel: 'panel', text: optionalString(body, 'message') })
+      } catch (error) {
+        if (['TaskError', 'RouterError', 'DeferredError'].includes(error?.name)) throw new HttpError(400, error.message)
+        throw error
+      }
+    }
     // 取消（round 43）: idle/queued 票还没开始执行，允许直接关闭（done）。已开始的一律走 reject/失败路径。
     if (resolution === 'cancel') {
       const ticket0 = hub.router.getTicket(ticketId)
@@ -767,9 +911,10 @@ export function apply(ctx, rawConfig) {
           // Forces one polling cycle NOW (dev proof without waiting 5min); body {repo?} narrows to one repo.
           const body = await readBody(req)
           if (body.repo) {
-            const cfg = (config.github.repos ?? []).find(r => r.repo === body.repo)
-            if (!cfg) { json(res, 404, { error: 'unknown repo ' + body.repo }); return }
-            json(res, 200, await github.pollRepo(cfg))
+            const repo = requireString(body, 'repo')
+            const result = await github.pollWatchedRepo(repo)
+            if (result === null) throw new HttpError(404, 'Unknown watched repository ' + repo)
+            json(res, 200, result)
           } else {
             json(res, 200, await github.pollAll())
           }
@@ -782,7 +927,9 @@ export function apply(ctx, rawConfig) {
           else json(res, 200, await github.handleIssueEvent(body.item, cfg))
         } else if (route === 'overview' && method === 'GET') {
           // 三问视图数据 (#73): 票面 + 注册表 + 健康快照, 一次取齐
-          json(res, 200, buildOverview({ store, registry: hub.registry, health: await buildHealth() }))
+          json(res, 200, await overview())
+        } else if (route === 'timers/manage' && method === 'POST') {
+          json(res, 200, timerAction(await readBody(req)))
         } else if (route === 'settings' && method === 'GET') {
           json(res, 200, await settingsView())
         } else if (route === 'models/catalog' && method === 'GET') {

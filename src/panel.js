@@ -392,6 +392,14 @@ export function readMessageDetail(store, triggerId) {
     intake: trigger.policy || delivery ? {
       disposition: delivery?.state === 'failed' ? 'failed' : intakeDisposition(trigger, ticket),
       queueState: delivery?.state ?? null, lastError: delivery?.lastError ?? null,
+      ...(trigger.intakeCohort && { cohort: {
+        ...trigger.intakeCohort,
+        messages: trigger.intakeCohort.triggerIds.map(id => {
+          const linked = store.db.prepare('SELECT value FROM trigger WHERE id = ?').get(id)
+          return { triggerId: id, message: linked ? storedMessage(JSON.parse(String(linked.value))) : null,
+            ticketIds: store.db.prepare("SELECT id FROM ticket WHERE json_extract(value, '$.triggerId') = ?").all(id).map(ticket => ticket.id) }
+        }),
+      } }),
     } : null,
     reply: row ? { ...projectReply(row), sentAt: row.sentAt ?? null } : null,
   }
@@ -556,8 +564,12 @@ export function buildOverview({ store, registry, health, now, listDir }) {
       authorization: t.authorization ?? null,
       trigger: trigger ? { id: trigger.id, kind: trigger.kind ?? null, at: trigger.at ?? null, sourceRef: trigger.sourceRef ?? null } : null,
       assignments: t.assignments ?? [],
+      workerSession: t.workerSession ?? null,
+      background: t.background ? { kind: t.background.kind, timerId: t.background.timerId ?? null } : null,
       question: t.question ?? null,
       pendingConfirm: t.pendingConfirm ?? null,
+      deferred: t.deferred ? { requestId: t.deferred.requestId, type: t.deferred.type,
+        status: t.deferred.status, expiresAt: t.deferred.expiresAt } : null,
       report: t.report ?? null,
       dirListing: null,
     }

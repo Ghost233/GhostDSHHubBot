@@ -147,6 +147,17 @@ export class HubBotSettingsService extends TypertRemoteService {
     return detail
   }
 
+  async timerAction(request) {
+    try {
+      return await this.deps.timerAction(request ?? {})
+    } catch (error) {
+      if ([400, 404].includes(error?.status ?? error?.statusCode)) {
+        throw new RemoteError('timer/invalid', error.message, {})
+      }
+      throw error
+    }
+  }
+
   /** Start the feishu scan-to-bind device flow (idempotent: a pending registration is not restarted). */
   async startFeishuRegister() {
     try {
@@ -182,5 +193,6 @@ markRemote(HubBotSettingsService, 'discardOutbox', {})
 markRemote(HubBotSettingsService, 'selfTest', {})
 markRemote(HubBotSettingsService, 'overview', {})
 markRemote(HubBotSettingsService, 'messageDetail', {})
+markRemote(HubBotSettingsService, 'timerAction', {})
 markRemote(HubBotSettingsService, 'resolveTicket', {})
 markRemote(HubBotSettingsService, 'startFeishuRegister', {})

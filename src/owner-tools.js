@@ -315,7 +315,8 @@ export function apply(ctx) {
       const dangerousHit = findDangerousPattern(text, hub(ctx).config?.security?.dangerousPatterns ?? DEFAULT_DANGEROUS_PATTERNS)
       if (dangerousHit) {
         if (args.ticketId !== undefined) {
-          hub(ctx).tasks.askConfirm({
+          const openConfirm = api.router?.openQuestion?.bind(api.router) ?? api.tasks.askConfirm.bind(api.tasks)
+          openConfirm({
             ticketId: args.ticketId,
             question: dangerousConfirmText(dangerousHit, args.text.trim()),
             action: { type: DANGEROUS_INJECT_ACTION, entry: 'owner-inject', sessionId: args.sessionId, text },
@@ -366,7 +367,8 @@ export function apply(ctx) {
         : Object.fromEntries(sectionKeys.map(k => [k, args[k]]))
       try {
         const ticket = args.question !== undefined
-          ? api.tasks.ask({ ticketId: args.ticketId, question: args.question })
+          ? (api.router?.openQuestion?.({ ticketId: args.ticketId, question: args.question })
+            ?? api.tasks.ask({ ticketId: args.ticketId, question: args.question }))
           : args.failure !== undefined
             ? api.tasks.fail({ ticketId: args.ticketId, reason: args.failure })
             : api.tasks.report({ ticketId: args.ticketId, summary: args.summary, evidence: args.evidence, sections })
@@ -418,7 +420,8 @@ export function apply(ctx) {
           requireCurrentBinding(api, owner)
           mustOwnTicket(api, owner, args.ticketId)
         }
-        const ticket = api.tasks.askConfirm({ ticketId: args.ticketId, question: forkConfirmText(action, args.ticketId), action })
+        const openConfirm = api.router?.openQuestion?.bind(api.router) ?? api.tasks.askConfirm.bind(api.tasks)
+        const ticket = openConfirm({ ticketId: args.ticketId, question: forkConfirmText(action, args.ticketId), action })
         // 需要行动 = 汇报事实： the confirm request joins this wake's digest and reaches the user via the chief.
         recordReportFact(api.store, owner.id, ticket)
         await api.router.tick()
