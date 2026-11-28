@@ -367,7 +367,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       timerCancelled: '已取消', timerFailed: '失败',
       timerWorker: '打开执行会话', timerDeliverySent: '已接管', timerDeliveryQueued: '待投递', timerDeliveryFailed: '投递失败',
       intakeCohort: '合并来信',
-      deferredExpires: '答复截止', deferredTarget: '目标会话',
+      deferredExpires: '答复截止', deferredTarget: '目标会话', deferredAnswer: '用户答复',
       answerQueued: '答复待接管', answerSent: '答复已接管', answerFailed: '答复投递失败', answerDiscarded: '已丢弃答复投递',
       intakeInterrupt: '停止请求',
       intakeInterruptRequested: '已请求停止',
@@ -748,7 +748,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       timerCancelled: 'Cancelled', timerFailed: 'Failed',
       timerWorker: 'Open worker session', timerDeliverySent: 'Admitted', timerDeliveryQueued: 'Pending delivery', timerDeliveryFailed: 'Delivery failed',
       intakeCohort: 'Combined incoming messages',
-      deferredExpires: 'Reply deadline', deferredTarget: 'Destination session',
+      deferredExpires: 'Reply deadline', deferredTarget: 'Destination session', deferredAnswer: 'User reply',
       answerQueued: 'Reply pending delivery', answerSent: 'Reply delivered', answerFailed: 'Reply delivery failed', answerDiscarded: 'Reply delivery discarded',
       intakeInterrupt: 'Stop request',
       intakeInterruptRequested: 'Stop requested',
@@ -1593,7 +1593,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 h('span', { style: settingsHintStyle }, fill(t('messageAttempts'), row.attempts ?? 0)),
                 ticketLink(row.ticketId),
                 isFailed ? h('div', { style: Object.assign({}, flexRow, { marginLeft: 'auto' }) },
-                  actionButton('retry', row, 'retryOne'), actionButton('discard', row, 'discardOne')) : null),
+                  row.retryable !== false ? actionButton('retry', row, 'retryOne') : null, actionButton('discard', row, 'discardOne')) : null),
               !isFailed ? h('div', { style: settingsHintStyle }, retrySchedule(row)) : null,
               row.text ? h('p', { style: Object.assign({}, settingsHintStyle, { margin: '4px 0 0' }) }, row.text) : null,
               row.lastError ? h('p', { style: { margin: '4px 0 0', fontSize: '12px', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } },
@@ -1606,7 +1606,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             return h('details', { key: isFailed ? 'failed' : 'retrying', style: groupStyle },
               h('summary', { style: { cursor: 'pointer', fontWeight: 600 } }, t(isFailed ? 'healthDetailDead' : 'healthDetailRetry') + ' · ' + rows.length),
               isFailed && rows.length > 1 ? h('div', { style: Object.assign({}, flexRow, { marginTop: '6px' }) },
-                actionButton('retry', null, 'retryAll'), actionButton('discard', null, 'discardAll')) : null,
+                rows.some(row => row.retryable !== false) ? actionButton('retry', null, 'retryAll') : null, actionButton('discard', null, 'discardAll')) : null,
               h('ul', { style: listStyle }, rows.map(row => deliveryRow(row, isFailed))));
           }
           if (!hasAlerts && !history.length && !feedback) {
@@ -2268,7 +2268,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 return h('div', { key: timer.id, style: { margin: '8px 0' } },
                   h('strong', null, timer.message),
                   h('div', { style: settingsHintStyle }, [ownerNames.get(timer.ownerId) || timer.ownerId, time, statusKey ? t(statusKey) : timer.status, deliveryKey ? t(deliveryKey) : null, timer.late ? t('timerLate') : null].filter(Boolean).join(' · ')),
-                  timer.lastError?.message ? h('p', { role: 'alert', style: settingsHintStyle }, timer.lastError.message) : null,
+                  timer.lastError?.message || timer.delivery?.lastError
+                    ? h('p', { role: 'alert', style: settingsHintStyle }, timer.lastError?.message ?? timer.delivery.lastError) : null,
                   h('div', { style: wrappingRow }, actions.map(action => h('button', { key: action, type: 'button', style: actionStyle, disabled: timerBusy, onClick: () => void act(timer, action) },
                     t(({ pause: 'timerPause', resume: 'timerResume', cancel: 'timerCancel' })[action]))),
                     timer.delivery?.ticketId ? h('button', { type: 'button', style: actionStyle, onClick: () => openStream({ ticketId: timer.delivery.ticketId }) }, t('timerRun')) : null,
@@ -2594,7 +2595,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                   })()
                 : null,
               h('span', { style: { fontSize: '12px', opacity: 0.55, whiteSpace: 'nowrap' } }, relTime(t, tk.updatedAt))));
-            if (tk.pendingConfirm) rows.push(h('div', { key: 'pc', style: { marginTop: '6px', fontSize: '13px', color: TONES.amber.fg } }, t('pendingConfirmLabel') + tk.pendingConfirm.text));
+            if (tk.pendingConfirm && tk.stage === 'person/confirm') rows.push(h('div', { key: 'pc', style: { marginTop: '6px', fontSize: '13px', color: TONES.amber.fg } }, t('pendingConfirmLabel') + tk.pendingConfirm.text));
             // 确认语义透明化： 危险注入挂起 → 确认=原样投递；fork 提案（无 action）→ 确认=fork 副本续作。
             if (tk.pendingConfirm && tk.stage === 'person/confirm') {
               var pcAction = tk.pendingConfirm.action;
@@ -2638,6 +2639,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               rows.push(h('p', { key: 'deferred-result', style: settingsHintStyle },
                 [answerStatusKey && t(answerStatusKey), decisionNote].filter(Boolean).join(' · ')));
             }
+            if (tk.deferred?.answer) rows.push(h('details', { key: 'deferred-answer-text', style: settingsHintStyle },
+              h('summary', null, t('deferredAnswer')), h('p', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } }, tk.deferred.answer)));
             var report = tk.report ? h(TicketReport, { key: 'report', report: tk.report,
               copied: copiedId === 'rp:' + tk.id, copy: text => copyText(text, 'rp:' + tk.id),
             }) : null;

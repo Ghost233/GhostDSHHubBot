@@ -28,12 +28,29 @@ export const GITHUB_SOURCE_MARK = '[hub-bot github '
 /** Consecutive gh send failures before a recorded intent fails out and reports a system problem. */
 const MAX_GITHUB_ATTEMPTS = 5
 const ISSUE_PAGE_SIZE = 100
+// Leave headroom below the gh buffer even for large, JSON-escaped Markdown bodies.
+const COMMENT_PAGE_SIZE = 30
 
-// The remote comment can be visible before gh returns its ID. Keep the wait scoped to its item.
-const replyPosts = new Map()
+// A leading hidden marker survives Markdown rendering without changing the visible reply.
+const REPLY_MARKER = /^<!-- hub-bot-github-reply:([a-f0-9-]{36}) -->\r?\n/
 
-function replyTargetKey(store, repo, number) {
-  return JSON.stringify([store.path, repo.toLowerCase(), number])
+function replyAttemptKey(outboxId) {
+  return 'github:reply-attempt:' + outboxId
+}
+
+function replyMarkerKey(marker) {
+  return 'github:reply-marker:' + marker
+}
+
+function matchesReplyMarker(comment, attempt) {
+  const author = comment.user?.login
+  return REPLY_MARKER.exec(comment.body ?? '')?.[1] === attempt.marker
+    && typeof author === 'string' && author.toLowerCase() === attempt.login
+}
+
+function githubCommentItem(comment) {
+  const item = /^https:\/\/api\.github\.com\/repos\/([^/]+\/[^/]+)\/issues\/([1-9]\d*)$/i.exec(comment.issue_url ?? '')
+  return item ? { repo: item[1].toLowerCase(), number: Number(item[2]) } : null
 }
 
 function postedCommentKey(repo, commentId) {
@@ -82,6 +99,7 @@ export async function realGh(args) {
 export class GitHubSource {
   #polls = new Map()
   #loginTask = null
+  #authenticatedLoginTask = null
 
   /**
    * @param {{ store: import('./store.js').Store, registry: import('./registry.js').OwnerRegistry,
@@ -186,12 +204,25 @@ export class GitHubSource {
     return this.#loginTask
   }
 
+  #authenticatedLogin() {
+    if (!this.#authenticatedLoginTask) {
+      this.#authenticatedLoginTask = this.#readAuthenticatedLogin()
+        .finally(() => { this.#authenticatedLoginTask = null })
+    }
+    return this.#authenticatedLoginTask
+  }
+
+  async #readAuthenticatedLogin() {
+    const raw = await this.#githubApi(['user'])
+    const login = JSON.parse(String(raw))?.login
+    if (typeof login !== 'string' || !login.trim()) throw new Error('GitHub user response is missing a login')
+    return login
+  }
+
   async #lookupLogin() {
     try {
-      const raw = await this.gh(['api', 'user'])
+      const login = await this.#authenticatedLogin()
       if (this.config.loginAllowlist?.length) return this.config.loginAllowlist
-      const login = JSON.parse(String(raw))?.login
-      if (typeof login !== 'string' || !login.trim()) throw new Error('GitHub user response is missing a login')
       this.config.loginAllowlist = [login]
       this.logger.info('hub-bot github: loginAllowlist resolved from gh auth → %s', login)
       return this.config.loginAllowlist
@@ -221,6 +252,7 @@ export class GitHubSource {
       totals.triggered += result.triggered ?? 0
       totals.dropped += result.dropped ?? 0
       totals.terminated += result.terminated ?? 0
+      if (result.stops?.length) (totals.stops ??= []).push(...result.stops)
     }
     return totals
   }
@@ -249,20 +281,52 @@ export class GitHubSource {
     return pending
   }
 
-  async #fetchList(endpoint, ...flags) {
-    const rows = JSON.parse(String(await this.gh(['api', endpoint, ...flags])))
+  #githubApi(args) {
+    return this.gh(['api', ...args, '--hostname', 'github.com'])
+  }
+
+  async #fetchList(endpoint) {
+    const rows = JSON.parse(String(await this.#githubApi([endpoint])))
     if (!Array.isArray(rows)) throw new Error('Expected GitHub list for ' + endpoint)
     return rows
   }
 
-  async #fetchComments(endpoint) {
-    const pages = await this.#fetchList(endpoint, '--paginate', '--slurp')
-    const comments = new Map()
-    for (const comment of pages.flat()) {
-      if (!isPositiveInteger(comment?.id)) throw new Error('Invalid GitHub comment ID for ' + endpoint)
-      if (!comments.has(comment.id)) comments.set(comment.id, comment)
+  async *#commentPages(endpoint) {
+    const separator = endpoint.includes('?') ? '&' : '?'
+    const query = endpoint + separator + 'per_page=' + COMMENT_PAGE_SIZE
+    // Each page has its own gh deadline and output buffer.
+    for (let page = 1; ; page++) {
+      const comments = await this.#fetchList(query + '&page=' + page)
+      for (const comment of comments) {
+        if (!isPositiveInteger(comment?.id)) throw new Error('Invalid GitHub comment ID for ' + endpoint)
+      }
+      yield comments
+      if (comments.length < COMMENT_PAGE_SIZE) return
     }
-    return [...comments.values()]
+  }
+
+  async #fetchComments(repo, since, cutoff) {
+    // GitHub's `since` is exclusive and its timestamps are second-granularity. Revisit
+    // the boundary second and let immutable comment IDs prevent replay after edits.
+    const inclusive = new Date(Date.parse(since) - 1000).toISOString()
+    const endpoint = 'repos/' + repo + '/issues/comments?sort=created&direction=asc&since=' + encodeURIComponent(inclusive)
+    const comments = new Map()
+    for await (const page of this.#commentPages(endpoint)) {
+      let pastCutoff = false
+      for (const comment of page) {
+        const created = Date.parse(comment.created_at)
+        const updated = Date.parse(comment.updated_at ?? comment.created_at)
+        if (!Number.isFinite(created) || !Number.isFinite(updated)) {
+          throw new Error('Invalid GitHub comment timestamp for ' + endpoint)
+        }
+        if (created > cutoff) pastCutoff = true
+        else if (updated <= cutoff && !comments.has(comment.id)) comments.set(comment.id, comment)
+      }
+      // Pages are in creation order. Later edits to older comments remain eligible
+      // in the next `since` window, including lower IDs.
+      if (pastCutoff) break
+    }
+    return [...comments.values()].sort((a, b) => a.id - b.id)
   }
 
   async #fetchNewIssues(repo, floor) {
@@ -302,20 +366,24 @@ export class GitHubSource {
       if (result.routed) triggered++
       if (result.dropped && !result.deduped) dropped++
     }
-    const since = encodeURIComponent(wm.commentsSince ?? startedAt)
-    const comments = await this.#fetchComments('repos/' + repo + '/issues/comments?since=' + since + '&per_page=100')
+    const cutoff = Date.parse(startedAt)
+    const comments = await this.#fetchComments(repo, wm.commentsSince ?? startedAt, cutoff)
     let maxCommentId = wm.maxCommentId ?? 0
-    for (const c of comments.filter(c => c.id > maxCommentId).sort((a, b) => a.id - b.id)) {
+    const stops = []
+    for (const c of comments) {
       const result = await this.handleCommentEvent(c, repoCfg)
       if (result.routed) triggered++
       if (result.dropped && !result.deduped) dropped++
-      terminated += result.terminatedTicketIds?.length ?? (result.terminated ? 1 : 0)
-      maxCommentId = c.id
+      if (!result.deduped && result.transitionedTicketIds) {
+        terminated += result.transitionedTicketIds.length
+        stops.push({ repo, commentId: c.id, ...result })
+      }
+      maxCommentId = Math.max(maxCommentId, c.id)
     }
     const closures = await this.checkClosures(repoCfg)
     terminated += closures.terminated.length
     this.#saveWatermark(repo, { ...wm, maxNumber, maxCommentId, commentsSince: startedAt })
-    return { triggered, dropped, terminated }
+    return { triggered, dropped, terminated, ...(stops.length > 0 && { stops }) }
   }
 
   /** Event references use the item number for issues and PRs, and the immutable ID for comments. */
@@ -418,17 +486,19 @@ export class GitHubSource {
   /** An allowlisted work comment starts its own task. A stop comment only ends work for its item. */
   async handleCommentEvent(c, repoCfg) {
     const { repo } = repoCfg
-    const item = /\/repos\/([^/]+\/[^/]+)\/issues\/([1-9]\d*)$/.exec(c.issue_url ?? '')
-    const issueNumber = Number(item?.[2])
-    if (!item || item[1].toLowerCase() !== repo.toLowerCase() || !isPositiveInteger(issueNumber) || !isPositiveInteger(c.id)) {
+    const item = githubCommentItem(c)
+    const issueNumber = item?.number
+    if (item?.repo !== repo.toLowerCase() || !isPositiveInteger(issueNumber) || !isPositiveInteger(c.id)) {
       return { dropped: 'malformed' }
     }
-    const pendingReply = replyPosts.get(replyTargetKey(this.store, repo, issueNumber))
-    const postedId = pendingReply && await pendingReply
-    if (postedId === c.id || this.store.get(postedCommentKey(repo, c.id))) return { skipped: 'self-generated' }
+    if (this.#isOwnComment(repo, issueNumber, c)) return { skipped: 'self-generated' }
     const ref = this.#refFor(repo, 'comment', c.id)
     const legacyDropId = 'github-drop:' + repo + ':' + issueNumber + '/c' + c.id
-    if (this.#getTrigger(ref) || this.#getTrigger(legacyDropId)) return { deduped: true }
+    const existing = this.#getTrigger(ref) ?? this.#getTrigger(legacyDropId)
+    if (existing) {
+      if (!existing.stop) return { deduped: true }
+      return { deduped: true, transitionedTicketIds: existing.stop.ticketIds, workerOutcomes: existing.stop.outcomes ?? [] }
+    }
     const author = c.user?.login ?? 'unknown'
     const body = typeof c.body === 'string' ? c.body : ''
     const at = this.now()
@@ -444,7 +514,7 @@ export class GitHubSource {
     const authorization = { actor: author, source: 'github', addressing, messageId: source.url, at }
     if (stop) {
       const trigger = this.#writeFacts(() => {
-        const ticketIds = this.#terminateTasks(tickets, repo, issueNumber, '评论喊停')
+        const ticketIds = this.#terminateTasks(tickets, repo, issueNumber, '评论喊停', { notify: false })
         if (!ticketIds.length) return null
         const workers = this.#stoppedWorkers(ticketIds)
         const event = {
@@ -455,9 +525,9 @@ export class GitHubSource {
         return event
       })
       if (!trigger) return drop('stop-without-task')
-      await this.#cancelStoppedWorkers(trigger)
       const { ticketIds } = trigger.stop
-      return { terminated: ticketIds[0], terminatedTicketIds: ticketIds }
+      const workerOutcomes = await this.#cancelStoppedWorkers(trigger)
+      return { transitionedTicketIds: ticketIds, workerOutcomes }
     }
     const ownerId = this.#registeredOwner(repoCfg)
     const label = addressing === 'mention' ? '评论提及' : '新评论'
@@ -536,20 +606,21 @@ export class GitHubSource {
     }
   }
 
-  #terminateTasks(ticketIds, repo, number, why) {
+  #terminateTasks(ticketIds, repo, number, why, { notify = true } = {}) {
     const terminated = []
+    const item = 'github ' + repo + '#' + number
     for (const ticketId of ticketIds) {
       const ticket = this.router.tasks.getTicket(ticketId)
       if (!ticket || !canTransition(ticket.stage, 'failed')) continue
-      const item = 'github ' + repo + '#' + number
       this.router.tasks.fail({ ticketId, reason: '源头' + why + '：' + item + '（让位于人）' })
-      insertOutbox(this.store, {
-        ticketId, triggerId: ticket.triggerId, kind: 'reply', to: 'dsh:session:chief', state: 'queued',
-        body: '[hub-bot ' + item + '] 源头' + why + '，任务 ' + ticketId + ' 已终止（让位于人）。',
-      })
+      if (notify) this.#notice(ticketId, ticket.triggerId, '[hub-bot ' + item + '] 源头' + why + '，任务 ' + ticketId + ' 已终止（让位于人）。')
       terminated.push(ticketId)
     }
     return terminated
+  }
+
+  #notice(ticketId, triggerId, body) {
+    insertOutbox(this.store, { ticketId, triggerId, kind: 'reply', to: 'dsh:session:chief', state: 'queued', body })
   }
 
   #stoppedWorkers(ticketIds) {
@@ -581,12 +652,12 @@ export class GitHubSource {
   }
 
   async #cancelStoppedWorkers(trigger) {
-    if (!this.sessions?.cancel) return
-    const { workers } = trigger.stop
+    const { workers, ticketIds } = trigger.stop
     const outcomes = []
     for (const sessionId of new Set(workers.map(target => target.sessionId))) {
+      if (this.store.closed) break
       const targets = workers.filter(target => target.sessionId === sessionId)
-      if (!this.#canCancelStoppedWorker(sessionId, targets)) {
+      if (typeof this.sessions?.cancel !== 'function' || !this.#canCancelStoppedWorker(sessionId, targets)) {
         outcomes.push({ sessionId, status: 'skipped' })
         continue
       }
@@ -599,12 +670,21 @@ export class GitHubSource {
         outcomes.push({ sessionId, status: 'failed', error: message })
       }
     }
-    if (!this.store.closed && outcomes.length) {
+    if (!this.store.closed) this.#writeFacts(() => {
       const settled = { ...trigger, stop: { ...trigger.stop, outcomes } }
       this.store.db.prepare('UPDATE trigger SET value = ? WHERE id = ?').run(JSON.stringify(settled), trigger.id)
-    }
+      const item = '[hub-bot github ' + trigger.source.repo + '#' + trigger.source.issueNumber + '] '
+      for (const ticketId of ticketIds) {
+        const worker = workers.find(target => target.ticketId === ticketId)
+        const outcome = outcomes.find(result => result.sessionId === worker?.sessionId)
+        let workerStatus = '未调用执行会话停止。'
+        if (outcome?.status === 'cancelled') workerStatus = '执行会话已停止。'
+        if (outcome?.status === 'failed') workerStatus = '执行会话停止失败：' + outcome.error
+        this.#notice(ticketId, trigger.id, item + '收到喊停，任务 ' + ticketId + ' 已标记为失败。' + workerStatus)
+      }
+    })
+    return outcomes
   }
-
 
   /** Rechecks each item with running or pending work, including work started by comments. */
   async checkClosures(repoCfg) {
@@ -619,11 +699,11 @@ export class GitHubSource {
     }
     const terminated = []
     for (const [number, tracked] of items) {
-      const item = JSON.parse(String(await this.gh(['api', 'repos/' + repo + '/issues/' + number])))
+      const item = JSON.parse(String(await this.#githubApi(['repos/' + repo + '/issues/' + number])))
       if (item.state !== 'closed') continue
       let why = '已关闭'
       if (item.pull_request || tracked.pr) {
-        const pr = JSON.parse(String(await this.gh(['api', 'repos/' + repo + '/pulls/' + number])))
+        const pr = JSON.parse(String(await this.#githubApi(['repos/' + repo + '/pulls/' + number])))
         why = pr.merged_at ? '已合并' : '已关闭未合并'
       }
       terminated.push(...this.#writeFacts(() => this.#terminateTasks(tracked.tickets, repo, number, why)))
@@ -631,33 +711,81 @@ export class GitHubSource {
     return { terminated }
   }
 
+  #isOwnComment(repo, number, comment) {
+    if (this.store.get(postedCommentKey(repo, comment.id))) return true
+    const marker = REPLY_MARKER.exec(comment.body ?? '')?.[1]
+    if (!marker) return false
+    const outboxId = this.store.get(replyMarkerKey(marker))
+    const attempt = outboxId && this.store.get(replyAttemptKey(outboxId))
+    // The marker index only exists for a reply claimed from the recorded outbox.
+    if (!attempt || attempt.repo !== repo.toLowerCase() || attempt.number !== number || !matchesReplyMarker(comment, attempt)) {
+      return false
+    }
+    const receipt = this.store.get(replyReceiptKey(outboxId))
+    if (receipt) return receipt.commentId === comment.id
+    this.#saveReplyReceipt(repo, outboxId, comment)
+    return true
+  }
+
+  #saveReplyReceipt(repo, outboxId, comment) {
+    // A reload can close the sending source while GitHub is still completing the POST.
+    const store = this.store.closed ? new Store(this.store.stateDir) : this.store
+    try {
+      const receipt = { repo, commentId: comment.id, url: comment.html_url ?? null }
+      this.#writeFacts(() => {
+        store.set(postedCommentKey(repo, comment.id), receipt)
+        if (!store.get(replyReceiptKey(outboxId))) store.set(replyReceiptKey(outboxId), receipt)
+      }, store)
+    } finally {
+      if (store !== this.store) store.close()
+    }
+  }
+
+  async #findAttemptedReply(endpoint, attempt) {
+    // Fetch only this item's comments. A failed page propagates and never permits a new POST.
+    for await (const page of this.#commentPages(endpoint)) {
+      const sent = page.find(comment => {
+        const item = githubCommentItem(comment)
+        return item?.repo === attempt.repo && item.number === attempt.number && matchesReplyMarker(comment, attempt)
+      })
+      if (sent) return sent
+    }
+    return null
+  }
+
   async #postReply({ repo, number }, body, outboxId) {
     const receiptKey = replyReceiptKey(outboxId)
     if (this.store.get(receiptKey)) return
-    const key = replyTargetKey(this.store, repo, number)
-    const pending = Promise.resolve().then(async () => {
-      const raw = await this.gh(['api', '-X', 'POST', 'repos/' + repo + '/issues/' + number + '/comments', '-f', 'body=' + body])
-      const sent = JSON.parse(String(raw))
-      if (!isPositiveInteger(sent?.id)) throw new Error('GitHub reply response is missing a comment ID')
-      return sent
-    })
-    replyPosts.set(key, pending.then(sent => sent.id, () => null))
-    try {
-      const sent = await pending
-      // A reload can close the sending source while GitHub is still completing the POST.
-      const store = this.store.closed ? new Store(this.store.stateDir) : this.store
-      try {
-        const receipt = { repo, commentId: sent.id, url: sent.html_url ?? null }
-        this.#writeFacts(() => {
-          store.set(postedCommentKey(repo, sent.id), receipt)
-          store.set(receiptKey, receipt)
-        }, store)
-      } finally {
-        if (store !== this.store) store.close()
+    const attemptKey = replyAttemptKey(outboxId)
+    const endpoint = 'repos/' + repo + '/issues/' + number + '/comments'
+    const repoKey = repo.toLowerCase()
+    let attempt = this.store.get(attemptKey)
+    if (attempt) {
+      if (attempt.repo !== repoKey || attempt.number !== number) throw new Error('GitHub reply target changed after its first attempt')
+      const sent = await this.#findAttemptedReply(endpoint, attempt)
+      if (sent) {
+        this.#saveReplyReceipt(repo, outboxId, sent)
+        return
       }
-    } finally {
-      replyPosts.delete(key)
+      if (this.store.closed || this.store.get(receiptKey)) return
     }
+    const login = (await this.#authenticatedLogin()).toLowerCase()
+    if (attempt && attempt.login !== login) throw new Error('GitHub posting account changed after the first attempt')
+    if (this.store.closed || this.store.get(receiptKey)) return
+    if (!attempt) {
+      const marker = randomUUID()
+      attempt = { marker, repo: repoKey, number, login }
+      this.#writeFacts(() => {
+        this.store.set(attemptKey, attempt)
+        this.store.set(replyMarkerKey(marker), outboxId)
+      })
+    }
+    // The Router caps the visible body before this transport-only prefix is attached.
+    const markedBody = '<!-- hub-bot-github-reply:' + attempt.marker + ' -->\n\n' + body
+    const raw = await this.#githubApi(['-X', 'POST', endpoint, '-f', 'body=' + markedBody])
+    const sent = JSON.parse(String(raw))
+    if (!isPositiveInteger(sent?.id)) throw new Error('GitHub reply response is missing a comment ID')
+    this.#saveReplyReceipt(repo, outboxId, sent)
   }
 
   /** Posts recorded reply intents and saves the returned comment identity before marking them sent. */

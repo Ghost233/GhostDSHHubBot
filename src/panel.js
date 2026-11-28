@@ -300,6 +300,7 @@ export function buildOutboxHealth(store) {
   const delivery = row => ({
     id: row.id, ticketId: row.ticketId ?? null, to: row.to, state: row.state, attempts: row.attempts ?? 0,
     nextRetryAt: row.nextRetryAt ?? null, lastError: row.lastError ?? null, text: String(row.body ?? row.text ?? '').slice(0, 120),
+    ...(row.retryable === false && { retryable: false }),
   })
   return {
     queued: count('queued'), held: count('held'), recorded: count('recorded'), failed: count('failed'), sent: count('sent'),
@@ -581,7 +582,8 @@ export function buildOverview({ store, registry, health, now, listDir }) {
       deferred: t.deferred ? { requestId: t.deferred.requestId, type: t.deferred.type,
         status: t.deferred.status, expiresAt: t.deferred.expiresAt,
         target: t.deferred.target ?? null,
-        delivery: answerDelivery, reason: t.deferred.outcome?.reason ?? null } : null,
+        answer: t.deferred.outcome?.decision === 'answer' ? t.deferred.outcome.text ?? null : null,
+        delivery: answerDelivery, reason: t.deferred.outcome?.reason ?? t.failed?.reason ?? null } : null,
       report: t.report ?? null,
       dirListing: null,
     }

@@ -96,6 +96,7 @@ function detailRow(label, value) {
 function ticketDetails(t) {
   const box = el('div', { class: 'ticket-details' })
   if (t.authorization) box.append(detailRow('授权', t.authorization.actor + ' 经 ' + t.authorization.source + ' 于 ' + fmtTime(t.authorization.at)))
+  if (t.deferred?.answer) box.append(detailRow('用户答复', t.deferred.answer))
   if (t.trigger) box.append(detailRow('Trigger', shortId(t.trigger.id) + (t.trigger.kind ? ' (' + t.trigger.kind + ')' : '')))
   for (const a of t.assignments ?? []) box.append(detailRow('Assignment', a.state + ' · ' + fmtTime(a.startedAt) + (a.endedAt ? ' → ' + fmtTime(a.endedAt) : '') + (a.endedReason ? ' (' + a.endedReason + ')' : '')))
   if (t.report) {
@@ -146,8 +147,8 @@ function ticketRow(t, { actions } = {}) {
   head.append(el('time', {}, text(fmtTime(t.updatedAt))))
   if (actions) head.append(actions)
   row.append(head)
-  if (t.pendingConfirm) row.append(el('div', { class: 'pending-confirm' }, text('待确认：' + t.pendingConfirm.text)))
-  if (t.question) row.append(el('div', { class: 'pending-confirm' }, text('等您回复：' + t.question.text)))
+  if (t.pendingConfirm && t.stage === 'person/confirm') row.append(el('div', { class: 'pending-confirm' }, text('待确认：' + t.pendingConfirm.text)))
+  if (t.question && t.stage === 'person/answer') row.append(el('div', { class: 'pending-confirm' }, text('等您回复：' + t.question.text)))
   if (t.deferred?.status === 'pending') {
     const target = t.deferred.target?.sessionId
     row.append(el('p', { class: 'quiet small' }, text('截止时间 ' + fmtTime(t.deferred.expiresAt) + (target ? ' · 目标会话 ' + target : ''))))
@@ -284,7 +285,8 @@ function renderTimers(timers, owners) {
     const delivery = ({ queued: '待投递', sent: '已接管', failed: '投递失败' })[timer.delivery?.state]
     if (delivery) row.append(el('p', { class: 'quiet small' }, text(delivery)))
     if (timer.delivery?.workerSession?.sessionId) row.append(el('p', { class: 'quiet small' }, text('会话 ' + timer.delivery.workerSession.sessionId)))
-    if (timer.lastError?.message) row.append(el('p', { role: 'alert', class: 'warn-text' }, text(timer.lastError.message)))
+    const reason = timer.lastError?.message ?? timer.delivery?.lastError
+    if (reason) row.append(el('p', { role: 'alert', class: 'warn-text' }, text(reason)))
     for (const [action, name] of actions) {
       const button = el('button', { class: 'btn', type: 'button' }, text(name))
       button.addEventListener('click', async () => {

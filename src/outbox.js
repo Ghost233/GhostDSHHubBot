@@ -80,7 +80,7 @@ export function retryOutboxRows(store, ids = null) {
     for (const [headId, rows] of failedOutboxGroups(store, ids)) {
       // A partial cohort can be discarded, but replay requires the original head and every frozen member.
       const head = rows.find(row => row.id === headId)
-      if (!head) continue
+      if (!head || head.retryable === false) continue
       const frozen = Array.isArray(head.mergedRows) ? head.mergedRows : [head]
       const memberIds = new Set(frozen.map(member => member?.id))
       if (frozen.length !== rows.length || rows.some(row => !memberIds.has(row.id))) continue
@@ -202,11 +202,13 @@ export class OutboxRunner {
    * @param {{ store: import('./store.js').Store,
    *           deliver: (row: object) => Promise<void>,
    *           now?: () => number,
+   *           onFailure?: (row: object, reason: string) => boolean,
    *           onSystemProblem?: (problem: { ticketId: string|null, reason: string, rowId: string }) => void }} deps
    */
-  constructor({ store, deliver, now, onSystemProblem }) {
+  constructor({ store, deliver, now, onFailure, onSystemProblem }) {
     this.store = store
     this.deliver = deliver
+    this.onFailure = onFailure
     this.now = now ?? (() => Date.now())
     this.onSystemProblem = onSystemProblem ?? (() => {})
   }
@@ -319,16 +321,10 @@ export class OutboxRunner {
    */
   #settleCohort(head, terminal) {
     if (this.store.closed) return
-    const db = this.store.db
-    db.exec('BEGIN IMMEDIATE')
-    try {
+    writeOutboxTransaction(this.store, () => {
       this.#writeRow({ ...head, ...terminal, nextRetryAt: null })
       this.#settleMembers(head, terminal)
-      db.exec('COMMIT')
-    } catch (error) {
-      if (db.isTransaction) db.exec('ROLLBACK')
-      throw error
-    }
+    })
   }
 
   #settleMembers(head, terminal) {
@@ -417,9 +413,12 @@ export class OutboxRunner {
       const lastError = String(error?.message ?? error)
       if (attempts >= MAX_ATTEMPTS) {
         const failedAt = new Date(this.now()).toISOString()
-        this.#settleCohort(row, { state: 'failed', failedAt, lastError, attempts })
         const problem = { ticketId: row.ticketId, reason: 'delivery failed ' + attempts + ' times in a row (' + row.kind + ' → ' + row.to + ')', rowId: row.id }
-        insertOutbox(this.store, { ticketId: row.ticketId, kind: 'system-problem', to: 'chief', body: problem.reason, state: 'recorded' }, this.now)
+        writeOutboxTransaction(this.store, () => {
+          const settled = this.onFailure?.(row, lastError) === true
+          this.#settleCohort(row, { state: 'failed', failedAt, lastError, attempts, ...(settled && { retryable: false }) })
+          insertOutbox(this.store, { ticketId: row.ticketId, kind: 'system-problem', to: 'chief', body: problem.reason, state: 'recorded' }, this.now)
+        })
         this.onSystemProblem(problem)
         return true // bypass: the tail may proceed
       }

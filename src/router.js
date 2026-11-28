@@ -59,6 +59,7 @@ export class Router {
   // Owner queues protect execution slots. Trigger queues prevent duplicate tickets across owners.
   #queues = new Map()
   #currentStops = new Map()
+  #panelDecisions = new Map()
 
   constructor({ store, registry, sessions, tasks, runner, config, now, ids, onSystemProblem, placer }) {
     this.store = store
@@ -86,6 +87,7 @@ export class Router {
       store,
       now: () => Date.parse(this.now()),
       deliver: row => this.#deliverRow(row),
+      onFailure: (row, reason) => this.#settleDeliveryFailure(row, reason),
       onSystemProblem,
     })
   }
@@ -109,6 +111,33 @@ export class Router {
     book.setHandler('fork', input => this.#fulfillDeferred(input.request))
     book.setHandler(DANGEROUS_INJECT_ACTION, input => this.#fulfillDeferred(input.request))
     book.setCloseHandler(request => this.#enqueueDeferredOutcome(request))
+  }
+
+  #settleDeliveryFailure(row, reason) {
+    if (row.kind === 'deferred-answer') {
+      const requestId = row.id.slice('out-answer-'.length)
+      if (this.deferred?.get(requestId)?.outcome?.decision === 'answer') this.deferred.recordAnswerDelivery(requestId, { state: 'failed', reason })
+      return true
+    }
+    if (!row.ticketId) return false
+    const ticket = this.tasks.getTicket(row.ticketId)
+    if (row.kind === 'approved-owner-inject') {
+      const requestId = row.requestId.slice('hub-bot-approved-'.length)
+      if (this.#currentDeferredWork(row.ticketId, requestId)) this.tasks.fail({ ticketId: ticket.id, reason })
+      return true
+    }
+    if (row.kind === 'background-recovery') {
+      if (ticket?.stage === 'working' && ticket.recoveryPending) {
+        const blocked = this.tasks.escalate({ ticketId: ticket.id, reason, by: 'system' })
+        this.#enqueueBackgroundReport(blocked)
+      }
+      return true
+    }
+    if (row.kind !== 'inject' || !ticket?.background || row.requestId !== ticket.requestId) return false
+    if (['idle', 'working'].includes(ticket.stage) && ticket.lastDelivery?.state !== 'sent') {
+      this.tasks.fail({ ticketId: ticket.id, reason })
+    }
+    return true
   }
 
   #requireCurrentApproval(requestId) {
@@ -172,7 +201,8 @@ export class Router {
       const origin = this.getTrigger(ticket.triggerId)?.source
       const returnTo = origin?.kind === 'timer' ? origin.origin ?? origin : origin
       const source = { ...returnTo, kind: returnTo?.kind ?? ticket.authorization.source, triggerId: returnTo?.triggerId ?? ticket.triggerId ?? null }
-      const ownerSessionId = action && !action.sessionId && !ticket.background ? this.registry.get(ticket.owner)?.sessionId : null
+      const independentLaunch = ticket.background && action?.entry === 'route'
+      const ownerSessionId = action && !action.sessionId && !independentLaunch ? this.registry.get(ticket.owner)?.sessionId : null
       const request = this.deferred.request({
         action: action ?? { type: 'ask-user' }, type: action ? 'confirm' : 'answer', ticketId, ownerId: ticket.owner, question,
         requester: { actor: returnTo?.actor ?? ticket.authorization.actor }, source,
@@ -199,6 +229,7 @@ export class Router {
   }
 
   async resolveDeferred({ requestId, ticketId, decision, text, channel, actor, chatId, receivedAt }) {
+    const receipt = channel === 'panel' ? this.now() : receivedAt
     const request = this.deferred?.get(requestId)
     if (!request || (ticketId !== undefined && ticketId !== request.ticketId)) {
       throw new RouterError('unknown-deferred', 'The decision does not identify this request.')
@@ -206,20 +237,29 @@ export class Router {
     if (channel !== 'panel' && !(channel === 'feishu' && this.#isOriginalFeishuSender(request, actor, chatId))) {
       throw new RouterError('deferred-actor-mismatch', 'The original sender must answer in the original Feishu chat, or use the authenticated panel.')
     }
-    return this.#serialized('owner:' + request.ownerId, async () => {
-      const ticket = this.tasks.getTicket(request.ticketId)
-      if (!ticket?.authorization || ticket.deferred?.requestId !== requestId) {
-        throw new RouterError('stale-deferred', 'This request is no longer the active decision for its task.')
-      }
-      const workerUnavailable = decision === 'answer' && request.status === 'pending' && request.receiver.kind === 'worker'
-        && !await this.#canReceiveWorkerAnswer(ticket, request.receiver.sessionId)
-      const result = await this.deferred.resolve({
-        requestId, decision, text, actor: { actor: request.requester.actor }, workerUnavailable,
-        ...(channel === 'feishu' && receivedAt && { receivedAt }),
+    const trackReceipt = channel === 'panel' && this.#isTimelyDecision(request, decision, text, receipt, Date.parse(receipt))
+    if (trackReceipt) this.#panelDecisions.set(requestId, (this.#panelDecisions.get(requestId) ?? 0) + 1)
+    try {
+      return await this.#serialized('owner:' + request.ownerId, async () => {
+        const ticket = this.tasks.getTicket(request.ticketId)
+        if (!ticket?.authorization || ticket.deferred?.requestId !== requestId) {
+          throw new RouterError('stale-deferred', 'This request is no longer the active decision for its task.')
+        }
+        const workerUnavailable = decision === 'answer' && request.status === 'pending' && request.receiver.kind === 'worker'
+          && !await this.#canReceiveWorkerAnswer(ticket, request.receiver.sessionId)
+        const result = await this.deferred.resolve({
+          requestId, decision, text, actor: { actor: request.requester.actor }, workerUnavailable, receivedAt: receipt,
+        })
+        return { ticketId: ticket.id, requestId, stage: this.tasks.getTicket(ticket.id).stage,
+          outcome: result.status, duplicate: result.duplicate }
       })
-      return { ticketId: ticket.id, requestId, stage: this.tasks.getTicket(ticket.id).stage,
-        outcome: result.status, duplicate: result.duplicate }
-    })
+    } finally {
+      if (trackReceipt) {
+        const count = this.#panelDecisions.get(requestId)
+        if (count === 1) this.#panelDecisions.delete(requestId)
+        else this.#panelDecisions.set(requestId, count - 1)
+      }
+    }
   }
 
   #enqueueDeferredOutcome(request) {
@@ -264,17 +304,22 @@ export class Router {
     const current = () => request && this.#currentDeferredWork(request.ticketId, requestId)
     const inactive = { recorded: true, skipped: 'deferred-no-longer-active' }
     const ticket = current()
-    if (!ticket || request.outcome?.delivery?.state === 'failed') return inactive
-    if (request.outcome?.delivery?.state === 'sent') return
-    const permanent = reason => {
-      if (!this.store.closed) this.deferred.recordAnswerDelivery(requestId, { state: 'failed', reason })
-      return Object.assign(new Error(reason), { permanent: true })
+    const deliveryState = request?.outcome?.delivery?.state
+    if (deliveryState === 'sent') return
+    if (deliveryState === 'failed') return inactive
+    const skipped = () => {
+      if (request?.outcome?.decision === 'answer') this.deferred.recordAnswerDelivery(requestId, {
+        state: 'failed', reason: 'The task moved on before the answer could be delivered.',
+      })
+      return inactive
     }
+    if (!ticket) return skipped()
+    const permanent = reason => Object.assign(new Error(reason), { permanent: true })
     const text = () => (current()?.recoveryPending ? RECOVERY_NOTE + '\n\n' : '') + row.body
     if (request.receiver.kind === 'worker') {
       const sessionId = request.receiver.sessionId
       const available = await this.#canReceiveWorkerAnswer(ticket, sessionId)
-      if (!current()) return inactive
+      if (!current()) return skipped()
       const unavailable = 'The original execution session is no longer available.'
       if (!available) throw permanent(unavailable)
       try {
@@ -289,7 +334,7 @@ export class Router {
       const ensured = await (owner.role === 'chief' ? this.#ensureChiefSession() : this.#ensureSession(owner))
       const sessionId = this.registry.get(owner.id)?.sessionId ?? ensured.sessionId
       const delivered = await this.#promptOwner(owner.id, { sessionId }, ticket.id, row.requestId, text(), current)
-      if (!delivered) return inactive
+      if (!delivered) return skipped()
     }
     if (this.store.closed) return
     this.#persistWork(() => {
@@ -448,8 +493,18 @@ export class Router {
    * stored-then-delivered by the runner like every outward message （先存后做）; a ticket cancelled once leaves
    * person/confirm, so the notice fires exactly once.
    */
+  #isTimelyDecision(request, decision, text, at, nowMs) {
+    if (request.status !== 'pending') return false
+    const received = Date.parse(at)
+    if (!(received <= nowMs && received >= Date.parse(request.openedAt) && received < Date.parse(request.expiresAt))) return false
+    const ticket = this.tasks.getTicket(request.ticketId)
+    if (!ticket?.authorization || ticket.deferred?.requestId !== request.requestId) return false
+    if (request.type === 'answer') return ticket.stage === 'person/answer' && decision === 'answer' && typeof text === 'string' && Boolean(text.trim())
+    return ticket.stage === 'person/confirm' && ['approve', 'reject'].includes(decision)
+  }
+
   #receivedDecisions() {
-    const ids = new Set()
+    const ids = new Set(this.#panelDecisions.keys())
     const nowMs = Date.parse(this.now())
     const rows = this.store.db.prepare(`
       SELECT value FROM outbox
@@ -460,14 +515,8 @@ export class Router {
       const choice = trigger?.decision
       if (!choice || !trigger.authorization || trigger.dropped) continue
       const request = this.deferred.get(choice.requestId)
-      if (!request || request.status !== 'pending' || !this.#isOriginalFeishuSender(request, trigger.authorization.actor, trigger.source?.chatId)) continue
-      const received = Date.parse(trigger.at)
-      if (!(received <= nowMs && received >= Date.parse(request.openedAt) && received < Date.parse(request.expiresAt))) continue
-      const ticket = this.tasks.getTicket(request.ticketId)
-      if (!ticket?.authorization || ticket.deferred?.requestId !== request.requestId) continue
-      const matches = request.type === 'answer' ? ticket.stage === 'person/answer' && choice.decision === 'answer' && choice.text?.trim()
-        : ticket.stage === 'person/confirm' && ['approve', 'reject'].includes(choice.decision)
-      if (matches) ids.add(request.requestId)
+      if (!request || !this.#isOriginalFeishuSender(request, trigger.authorization.actor, trigger.source?.chatId)) continue
+      if (this.#isTimelyDecision(request, choice.decision, choice.text, trigger.at, nowMs)) ids.add(request.requestId)
     }
     return ids
   }
@@ -1061,7 +1110,6 @@ export class Router {
     const target = this.registry.get(ticket.owner)
     const unavailable = () => {
       const reason = 'The original owner session is unavailable. Request a new confirmation for the current session.'
-      if (!this.store.closed && current()) this.tasks.fail({ ticketId: row.ticketId, reason })
       return Object.assign(new Error(reason), { permanent: true })
     }
     if (!target || target.sessionId !== row.sessionId || target.recycled || this.sessions.isArchived?.(row.sessionId)) throw unavailable()
@@ -1145,18 +1193,15 @@ export class Router {
       return { postponeMs: 1000 }
     }
     const timer = ticket.background.kind === 'timer'
-    let worker = ticket.workerSession ?? this.#timerWorker(ticket)
+    let worker = ticket.workerSession ?? (recovering ? undefined : this.#timerWorker(ticket))
     if (worker && this.sessions.isArchived?.(worker.sessionId)) {
-      if (!timer) {
-        const reason = '后台执行会话已归档'
-        this.tasks.fail({ ticketId: ticket.id, reason })
-        throw Object.assign(new Error(reason), { permanent: true })
-      }
+      if (recovering || !timer) throw Object.assign(new Error('原后台执行会话已归档'), { permanent: true })
       const { proposedSessionId, ...background } = ticket.background
       ticket = { ...ticket, background }
       worker = undefined
     }
-    const alreadyRunning = recovering && worker && await this.sessions.isRunning?.(worker.sessionId)
+    if (recovering && !worker) throw Object.assign(new Error('原后台执行会话已失效'), { permanent: true })
+    const alreadyRunning = recovering && await this.sessions.isRunning?.(worker.sessionId)
     const live = currentTicket()
     if (!live || live.workerSession?.sessionId !== ticket.workerSession?.sessionId) return inactive
     if (alreadyRunning) return { postponeMs: 1000 }
@@ -1175,10 +1220,7 @@ export class Router {
       if (!isMissingSession(error) && error?.code !== 'session/not-found') throw error
       const latest = currentTicket()
       if (!latest) return inactive
-      if (!timer) {
-        this.tasks.fail({ ticketId: ticket.id, reason: '后台执行会话已失效' })
-        throw Object.assign(error, { permanent: true })
-      }
+      if (recovering || !timer) throw Object.assign(error, { permanent: true })
       if (!recovering && !this.#timerMayDeliver(latest)) return this.#skipTimerDelivery(latest)
       const { proposedSessionId, ...background } = latest.background
       sessionId = await this.#bindBackgroundWorker({ ...latest, background }, owner, undefined, recovering)
@@ -1240,11 +1282,15 @@ export class Router {
     return this.#persistWork(() => {
       this.tasks.markDelivered(ticketId)
       const saved = failure === undefined ? this.tasks.report({ ticketId, summary, evidence }) : this.tasks.fail({ ticketId, reason: failure })
-      this.runner.enqueue({
-        kind: 'background-report', ticketId, triggerId: ticket.triggerId, to: 'owner:' + ticket.owner,
-        body: '[hub-bot 后台结果] ' + factLine(saved), requestId: 'hub-bot-background-result-' + ticketId + '-' + this.ids.uuid(),
-      })
+      this.#enqueueBackgroundReport(saved)
       return { ticketId, stage: saved.stage }
+    })
+  }
+
+  #enqueueBackgroundReport(ticket) {
+    this.runner.enqueue({
+      kind: 'background-report', ticketId: ticket.id, triggerId: ticket.triggerId, to: 'owner:' + ticket.owner,
+      body: '[hub-bot 后台结果] ' + factLine(ticket), requestId: 'hub-bot-background-result-' + ticket.id + '-' + this.ids.uuid(),
     })
   }
 

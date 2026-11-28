@@ -333,7 +333,7 @@ export class TimerService {
     const nowMs = this.#nowMs()
     const view = this.#view(timer, nowMs)
     if (timer.status === 'cancelled') return { timer: view, changed: false }
-    if (timer.status === 'failed') return { timer: view, changed: false, alreadyFailed: true }
+    if (timer.status === 'failed' || view.delivery?.state === 'failed') return { timer: view, changed: false, alreadyFailed: true }
     if (view.delivery?.state === 'sent' || (timer.status === 'fired' && view.delivery?.state !== 'queued')) {
       return { timer: view, changed: false, alreadyFired: true }
     }
@@ -537,7 +537,7 @@ export class TimerService {
       return { ...current, state: 'sent', sentAt: ticket.lastDelivery.at }
     }
     if (delivery.state !== 'queued') return current
-    if (current.stage === 'failed') return { ...current, state: 'failed' }
+    if (current.stage === 'failed') return { ...current, state: 'failed', lastError: ticket.failed?.reason ?? delivery.lastError ?? null }
     if (current.stage === 'done') return { ...current, state: 'cancelled' }
     return current
   }

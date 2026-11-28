@@ -25,7 +25,7 @@ function fakeGh(script) {
     else reads.push(args)
     const key = posting ? 'POST ' + endpoint : endpoint
     const query = new URLSearchParams(args[1].split('?')[1])
-    const defaultRead = args.includes('--slurp') || query.has('page') ? [] : { state: 'open' }
+    const defaultRead = endpoint === 'user' ? { login: 'Ghost233' } : query.has('page') ? [] : { state: 'open' }
     const response = script[key] ?? (posting ? { id: 9001 } : defaultRead)
     const value = typeof response === 'function' ? await response(args) : response
     if (value instanceof Error) throw value
@@ -45,8 +45,10 @@ function issue({ number = 42, title = '修一下登录重试', body = '正文', 
   if (pr) item.pull_request = { url: 'x' }
   return item
 }
-function comment({ id = 5001, body = '继续', login = 'Ghost233', issueNumber = 42 } = {}) {
-  return { id, body, user: { login }, html_url: 'https://github.com/' + REPO + '/issues/' + issueNumber + '#issuecomment-' + id, issue_url: 'https://api.github.com/repos/' + REPO + '/issues/' + issueNumber, created_at: '2026-11-15T01:05:00Z' }
+function comment({ id = 5001, body = '继续', login = 'Ghost233', issueNumber = 42,
+  createdAt = '2026-11-15T00:00:00Z', updatedAt = createdAt } = {}) {
+  return { id, body, user: { login }, html_url: 'https://github.com/' + REPO + '/issues/' + issueNumber + '#issuecomment-' + id,
+    issue_url: 'https://api.github.com/repos/' + REPO + '/issues/' + issueNumber, created_at: createdAt, updated_at: updatedAt }
 }
 
 /** registry+router+source with fake sessions and a scripted fake gh. 监听清单跟随注册表（repo owners 的
@@ -106,8 +108,7 @@ test('config: the github section validates and defaults disabled with 5min polli
 
 test('bootstrap reads only the newest issue or PR and records its number', async () => {
   const issues = 'repos/' + REPO + '/issues'
-  const f = fixture({ script: { [issues]: args => args.includes('--slurp')
-    ? [[issue({ number: 41, pr: true })], [issue({ number: 40 })]] : [issue({ number: 41, pr: true })] } })
+  const f = fixture({ script: { [issues]: [issue({ number: 41, pr: true })] } })
   try {
     const result = await f.source.pollWatchedRepo(REPO)
     assert.equal(result.triggered, 0)
@@ -115,7 +116,7 @@ test('bootstrap reads only the newest issue or PR and records its number', async
     const wm = JSON.parse(readFileSync(watermarkPath(f.store.stateDir), 'utf8'))
     assert.equal(wm.repos[REPO].maxNumber, 41)
     assert.equal(wm.repos[REPO].initialized, true)
-    assert.deepEqual(f.reads, [['api', issues + '?state=all&sort=created&direction=desc&per_page=1&page=1']])
+    assert.deepEqual(f.reads, [['api', issues + '?state=all&sort=created&direction=desc&per_page=1&page=1', '--hostname', 'github.com']])
   } finally { f.cleanup() }
 })
 
@@ -224,8 +225,7 @@ test('a GitHub stop cancels its bound workers and leaves management sessions and
     const stop = comment({ body: '停' })
     const result = await f.source.handleCommentEvent(stop, REPO_CFG)
     const stopped = [routed, follow, legacy, stale, conflicting, shared].map(work => work.ticketId)
-    assert.equal(result.terminated, routed.ticketId)
-    assert.deepEqual(new Set(result.terminatedTicketIds), new Set(stopped))
+    assert.deepEqual(new Set(result.transitionedTicketIds), new Set(stopped))
     for (const id of stopped) {
       const ticket = f.router.getTicket(id)
       assert.equal(ticket.stage, 'failed')
@@ -236,9 +236,44 @@ test('a GitHub stop cancels its bound workers and leaves management sessions and
     assert.equal(f.registry.get(ownerId).sessionId, 'repo-owner')
     assert.equal((await f.source.handleCommentEvent({ ...stop, body: '@hub-bot 重试' }, REPO_CFG)).deduped, true)
     assert.deepEqual(f.calls.cancel, [workerOf(routed.ticketId), workerOf(follow.ticketId)])
-    const notices = f.outbox().filter(r => r.kind === 'reply' && r.body.includes('已终止'))
-    assert.deepEqual(notices.map(r => r.ticketId), result.terminatedTicketIds)
+    const notices = f.outbox().filter(r => r.kind === 'reply' && r.body.includes('已标记为失败'))
+    assert.deepEqual(notices.map(r => r.ticketId), result.transitionedTicketIds)
     assert.ok(notices.every(r => r.to === 'dsh:session:chief' && r.state === 'queued'))
+  } finally { f.cleanup() }
+})
+
+test('a failed GitHub worker cancel is visible in the result and notice and is never replayed', async () => {
+  const comments = 'repos/' + REPO + '/issues/comments'
+  const f = fixture({ routerConfig: { concurrency: { slotsPerOwner: 5 } } })
+  try {
+    await f.source.pollWatchedRepo(REPO)
+    const issueWork = await f.source.handleIssueEvent(issue(), REPO_CFG)
+    const replyWork = await f.source.handleCommentEvent(comment({ id: 5002 }), REPO_CFG)
+    const unrelated = await f.source.handleIssueEvent(issue({ number: 43 }), REPO_CFG)
+    const sessionId = f.router.getTicket(issueWork.ticketId).workerSession.sessionId
+    const otherWorker = f.router.getTicket(replyWork.ticketId).workerSession.sessionId
+    f.sessions.cancel = async request => {
+      f.calls.cancel.push(request.sessionId)
+      if (request.sessionId === sessionId) throw new Error('synthetic worker cancel failed')
+    }
+    const stop = comment({ body: '停' })
+    const expected = {
+      transitionedTicketIds: [issueWork.ticketId, replyWork.ticketId],
+      workerOutcomes: [{ sessionId, status: 'failed', error: 'synthetic worker cancel failed' },
+        { sessionId: otherWorker, status: 'cancelled' }],
+    }
+    f.script[comments] = [stop]
+    assert.deepEqual(await f.source.pollWatchedRepo(REPO), { triggered: 0, dropped: 0, terminated: 2,
+      stops: [{ repo: REPO, commentId: stop.id, ...expected }] })
+    assert.equal(f.router.getTicket(issueWork.ticketId).stage, 'failed')
+    assert.equal(f.router.getTicket(unrelated.ticketId).stage, 'working')
+    const notice = f.outbox().find(row => row.ticketId === issueWork.ticketId && row.to === 'dsh:session:chief')
+    assert.match(notice.body, /已标记为失败/)
+    assert.match(notice.body, /执行会话停止失败：synthetic worker cancel failed/)
+    assert.doesNotMatch(notice.body, /执行会话已停止/)
+    assert.deepEqual(await f.source.handleCommentEvent({ ...stop, body: 'edited' }, REPO_CFG), { deduped: true, ...expected })
+    assert.deepEqual(f.calls.cancel, [sessionId, otherWorker])
+    assert.deepEqual(f.router.getTrigger('github:' + REPO + ':comment:5001').stop.outcomes, expected.workerOutcomes)
   } finally { f.cleanup() }
 })
 
@@ -375,6 +410,23 @@ test('deliverReplies posts recorded github replies as real comments with the bad
   } finally { f.cleanup() }
 })
 
+test('the hidden marker does not change the recorded reply body or its word cap', async () => {
+  const f = fixture()
+  try {
+    const to = 'github:' + REPO + ':42'
+    const text = Array.from({ length: 110 }, (_, index) => 'word' + index).join(' ')
+    const reply = await f.router.replySource({ to, text })
+    const row = f.outbox().find(item => item.id === reply.outboxId)
+    assert.equal(reply.truncated, true)
+    assert.equal((await f.source.deliverReplies()).delivered, 1)
+    const sentBody = f.posts[0].find(arg => arg.startsWith('body=')).slice('body='.length)
+    const [marker, ...parts] = sentBody.split('\n\n')
+    assert.match(marker, /^<!-- hub-bot-github-reply:[0-9a-f-]{36} -->$/)
+    assert.equal(parts.join('\n\n'), row.body + '\n\n' + DSH_BADGE)
+    assert.equal(f.outbox().find(item => item.id === reply.outboxId).body, row.body)
+  } finally { f.cleanup() }
+})
+
 test('a posted acknowledgement does not become work after reopen, even when a manual comment has the same login and body', async () => {
   const issues = 'repos/' + REPO + '/issues'
   const f = fixture({ allowlist: [], script: { user: { login: 'Ghost233' }, [issues]: [issue({ number: 41 })] } })
@@ -391,8 +443,8 @@ test('a posted acknowledgement does not become work after reopen, even when a ma
     }
     assert.equal((await f.source.deliverReplies()).delivered, 1)
     assert.ok(posted.body.includes(DSH_BADGE))
-    const manual = comment({ id: 9002, body: posted.body })
-    f.script[issues + '/comments'] = [[posted, manual]]
+    const manual = comment({ id: 9002, body: f.outbox().find(r => r.kind === 'reply').body })
+    f.script[issues + '/comments'] = [posted, manual]
     const reopened = f.reopen()
     store = reopened.store
     const result = await reopened.source.pollWatchedRepo(REPO)
@@ -403,43 +455,123 @@ test('a posted acknowledgement does not become work after reopen, even when a ma
   } finally { store?.close(); f.cleanup() }
 })
 
-test('polling waits for an in-flight reply receipt before admitting same-item comments', async () => {
+test('a POST accepted before a lost response is suppressed by poll and recovered without another POST', async () => {
+  const issues = 'repos/' + REPO + '/issues'
+  const target = issues + '/42/comments'
+  const f = fixture()
+  let reopened
+  try {
+    await f.source.pollWatchedRepo(REPO)
+    const routed = await f.source.handleIssueEvent(issue(), REPO_CFG)
+    const ack = f.outbox().find(row => row.ticketId === routed.ticketId && row.state === 'recorded')
+    let posted
+    f.script.user = { login: 'Ghost233' }
+    f.script['POST ' + target] = args => {
+      posted = comment({ id: 9001, body: args[args.indexOf('-f') + 1].slice('body='.length) })
+      throw new Error('synthetic timeout after remote accepted POST')
+    }
+    assert.equal((await f.source.deliverReplies()).delivered, 0)
+    assert.equal(f.outbox().find(row => row.id === ack.id).state, 'recorded')
+    const manual = comment({ id: 9002, body: ack.body })
+    f.script[target] = new Error('synthetic marker lookup timeout')
+    assert.equal((await f.source.deliverReplies()).delivered, 0)
+    assert.equal(f.outbox().find(row => row.id === ack.id).state, 'recorded')
+    assert.equal(f.posts.length, 1)
+    assert.match(posted.body, /<!--.*[a-f0-9-]{32,}.*-->/)
+    const copiedByOther = comment({ id: 9003, login: 'someone-else', body: posted.body })
+    f.script[issues + '/comments'] = [posted, manual, copiedByOther]
+    reopened = f.reopen()
+    // Polling recognizes and ignores the outbound reply before the delivery retry runs.
+    const result = await reopened.source.pollWatchedRepo(REPO)
+    assert.deepEqual({ triggered: result.triggered, ids: f.tickets().map(row => row.triggerId) }, {
+      triggered: 1, ids: ['github:' + REPO + ':issue:42', 'github:' + REPO + ':comment:9002'],
+    })
+    assert.equal(f.triggers().find(row => row.source?.commentId === 9003).dropped, 'not-allowlisted')
+    assert.equal(f.outbox().find(row => row.id === ack.id).state, 'recorded')
+    f.script[target] = [posted]
+    assert.equal((await reopened.source.deliverReplies()).delivered, 1)
+    assert.equal(f.outbox().find(row => row.id === ack.id).state, 'sent')
+    assert.equal(f.posts.length, 1)
+  } finally { reopened?.store.close(); f.cleanup() }
+})
+
+test('a retry finds the exact marker on a later item page after reopening', async () => {
+  const target = 'repos/' + REPO + '/issues/42/comments'
+  const f = fixture({ allowlist: ['other-operator'] })
+  let reopened
+  try {
+    const { insertOutbox } = await import('../src/outbox.js')
+    const row = insertOutbox(f.store, { kind: 'reply', to: 'github:' + REPO + ':42', body: 'status', state: 'recorded' })
+    let posted
+    f.script['POST ' + target] = args => {
+      posted = comment({ id: 9001, body: args[args.indexOf('-f') + 1].slice('body='.length) })
+      throw new Error('synthetic lost response')
+    }
+    assert.equal((await f.source.deliverReplies()).delivered, 0)
+    f.script[target] = args => {
+      const query = new URLSearchParams(args[1].split('?')[1])
+      return query.get('page') === '1'
+        ? Array.from({ length: Number(query.get('per_page')) }, (_, index) => comment({
+          id: 8000 + index, body: posted.body, ...(index % 2 ? { login: 'other-operator' } : { issueNumber: 43 }),
+        }))
+        : [posted]
+    }
+    reopened = f.reopen()
+    assert.equal((await reopened.source.deliverReplies()).delivered, 1)
+    assert.equal(f.outbox().find(item => item.id === row.id).state, 'sent')
+    assert.equal(f.posts.length, 1)
+    assert.equal(f.reads.filter(args => args[1].startsWith(target + '?')).length, 2)
+    assert.deepEqual(await reopened.source.handleCommentEvent({ ...posted, body: 'edited' }, REPO_CFG), { skipped: 'self-generated' })
+  } finally { reopened?.store.close(); f.cleanup() }
+})
+
+test('a complete empty lookup allows a retry by the original posting account with the same marker', async () => {
+  const target = 'repos/' + REPO + '/issues/42/comments'
+  const f = fixture()
+  try {
+    const { insertOutbox } = await import('../src/outbox.js')
+    insertOutbox(f.store, { kind: 'reply', to: 'github:' + REPO + ':42', body: 'status', state: 'recorded' })
+    f.script['POST ' + target] = new Error('synthetic unavailable before write')
+    assert.equal((await f.source.deliverReplies()).delivered, 0)
+    f.script.user = { login: 'changed-posting-account' }
+    assert.equal((await f.source.deliverReplies()).delivered, 0)
+    assert.equal(f.posts.length, 1)
+    f.script.user = { login: 'Ghost233' }
+    f.script['POST ' + target] = { id: 9001 }
+    assert.equal((await f.source.deliverReplies()).delivered, 1)
+    assert.equal(f.posts.length, 2)
+    assert.equal(f.posts[0].find(arg => arg.startsWith('body=')), f.posts[1].find(arg => arg.startsWith('body=')))
+  } finally { f.cleanup() }
+})
+
+test('polling recognizes an in-flight reply without waiting to admit a manual comment', async () => {
   const issues = 'repos/' + REPO + '/issues'
   const f = fixture()
   const visible = Promise.withResolvers()
   const release = Promise.withResolvers()
-  const entered = Promise.withResolvers()
-  let delivery, poll
+  let delivery
   try {
     await f.source.pollAll()
     await f.source.handleIssueEvent(issue(), REPO_CFG)
-    const self = comment({ id: 9001, body: 'posted by the plugin' })
     const human = comment({ id: 9002, body: 'manual comment' })
-    f.script['POST ' + issues + '/42/comments'] = async () => {
+    f.script['POST ' + issues + '/42/comments'] = async args => {
+      const self = comment({ id: 9001, body: args[args.indexOf('-f') + 1].slice('body='.length) })
+      f.script[issues + '/comments'] = [self, human]
       visible.resolve()
       await release.promise
       return self
     }
-    f.script[issues + '/comments'] = [[self, human]]
     delivery = f.source.deliverReplies()
     await visible.promise
-    const receive = f.source.handleCommentEvent.bind(f.source)
-    f.source.handleCommentEvent = (...args) => {
-      entered.resolve()
-      return receive(...args)
-    }
-    poll = f.source.pollWatchedRepo(REPO)
-    await entered.promise
-    assert.equal(f.tickets().length, 1)
+    assert.equal((await f.source.pollWatchedRepo(REPO)).triggered, 1)
     release.resolve()
     assert.equal((await delivery).delivered, 1)
-    assert.equal((await poll).triggered, 1)
     assert.deepEqual(f.tickets().map(t => t.triggerId), [
       'github:' + REPO + ':issue:42', 'github:' + REPO + ':comment:9002',
     ])
   } finally {
     release.resolve()
-    await Promise.allSettled([delivery, poll])
+    await Promise.allSettled([delivery])
     f.cleanup()
   }
 })
@@ -467,7 +599,7 @@ test('a restart reuses the receipt for the same outbox row when a POST completes
     assert.equal((await reopened.source.deliverReplies()).delivered, 1)
     assert.equal(readRow().state, 'sent')
     assert.equal(f.posts.length, 1)
-    f.script[issues + '/comments'] = [[posted]]
+    f.script[issues + '/comments'] = [posted]
     assert.equal((await reopened.source.pollWatchedRepo(REPO)).triggered, 0)
     assert.equal(f.calls.prompt.length, 1)
   } finally {
@@ -527,7 +659,7 @@ test('a failed comment fetch preserves the checkpoint and the next instance catc
     await f.source.pollAll()
     const failedCheckpoint = checkpoint()
     assert.equal((await f.source.status()).repos[REPO].lastError, 'synthetic GitHub comment timeout')
-    const fetched = comment({ body: '@hub-bot 处理这条' })
+    const fetched = comment({ body: '@hub-bot 处理这条', createdAt: '2026-11-15T01:05:00Z' })
     f.script[comments] = args => {
       const since = new URLSearchParams(args[1].split('?')[1]).get('since')
       return Date.parse(since) > Date.parse(fetched.created_at) ? [] : [fetched]
@@ -554,14 +686,14 @@ test('issue pagination crosses number gaps, deduplicates overlap and stops at th
       assert.equal(query.get('state'), 'all')
       assert.equal(query.get('sort'), 'created')
       assert.equal(query.get('direction'), 'desc')
-      assert.deepEqual(args.slice(2), [])
+      assert.deepEqual(args.slice(2), ['--hostname', 'github.com'])
       if (query.get('page') === '1') return highPage
       if (query.get('page') === '2') return [highPage.at(-1), pull, opened, issue({ number: 40 })]
       throw new Error('old history must not be fetched')
     }
     const first = comment({ id: 5001, body: '@hub-bot 确认行为' })
     const second = comment({ id: 5002, body: '补充说明', issueNumber: 47 })
-    f.script[issues + '/comments'] = [[second], [first, second]]
+    f.script[issues + '/comments'] = [second, first, second]
     assert.deepEqual(await f.source.pollWatchedRepo(REPO), { triggered: 4, dropped: 100, terminated: 0 })
     assert.deepEqual(new Set(f.tickets().map(t => t.triggerId)), new Set([
       'github:' + REPO + ':issue:42', 'github:' + REPO + ':pr:47',
@@ -570,7 +702,7 @@ test('issue pagination crosses number gaps, deduplicates overlap and stops at th
     const issueReads = f.reads.filter(args => args[1].startsWith(issues + '?'))
     assert.deepEqual(issueReads.map(args => new URLSearchParams(args[1].split('?')[1]).get('page')), ['1', '1', '2'])
     const commentReads = f.reads.filter(args => args[1].startsWith(issues + '/comments?'))
-    assert.deepEqual(commentReads.map(args => args.slice(2)), [['--paginate', '--slurp']])
+    assert.deepEqual(commentReads.map(args => args.slice(2)), [['--hostname', 'github.com']])
     assert.equal((await f.source.status()).repos[REPO].maxCommentId, 5002)
     assert.equal((await f.source.status()).repos[REPO].maxNumber, 250)
   } finally { f.cleanup() }
@@ -598,6 +730,70 @@ test('a failed later issue page leaves the saved floor available after reopening
   } finally { reopened?.store.close(); f.cleanup() }
 })
 
+test('a partial comment-page fetch keeps the old checkpoint and a reopened poll catches up across equal timestamps', async () => {
+  const comments = 'repos/' + REPO + '/issues/comments'
+  const f = fixture()
+  let reopened
+  try {
+    await f.source.pollWatchedRepo(REPO)
+    const before = readFileSync(watermarkPath(f.store.stateDir), 'utf8')
+    f.setNow('2026-11-15T01:05:00.000Z')
+    const one = comment({ id: 5001, body: '@hub-bot 第一条' })
+    const two = comment({ id: 5002, body: '@hub-bot 第二条' })
+    const filler = Array.from({ length: 99 }, (_, index) => comment({ id: 6000 + index, login: 'stranger' }))
+    f.script[comments] = args => {
+      const query = new URLSearchParams(args[1].split('?')[1])
+      if (args.includes('--slurp')) throw new Error('unbounded combined response')
+      if (query.get('page') === '1') return [one, ...filler].slice(0, Number(query.get('per_page')))
+      throw new Error('synthetic second comment page timeout')
+    }
+    await assert.rejects(f.source.pollWatchedRepo(REPO), /synthetic second comment page timeout/)
+    assert.equal(readFileSync(watermarkPath(f.store.stateDir), 'utf8'), before)
+    assert.equal(f.calls.prompt.length, 0)
+    f.script[comments] = args => {
+      const query = new URLSearchParams(args[1].split('?')[1])
+      const size = Number(query.get('per_page'))
+      if (query.get('page') === '1') return [one, ...filler].slice(0, size)
+      if (query.get('page') === '2') return [one, two]
+      throw new Error('unneeded extra comment page')
+    }
+    reopened = f.reopen()
+    assert.equal((await reopened.source.pollWatchedRepo(REPO)).triggered, 2)
+    assert.deepEqual(f.tickets().map(row => row.triggerId), [
+      'github:' + REPO + ':comment:5001', 'github:' + REPO + ':comment:5002',
+    ])
+  } finally { reopened?.store.close(); f.cleanup() }
+})
+
+test('a frozen cutoff defers late updates and replays only unseen IDs on its boundary', async () => {
+  const comments = 'repos/' + REPO + '/issues/comments'
+  const f = fixture()
+  try {
+    await f.source.pollAll()
+    f.setNow('2026-11-15T01:05:00.500Z')
+    const boundary = comment({ id: 5003, body: '@hub-bot boundary', createdAt: '2026-11-15T01:05:00Z' })
+    const late = comment({ id: 5001, body: '@hub-bot late update', createdAt: '2026-11-14T23:59:00Z', updatedAt: '2026-11-15T01:05:01Z' })
+    f.script[comments] = () => {
+      f.setNow('2026-11-15T01:05:02.000Z')
+      return [late, boundary]
+    }
+    assert.equal((await f.source.pollWatchedRepo(REPO)).triggered, 1)
+    const atBoundary = comment({ id: 5002, body: '@hub-bot same second', createdAt: boundary.created_at })
+    f.script[comments] = args => {
+      const query = new URLSearchParams(args[1].split('?')[1])
+      assert.equal(query.get('sort'), 'created')
+      assert.equal(query.get('direction'), 'asc')
+      const since = Date.parse(query.get('since'))
+      return [late, atBoundary, { ...boundary, body: '停', updated_at: '2026-11-15T01:05:01Z' }]
+        .filter(item => Date.parse(item.updated_at) > since)
+    }
+    assert.equal((await f.source.pollWatchedRepo(REPO)).triggered, 2)
+    assert.deepEqual(f.tickets().map(row => row.triggerId), [5003, 5001, 5002].map(id => 'github:' + REPO + ':comment:' + id))
+    assert.equal(f.calls.cancel.length, 0)
+    assert.equal((await f.source.status()).repos[REPO].maxCommentId, 5003)
+  } finally { f.cleanup() }
+})
+
 test('a comment processing failure preserves both checkpoint fields and a reopen deduplicates committed work', async () => {
   const comments = 'repos/' + REPO + '/issues/comments'
   const f = fixture()
@@ -607,7 +803,7 @@ test('a comment processing failure preserves both checkpoint fields and a reopen
     const checkpoint = () => JSON.parse(readFileSync(watermarkPath(f.store.stateDir), 'utf8')).repos[REPO]
     const before = checkpoint()
     f.setNow('2026-11-15T02:00:00.000Z')
-    f.script[comments] = [[comment({ body: '@hub-bot 第一条' }), comment({ id: 5002, body: '@hub-bot 第二条' })]]
+    f.script[comments] = [comment({ body: '@hub-bot 第一条' }), comment({ id: 5002, body: '@hub-bot 第二条' })]
     const routeBackground = f.router.routeBackground.bind(f.router)
     f.router.routeBackground = request => {
       if (request.source.commentId === 5002) throw new Error('synthetic dispatch failure')
@@ -647,7 +843,7 @@ test('manual and scheduled polling share the active repo cycle', async () => {
     f.script[issues + '/comments'] = async () => {
       entered.resolve()
       await release.promise
-      return [[comment({ body: '@hub-bot 查看' })]]
+      return [comment({ body: '@hub-bot 查看' })]
     }
     const scheduled = f.source.pollAll()
     await entered.promise
@@ -734,12 +930,12 @@ test('manual and scheduled polling wait for one default login check and retry af
     manual = f.source.pollWatchedRepo(REPO)
     scheduled = f.source.pollAll()
     await started.promise
-    assert.deepEqual(f.reads, [['api', 'user']])
+    assert.deepEqual(f.reads, [['api', 'user', '--hostname', 'github.com']])
     assert.equal(checkpoint(), before)
     release.resolve()
     await assert.rejects(manual, /synthetic auth timeout/)
     assert.deepEqual(await scheduled, { triggered: 0, dropped: 0, terminated: 0 })
-    assert.deepEqual(f.reads, [['api', 'user']])
+    assert.deepEqual(f.reads, [['api', 'user', '--hostname', 'github.com']])
     assert.equal(checkpoint(), before)
     assert.equal((await f.source.status()).repos[REPO].lastError, 'synthetic auth timeout')
     f.script.user = { login: 'Ghost233' }
