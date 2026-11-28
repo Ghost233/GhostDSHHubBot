@@ -243,6 +243,13 @@ test('GitHub stop removes only its queued IDs or stops its still-current turn', 
   stale = false
   assert.deepEqual(await stop(), { status: 'cancelled' })
   assert.deepEqual(cancelled, [{ sessionId }])
+  events.push(...Array.from({ length: 1024 }, (_, index) => ({ seq: index + 2, type: 'step/start' })))
+  assert.deepEqual(await stop(), { status: 'cancelled' })
+  assert.deepEqual(cancelled, [{ sessionId }, { sessionId }])
+  events[1] = input('unrelated')
+  events.push({ ...input(managed), seq: events.length })
+  assert.deepEqual(await stop(), { status: 'skipped' })
+  assert.deepEqual(cancelled, [{ sessionId }, { sessionId }])
 })
 
 test('an old mount can flush a Host answer accepted during reload', async t => {

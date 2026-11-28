@@ -219,19 +219,24 @@ export function apply(ctx, rawConfig) {
     try {
       const firstOwn = reader.inheritedEventCount
       if (reader.id !== sessionId || !Number.isSafeInteger(firstOwn) || firstOwn < 0 || firstOwn > cursor) return false
-      const offset = Math.max(firstOwn, cursor - 511)
-      const { events } = await reader.read(offset, cursor - offset + 1, { signal })
-      if (events.at(-1)?.seq !== cursor) return false
       let managed = false
-      for (let index = events.length - 1; index >= 0; index--) {
-        const event = events[index]
-        if (event.type === 'turn/end') return false
-        if (event.type === 'turn/start') return managed
-        if (event.type !== 'user/message') continue
-        const { source } = event.data.message ?? event.data
-        if (source?.kind !== 'user' && source?.kind !== 'retry') continue
-        if (!requestIds.has(source.rpcId)) return false
-        managed = true
+      for (let last = cursor; last >= firstOwn;) {
+        signal.throwIfAborted()
+        const offset = Math.max(firstOwn, last - 511)
+        const length = last - offset + 1
+        const { events } = await reader.read(offset, length, { signal })
+        if (events.length !== length || events[0]?.seq !== offset || events.at(-1)?.seq !== last) return false
+        for (let index = events.length - 1; index >= 0; index--) {
+          const event = events[index]
+          if (event.type === 'turn/end') return false
+          if (event.type === 'turn/start') return managed
+          if (event.type !== 'user/message') continue
+          const { source } = event.data.message ?? event.data
+          if (source?.kind !== 'user' && source?.kind !== 'retry') continue
+          if (!requestIds.has(source.rpcId)) return false
+          managed = true
+        }
+        last = offset - 1
       }
       return false
     } finally { await reader.close() }
