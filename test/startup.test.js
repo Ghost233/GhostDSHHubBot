@@ -21,7 +21,11 @@ for (const [label, Context] of contexts) {
       const homeRepo = await mkdtemp(join(tmpdir(), 'hub-bot-startup-'))
       const root = new Context()
       let routeRegistered = false
-      root.provide('sessionController', {})
+      // S06 显式停止: record what the Sessions port forwards to sessionController.cancel.
+      const cancelRequests = []
+      root.provide('sessionController', {
+        cancel: async request => { cancelRequests.push(request); return { sessionId: request.sessionId } },
+      })
       root.provide('sessionPersistence', {})
       root.provide('webServer', {
         host: '127.0.0.1',
@@ -49,6 +53,11 @@ for (const [label, Context] of contexts) {
       assert.equal(hub?.registry.get('chief')?.role, 'chief')
       assert.equal((await settings.overview()).owners[0]?.id, 'chief')
       assert.equal(routeRegistered, managementEnabled)
+      // S06 显式停止: the Sessions port exposes cancel and forwards the installed DSH shape { sessionId }
+      // unchanged (no invented fields, no widening — authorization stays in the router).
+      assert.equal(typeof hub.sessions.cancel, 'function', 'the Sessions port carries cancel for explicit stops')
+      await hub.sessions.cancel({ sessionId: 'session-s06-cancel' })
+      assert.deepEqual(cancelRequests, [{ sessionId: 'session-s06-cancel' }], 'cancel 原样透传 { sessionId }，不发明字段')
 
       await mounted.dispose()
       assert.ok(!root.reflect.get('hubBot', false), 'the root service must be withdrawn')

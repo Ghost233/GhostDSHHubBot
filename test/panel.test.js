@@ -16,7 +16,7 @@ import { resolveConfig } from '../src/config.js'
 import {
   SETTINGS_FILE, SettingsError,
   applySettingsPatch, applySettingsOverlay, loadSettingsOverlay, saveSettingsOverlay, mergeSettingsOverlay,
-  buildSettingsView, buildOverview, buildOutboxHealth, readMessageDetail,
+  buildSettingsView, buildOverview, buildOutboxHealth, readMessageDetail, buildIntakePolicy,
 } from '../src/panel.js'
 
 /** A fully resolved config with feishu/github sections on — the shape the panel mutates. */
@@ -477,6 +477,139 @@ test('S02 regression: an accepted settings change survives a reopen of the state
   }
 })
 
+test('S06: overview projects both intake entries (飞书入口 + 负责人路由) read-only from stored facts', async () => {
+  const { router, registry, store, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'DSH-Workflow', cwd: '/repos/DSH-Workflow' })
+    const put = store.db.prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)')
+    const droppedAt = '2026-11-15T00:00:00.000Z'
+    const keptAt = '2026-11-15T00:01:00.000Z'
+    // 丢弃的群聊消息也落库（只记录不处理）——它不能被当成「最近一次受理」。
+    put.run('feishu-om_drop', JSON.stringify({
+      id: 'feishu-om_drop', kind: 'feishu', message: '没 @ 的消息', at: droppedAt, dropped: 'no-mention',
+      source: { kind: 'feishu', chatId: 'oc_x', messageId: 'om_drop', openId: 'ou_a', addressing: 'none' },
+    }), droppedAt)
+    // 更早的一条已经注入过（injectedAt 有真实时间戳）；最新一条只落了 injectedAt: null（键在 = 还没注入）。
+    put.run('feishu-om_old', JSON.stringify({
+      id: 'feishu-om_old', kind: 'feishu', message: '昨天的消息', at: '2026-11-14T23:00:00.000Z', injectedAt: '2026-11-14T23:00:05.000Z',
+      source: { kind: 'feishu', chatId: 'oc_x', messageId: 'om_old', openId: 'ou_a', addressing: 'mention' },
+    }), '2026-11-14T23:00:00.000Z')
+    put.run('feishu-om_keep', JSON.stringify({
+      id: 'feishu-om_keep', kind: 'feishu', message: '看一下状态', at: keptAt, injectedAt: null,
+      source: { kind: 'feishu', chatId: 'oc_x', messageId: 'om_keep', openId: 'ou_a', addressing: 'direct' },
+      authorization: { actor: 'ou_a', source: 'feishu', addressing: 'direct', messageId: 'om_keep', at: keptAt },
+    }), keptAt)
+    const receipt = await router.routeToOwner({ ownerId: owner.id, message: '检查当前队列' })
+    const routeTrigger = store.db.prepare('SELECT value FROM trigger').all()
+      .map(raw => JSON.parse(String(raw.value)))
+      .find(trigger => trigger.kind === 'route')
+    assert.equal(routeTrigger.ownerId, owner.id, 'route 触发行由 router 落库（先存后做）')
+    // 投递行在 routeToOwner 之后才落库：routeToOwner 内部会 tick 一次，早落库的 queued 行会被它投掉。
+    insertOutbox(store, { triggerId: 'feishu-om_keep', kind: 'reply', to: 'feishu:chat:oc_x', body: '处理中', state: 'sent' }, () => keptAt)
+    insertOutbox(store, {
+      triggerId: 'feishu-om_keep', kind: 'reply', to: 'feishu:chat:oc_x', body: '还在排队', state: 'queued',
+      attempts: 1, nextRetryAt: Date.parse(keptAt) + 4000, lastError: 'socket hang up',
+    }, () => keptAt)
+
+    const overview = buildOverview({ store, registry })
+    assert.equal(overview.intake.generatedAt, overview.generatedAt, '同一次快照生成，时间戳一致')
+    assert.deepEqual(overview.intake.sources.map(s => s.source), ['feishu', 'route'], '两个入口：飞书与负责人路由')
+    const [feishu, route] = overview.intake.sources
+    assert.equal(feishu.label, '飞书入口')
+    assert.equal(route.label, '负责人路由')
+
+    assert.equal(feishu.at, keptAt, '最近一次受理取最新的触发行（旧的丢弃记录不覆盖）')
+    assert.equal(feishu.triggerId, 'feishu-om_keep')
+    assert.equal(feishu.dedupKey, 'feishu-om_keep', '去重键就是触发行 id（feishu 侧 = feishu-<messageId>）')
+    assert.equal(feishu.addressing, 'direct', '受理口径来自触发行自带的 addressing')
+    assert.equal(feishu.dropped, null)
+    assert.equal(feishu.injectedAt, null)
+    assert.equal(feishu.ownerId, null)
+    assert.equal(feishu.ticketId, null)
+    assert.deepEqual(feishu.counts, { triggers: 3, dropped: 1, injected: 1 },
+      '计数就是列表长度：丢弃也记账；注入只认真的注入过的行（injectedAt: null 的占位不算）')
+    assert.equal(feishu.queue.state, 'queued', '最相关的投递行优先：失败 > 在途 > 已送达')
+    assert.equal(feishu.queue.attempts, 1)
+    assert.equal(feishu.queue.nextRetryAt, Date.parse(keptAt) + 4000)
+    assert.equal(feishu.queue.lastError, 'socket hang up')
+    assert.equal(feishu.queue.rows, 2, '链接到该触发的全部投递行')
+
+    assert.equal(route.triggerId, routeTrigger.id)
+    assert.equal(route.dedupKey, routeTrigger.id)
+    assert.equal(route.at, routeTrigger.at)
+    assert.equal(route.ownerId, owner.id)
+    assert.equal(route.ticketId, receipt.ticketId)
+    assert.equal(route.addressing, 'direct', '路由入口保留到达时的寻址方式')
+    assert.equal(route.dropped, null)
+    assert.equal(route.injectedAt, null)
+    assert.deepEqual(route.counts, { triggers: 1, dropped: 0, injected: 1 },
+      'routeToOwner 真的把注入投进宿主了（票面 lastDelivery.state === sent）→ 计数为已注入')
+    assert.equal(route.queue.state, 'sent', 'routeToOwner 已投递的注入行是 sent')
+    assert.equal(route.queue.rows, 1)
+    assert.deepEqual(Object.keys(feishu).sort(), [
+      'addressing', 'at', 'counts', 'dedupKey', 'disposition', 'dropped', 'injectedAt', 'label', 'ownerId', 'policy', 'queue', 'source', 'ticketId', 'triggerId',
+    ], '只读投影的字段集合固定 —— 没有任何可写开关')
+    assert.equal(feishu.disposition, 'pending', '已受理但 injectedAt 还是 null = 等注入（重启会重放，不是丢了）')
+    assert.equal(route.disposition, 'injected', '票面 lastDelivery.state === sent 才算真的注入了')
+
+    // 到达时的口径快照由 router 落库在触发行顶层 `policy` 上（s06-core 契约）；面板原样透传，
+    // 没落库就是 null —— 不发明字段名、不补值。
+    assert.equal(feishu.policy, null)
+    assert.deepEqual(route.policy, routeTrigger.policy)
+    const snapshot = { source: 'dsh', addressing: 'direct', admitted: true }
+    store.db.prepare('UPDATE trigger SET value = ? WHERE id = ?')
+      .run(JSON.stringify({ ...routeTrigger, policy: snapshot }), routeTrigger.id)
+    const projected = buildIntakePolicy(store, { now: () => '2026-11-15T00:02:00.000Z' })
+    assert.equal(projected.generatedAt, '2026-11-15T00:02:00.000Z')
+    assert.deepEqual(projected.sources[1].policy, snapshot, '口径快照原样透传，面板不重算')
+    assert.equal(projected.sources[0].policy, null, '飞书触发行没有快照 → null')
+    // 只认顶层 policy：别的键（曾经的猜测字段）不会被当成口径快照，投影不猜字段名。
+    store.db.prepare('UPDATE trigger SET value = ? WHERE id = ?')
+      .run(JSON.stringify({ ...routeTrigger, policy: undefined, intake: { addressing: 'direct' }, policySnapshot: { allowed: true } }), routeTrigger.id)
+    const guessed = buildIntakePolicy(store, { now: () => '2026-11-15T00:02:00.000Z' })
+    assert.equal(guessed.sources[1].policy, null, 'intake/policySnapshot 不是契约字段，不能被当成快照')
+  } finally {
+    cleanup()
+  }
+})
+
+test('S06: intake projection is read-only — empty entries stay null, no settings key or allowlist appears', () => {
+  const { store, cleanup } = fixture()
+  try {
+    const empty = buildIntakePolicy(store, { now: () => '2026-11-15T00:00:00.000Z' })
+    assert.deepEqual(empty.sources.map(s => s.source), ['feishu', 'route'])
+    for (const source of empty.sources) {
+      assert.equal(typeof source.label, 'string', '每个入口都带中文标签')
+      assert.ok(source.label.length > 0)
+      assert.equal(source.at, null, '没有触发行 → null（面板渲染 —），不编造受理时间')
+      assert.equal(source.triggerId, null)
+      assert.equal(source.dedupKey, null)
+      assert.equal(source.addressing, null)
+      assert.equal(source.dropped, null)
+      assert.equal(source.injectedAt, null)
+      assert.equal(source.ownerId, null)
+      assert.equal(source.ticketId, null)
+      assert.equal(source.policy, null)
+      assert.equal(source.disposition, null, '没有触发行 → 处置是 null（面板渲染 —），不假装已注入/已丢弃')
+      assert.deepEqual(source.counts, { triggers: 0, dropped: 0, injected: 0 })
+      assert.deepEqual(source.queue, { state: null, attempts: 0, nextRetryAt: null, lastError: null, rows: 0 },
+        '没有投递行时队列状态是 null —— 不假装 queued/sent')
+    }
+  } finally {
+    cleanup()
+  }
+  // 只读投影不能顺带长出一个新的设置键/白名单：写层仍旧只认既有键。
+  const config = baseConfig()
+  assert.throws(() => applySettingsPatch(config, { feishu: { openIdAllowlist: ['ou_a'] } }), /does not know settings key/)
+  assert.throws(() => applySettingsPatch(config, { feishu: { intakePolicy: { addressing: 'direct' } } }), /does not know settings key/,
+    '投喂口径只读展示，不新增可写的 feishu.intakePolicy')
+  assert.throws(() => applySettingsPatch(config, { intake: { enabled: true } }), /unknown settings section "intake"/)
+  const view = buildSettingsView(config)
+  assert.equal(view.feishu.openIdAllowlist, undefined, '面板视图里没有 openId 白名单')
+  assert.equal(view.intake, undefined, '设置视图里没有投喂面开关')
+  assert.deepEqual(Object.keys(view.feishu).sort(), ['enabled', 'status'])
+})
+
 test('settings view merges the effective config with live source status', () => {
   const config = baseConfig()
   const view = buildSettingsView(config, {
@@ -493,4 +626,32 @@ test('settings view merges the effective config with live source status', () => 
   assert.deepEqual(view.github.loginAllowlist, ['ghost'])
   assert.deepEqual(view.github.followed, [{ repo: 'o/r', ownerId: 'repo-w' }], '监听清单跟随注册表（只读）')
   assert.equal(view.github.status.lastPollError, null)
+})
+
+test('message detail distinguishes pending, failed, and admitted intake for the same event', () => {
+  const { store, cleanup } = fixture()
+  try {
+    const trigger = { id: 'feishu-fixture-detail', kind: 'feishu', at: '2026-11-15T00:00:00.000Z', message: 'fixture', policy: { mode: 'queue' }, injectedAt: null }
+    store.db.prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)').run(trigger.id, JSON.stringify(trigger), trigger.at)
+    const intent = insertOutbox(store, { kind: 'inbox', to: 'owner:chief', state: 'queued', triggerId: trigger.id })
+    assert.equal(readMessageDetail(store, trigger.id).intake.disposition, 'pending')
+    const save = store.db.prepare('UPDATE outbox SET value = ? WHERE id = ?')
+    save.run(JSON.stringify({ ...intent, state: 'failed', lastError: 'fixture timeout' }), intent.id)
+    assert.deepEqual(readMessageDetail(store, trigger.id).intake, { disposition: 'failed', queueState: 'failed', lastError: 'fixture timeout' })
+    save.run(JSON.stringify({ ...intent, state: 'sent' }), intent.id)
+    store.db.prepare('UPDATE trigger SET value = ? WHERE id = ?').run(JSON.stringify({ ...trigger, injectedAt: trigger.at }), trigger.id)
+    assert.equal(readMessageDetail(store, trigger.id).intake.disposition, 'injected')
+  } finally { cleanup() }
+})
+
+test('message detail agrees with the overview after routing an owner request', async () => {
+  const { router, registry, store, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Details fixture', cwd: '/repos/details' })
+    const triggerId = 'fixture-route-detail'
+    await router.routeToOwner({ ownerId: owner.id, triggerRef: triggerId, message: 'fixture routing request' })
+    const overview = buildOverview({ store, registry })
+    assert.equal(overview.intake.sources.find(entry => entry.triggerId === triggerId)?.disposition, 'injected')
+    assert.equal(readMessageDetail(store, triggerId)?.intake?.disposition, 'injected')
+  } finally { cleanup() }
 })

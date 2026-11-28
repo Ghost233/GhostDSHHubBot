@@ -2,6 +2,11 @@
  * FeishuSource (issue #68 飞书入口): normalization of im.message.receive_v1 events, plugin-owned source marks,
  * the mention policy (授权边界在飞书侧, 插件不做二次过滤), the recorded-outbox reply channel (P1-2 honest intents actually sent), and
  * credential persistence (0600). Tested with an injected fake lark SDK — no network.
+ *
+ * S06 (飞书入口 = 纯来源适配器): the tests after `S06 单一入口` drive the PRODUCTION dispatch seam — a real Router
+ * over a temporary Store, the fake Lark SDK and a fake credentials port — and assert the source hands over ONE
+ * immutable trigger and asserts no acceptance of its own. The tests above them keep constructing the source
+ * WITHOUT the router port: that is the legacy mount and it must keep working unchanged (backward compatible).
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -16,20 +21,21 @@ import { CredentialsError, DEFAULT_FEISHU_CREDENTIAL_REF, MALFORMED, MISSING, UN
 import { insertOutbox } from '../src/outbox.js'
 import { resolveConfig } from '../src/config.js'
 
-/** A registry+router+source with fake sessions, Lark SDK, and DSH credential records. */
+/** Router and Feishu adapter over one SQLite store and fake host ports. */
 function fixture({ botOpenId = 'ou_bot', larkOverrides = {}, chiefConfig, credentials = fakeCredentialsPort(), config } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'hub-bot-feishu-'))
   const store = new Store(dir)
   const registry = new OwnerRegistry(store, { scratchRoot: join(dir, 'scratch') })
   registry.ensureChief({ cwd: '/Volumes/home', workspace: 'Ghost233HomeRepo' })
   let nowMs = Date.parse('2026-11-15T00:00:00.000Z')
-  const calls = { create: [], prompt: [], selectModel: [] }
+  const calls = { create: [], prompt: [], selectModel: [], cancel: [] }
   const sessions = {
     create: async request => { calls.create.push(request); return { sessionId: 'session-chief-' + calls.create.length } },
     prompt: async request => { calls.prompt.push(request); return { accepted: true } },
     selectModel: async request => { calls.selectModel.push(request); return { selected: request } },
+    cancel: async request => { calls.cancel.push(request); return { cancelled: true } },
   }
-  const router = new Router({ store, registry, sessions, now: () => new Date(nowMs).toISOString() })
+  const router = new Router({ store, registry, sessions, config: { chief: chiefConfig }, now: () => new Date(nowMs).toISOString() })
   const sent = []
   const fakeLark = {
     client: {
@@ -40,17 +46,22 @@ function fixture({ botOpenId = 'ou_bot', larkOverrides = {}, chiefConfig, creden
     ...larkOverrides,
   }
   const source = new FeishuSource({
-    store, registry, sessions,
+    store, router,
     config: config ?? { enabled: true, botOpenId },
-    chiefConfig,
     logger: { info() {}, warn() {} },
     lark: fakeLark,
     now: () => new Date(nowMs).toISOString(),
     credentials,
   })
   return {
-    source, router, registry, store, calls, sent, fakeLark, dir,
+    source, router, registry, store, calls, sent, fakeLark, dir, sessions,
     advance: ms => { nowMs += ms },
+    /** Read one trigger row back as JSON (the Router is the only writer on the intake path). */
+    trigger: id => {
+      const row = store.db.prepare('SELECT value FROM trigger WHERE id = ?').get(id)
+      return row ? JSON.parse(String(row.value)) : null
+    },
+    outbox: () => store.db.prepare('SELECT value FROM outbox').all().map(r => JSON.parse(String(r.value))),
     cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }) },
   }
 }
@@ -100,9 +111,10 @@ test('config: the feishu section is validated (keys) and defaults disabled; open
 })
 
 test('a p2p text message is normalized, recorded as a Trigger, and injected into L1 with a plugin-owned source mark', async () => {
-  const { source, registry, calls, cleanup } = fixture()
+  const { source, registry, router, calls, cleanup } = fixture()
   try {
     await source.handleEvent(event())
+    await router.tick()
     assert.equal(calls.prompt.length, 1)
     const injected = calls.prompt[0]
     assert.ok(injected.text.startsWith('[hub-bot 飞书 oc_1/om_1]'), 'source mark heads the injection (task-1 遗留: distinguishable from hand-typed input)')
@@ -125,7 +137,9 @@ test('Feishu replies and dispatches use the original message and its authorizati
       source.handleEvent(event({ messageId: 'om_first', text: '原始请求' })),
       source.handleEvent(event({ messageId: 'om_second', text: '另一条请求' })),
     ])
-    assert.equal(first.sessionId, second.sessionId)
+    await router.tick()
+    assert.equal(calls.prompt.length, 2)
+    assert.equal(calls.prompt[0].sessionId, calls.prompt[1].sessionId)
     assert.equal(calls.create.length, 1)
     assert.ok(calls.prompt.some(prompt => /triggerRef='feishu-om_first'/.test(prompt.text)))
     assert.ok(router.getTrigger(first.triggerId).injectedAt)
@@ -162,12 +176,14 @@ test('chief model: config validated; injection aligns the chief session model wh
   const aligned = fixture({ chiefConfig: { model: { provider: 'magpie', model: 'zhipu/glm-4.5' } } })
   try {
     await aligned.source.handleEvent(event())
+    await aligned.router.tick()
     assert.equal(aligned.calls.selectModel.length, 1)
     assert.deepEqual(aligned.calls.selectModel[0], { sessionId: 'session-chief-1', provider: 'magpie', model: 'zhipu/glm-4.5' })
   } finally { aligned.cleanup() }
   const plain = fixture({ chiefConfig: { model: null } })
   try {
     await plain.source.handleEvent(event())
+    await plain.router.tick()
     assert.equal(plain.calls.selectModel.length, 0)
   } finally { plain.cleanup() }
 })
@@ -181,7 +197,7 @@ test('bot-own messages are dropped (spec: 丢弃 bot 自己的消息)', async ()
 })
 
 test('group chat: only messages mentioning the bot become requests (spec: 群聊 @bot)', async () => {
-  const { source, calls, cleanup } = fixture()
+  const { source, router, calls, cleanup } = fixture()
   try {
     await source.handleEvent(event({ messageId: 'om_3', chatType: 'group', text: '随便聊聊' }))
     assert.equal(calls.prompt.length, 0)
@@ -191,6 +207,7 @@ test('group chat: only messages mentioning the bot become requests (spec: 群聊
       messageId: 'om_4', chatType: 'group', text: '@_user_1 查一下工单',
       mentions: [{ key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'hub-bot' }],
     }))
+    await router.tick()
     assert.equal(calls.prompt.length, 1)
     assert.ok(calls.prompt[0].text.includes('查一下工单'), 'the mention placeholder is stripped')
     assert.ok(calls.prompt[0].text.includes('群聊 @bot'), 'addressing surfaces as mention in the source mark')
@@ -214,10 +231,11 @@ test('non-text messages get the recorded-reply 暂不支持该消息类型', asy
 })
 
 test('a replayed message id is deduped by its Trigger id (重启不重放事件)', async () => {
-  const { source, calls, cleanup } = fixture()
+  const { source, router, calls, cleanup } = fixture()
   try {
     await source.handleEvent(event())
     await source.handleEvent(event())
+    await router.tick()
     assert.equal(calls.prompt.length, 1)
   } finally { cleanup() }
 })
@@ -516,6 +534,175 @@ test('S04 regression: an old local Feishu credential file is not used as a fallb
     assert.equal(source.status().bot, undefined)
     await assert.rejects(source.register(), /宿主凭据服务不可用/)
     assert.doesNotMatch(JSON.stringify(source.status()), /old-secret/)
+  } finally { f.cleanup() }
+})
+
+// ---------------------------------------------------------------------------------------------------------
+// S06 单一入口: 飞书 = 纯来源适配器.
+// The same production admission path is exercised through fake host ports.
+
+test('S06 单一入口: a duplicate message while the chief is busy is deduped — the same message never becomes two jobs', async () => {
+  const f = fixture()
+  try {
+    const [first, second, replay] = await Promise.all([
+      f.source.handleEvent(event({ messageId: 'om_a', text: '第一条请求' })),
+      f.source.handleEvent(event({ messageId: 'om_b', text: '第二条请求' })),
+      f.source.handleEvent(event({ messageId: 'om_a', text: '第一条请求' })),
+    ])
+    assert.equal(first.triggerId, 'feishu-om_a')
+    assert.equal(second.triggerId, 'feishu-om_b')
+    assert.equal(replay.triggerId, 'feishu-om_a', 'the dedup key is the message id, reused on replay')
+    // 同一条消息被投递两次: 恰好一次是 dedup，且 dedup 那次不声称注入、不新存东西
+    const deduped = [first, replay].filter(result => result.deduped === true)
+    assert.equal(deduped.length, 1, 'exactly one delivery of om_a is the dedup')
+    assert.equal(deduped[0].injected, false, 'a deduped delivery claims no injection of its own')
+    assert.equal(deduped[0].queued, false, 'a deduped delivery stores nothing new')
+    for (const result of [first, second]) {
+      assert.equal(result.dropped, null, 'a real text message is not dropped')
+      assert.ok(result.injected === true || result.queued === true, 'a real message becomes work (admitted or queued)')
+    }
+    // 触发器行由 Router 写，且每个 message id 只有一行
+    const ids = f.store.db.prepare('SELECT id FROM trigger').all().map(row => String(row.id)).sort()
+    assert.deepEqual(ids, ['feishu-om_a', 'feishu-om_b'], 'one trigger row per message id, no duplicate insert')
+    assert.ok(f.router.getTrigger('feishu-om_a').authorization, 'the Router is the trigger-row writer')
+    assert.equal(f.router.getTrigger('feishu-om_a').message, '第一条请求', 'the original text is preserved verbatim')
+  } finally { f.cleanup() }
+})
+
+test('S06: a pending trigger is admitted once after restart even if Feishu redelivers it', async () => {
+  const f = fixture()
+  try {
+    const accepted = await f.source.handleEvent(event({ messageId: 'om_pending', text: '重启前的请求' }))
+    assert.equal(accepted.dropped, null)
+    const stored = f.trigger('feishu-om_pending')
+    assert.ok(stored, 'the trigger row is persisted before anything is acted on (先存后做)')
+    assert.equal(stored.message, '重启前的请求')
+    assert.equal(stored.kind, 'feishu')
+    assert.deepEqual(stored.authorization, {
+      actor: 'ou_me', source: 'feishu', addressing: 'direct', messageId: 'om_pending', at: stored.at,
+    })
+    // 重启: 新的 Router + 新的 source 共用同一个 Store（宿主重启后重新挂载）
+    const restartedCalls = { create: [], prompt: [], selectModel: [], cancel: [] }
+    const restartedSessions = Object.fromEntries(Object.keys(restartedCalls).map(key => [key, async request => {
+      restartedCalls[key].push(request)
+      return key === 'create' ? { sessionId: 'session-restarted-chief' } : { accepted: true }
+    }]))
+    const restartedRouter = new Router({
+      store: f.store, registry: f.registry, sessions: restartedSessions,
+      now: () => '2026-11-15T06:00:00.000Z',
+    })
+    const restarted = new FeishuSource({
+      store: f.store, registry: f.registry, router: restartedRouter, sessions: restartedSessions,
+      config: { enabled: true, botOpenId: 'ou_bot' }, logger: { info() {}, warn() {} },
+      now: () => '2026-11-15T06:00:00.000Z',
+    })
+    // 重启后同一条消息再投递一次: 只认已存在的那一行，不再工作一次
+    const replay = await restarted.handleEvent(event({ messageId: 'om_pending', text: '重启前的请求' }))
+    assert.equal(replay.triggerId, 'feishu-om_pending')
+    assert.equal(replay.deduped, true, 'a replayed message after restart is deduped by its trigger id')
+    assert.equal(replay.injected, false)
+    assert.equal(replay.queued, false)
+    assert.equal(restartedCalls.prompt.length, 0)
+    await restartedRouter.tick()
+    await restartedRouter.tick()
+    assert.equal(restartedCalls.prompt.length, 1, 'resume the original saved intent exactly once')
+    assert.equal(restartedCalls.prompt[0].requestId, accepted.requestId)
+    assert.equal(f.store.db.prepare('SELECT COUNT(*) AS n FROM trigger WHERE id = ?').get('feishu-om_pending').n, 1)
+    const recovered = restartedRouter.getTrigger('feishu-om_pending')
+    assert.equal(recovered.message, '重启前的请求')
+    assert.ok(recovered.injectedAt)
+  } finally { f.cleanup() }
+})
+
+test('S06 单一入口: a group message @ the configured botOpenId is accepted as a mention', async () => {
+  const f = fixture({ botOpenId: 'ou_real_bot' })
+  try {
+    const result = await f.source.handleEvent(event({
+      messageId: 'om_mention', chatId: 'oc_group', chatType: 'group', text: '@_user_1 查一下工单',
+      mentions: [{ key: '@_user_1', id: { open_id: 'ou_real_bot' }, name: 'hub-bot' }],
+    }))
+    assert.equal(result.dropped, null, 'a verified @ this bot is addressed to us')
+    assert.ok(result.injected === true || result.queued === true, 'the message becomes work')
+    const row = f.trigger('feishu-om_mention')
+    assert.equal(row.source.addressing, 'mention')
+    assert.equal(row.source.chatId, 'oc_group')
+    assert.equal(row.authorization.addressing, 'mention')
+    assert.equal(row.authorization.actor, 'ou_me')
+    assert.equal(row.dropped, undefined, 'an accepted trigger carries no dropped reason')
+  } finally { f.cleanup() }
+})
+
+test('S06 单一入口: a group @ we cannot verify (botOpenId missing) is dropped as unknown-bot-id, never accepted', async () => {
+  // 没有配置真实 botOpenId: 认不出这个 @ 是谁 —— 绝不猜，也绝不用 mentions.length > 0 兜底
+  const f = fixture({ config: { enabled: true } })
+  try {
+    const result = await f.source.handleEvent(event({
+      messageId: 'om_unknown', chatType: 'group', text: '@_user_1 帮我改代码',
+      mentions: [{ key: '@_user_1', id: { open_id: 'ou_whoever' }, name: 'someone' }],
+    }))
+    assert.equal(result.dropped, 'unknown-bot-id', 'the truthful reason is explicit, not a silent swallow')
+    assert.equal(result.injected, false)
+    assert.equal(result.queued, false)
+    const row = f.trigger('feishu-om_unknown')
+    assert.ok(row, 'a dropped event still lands as a recorded trigger (只记录不处理)')
+    assert.equal(row.dropped, 'unknown-bot-id')
+    assert.equal(row.authorization, undefined, 'a dropped trigger grants no authorization')
+    assert.equal(row.source.addressing, 'none')
+  } finally { f.cleanup() }
+})
+
+test('S06 单一入口: a group message @ somebody else is dropped even when botOpenId is configured', async () => {
+  const f = fixture({ botOpenId: 'ou_real_bot' })
+  try {
+    const result = await f.source.handleEvent(event({
+      messageId: 'om_other', chatType: 'group', text: '@_user_1 你们看下',
+      mentions: [{ key: '@_user_1', id: { open_id: 'ou_colleague' }, name: '同事' }],
+    }))
+    assert.equal(result.dropped, 'unknown-bot-id', '@ someone else must not be mistaken for @ this bot')
+    assert.equal(result.injected, false)
+    assert.equal(f.trigger('feishu-om_other').dropped, 'unknown-bot-id')
+    // 对照组: 同一条消息 @ 本 bot 才是工作
+    const addressed = await f.source.handleEvent(event({
+      messageId: 'om_other_ok', chatType: 'group', text: '@_user_1 你们看下',
+      mentions: [{ key: '@_user_1', id: { open_id: 'ou_real_bot' }, name: 'hub-bot' }],
+    }))
+    assert.equal(addressed.dropped, null)
+  } finally { f.cleanup() }
+})
+
+test('S06 单一入口: 停/停止 travels as the original text and the Router is the one that cancels', async () => {
+  const f = fixture()
+  try {
+    f.registry.bindSession('chief', 'running-chief')
+    const stop = await f.source.handleEvent(event({ messageId: 'om_stop', text: '停' }))
+    const stopFull = await f.source.handleEvent(event({ messageId: 'om_stop_full', text: '停止' }))
+    assert.equal(stop.triggerId, 'feishu-om_stop')
+    assert.equal(stopFull.triggerId, 'feishu-om_stop_full')
+    // 原文逐字交给 Router —— 停止语义在 Router 的 acceptFeishuTrigger 里判，适配器不改写、不自己取消
+    assert.equal(f.trigger('feishu-om_stop').message, '停', 'the stop text is handed over unaltered')
+    assert.equal(f.trigger('feishu-om_stop_full').message, '停止', 'the stop text is handed over unaltered')
+    assert.equal(f.calls.cancel.length, 2, 'the Router cancels once per explicit stop message')
+  } finally { f.cleanup() }
+})
+
+test('S06 单一入口: a non-text message still records the 暂不支持 reply intent, exactly once', async () => {
+  const f = fixture()
+  try {
+    const result = await f.source.handleEvent(event({ messageId: 'om_image', msgType: 'image' }))
+    assert.equal(result.dropped, 'unsupported-type')
+    assert.equal(result.injected, false)
+    const replies = () => f.outbox().filter(row => row.kind === 'reply' && row.triggerId === 'feishu-om_image')
+    const [reply] = replies()
+    assert.ok(reply, 'the reply intent is stored before anything else (先存后做)')
+    assert.equal(reply.state, 'recorded', 'recorded, never faked as sent')
+    assert.equal(reply.to, 'feishu:chat:oc_1')
+    assert.equal(reply.body, '暂不支持该消息类型')
+    assert.equal(reply.requestId, 'hub-bot-feishu-unsupported-om_image')
+    assert.equal(f.trigger('feishu-om_image').dropped, 'unsupported-type')
+    assert.equal(f.trigger('feishu-om_image').msgType, 'image')
+    // 重放同一条消息不产生第二条回复意图
+    await f.source.handleEvent(event({ messageId: 'om_image', msgType: 'image' }))
+    assert.equal(replies().length, 1, 'a replay must not duplicate the recorded reply intent')
   } finally { f.cleanup() }
 })
 

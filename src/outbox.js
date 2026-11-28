@@ -16,7 +16,7 @@
 import { randomUUID } from 'node:crypto'
 
 /** Backoff caps by row kind (spec: 回复上限 1 分钟、注入上限 5 分钟）. */
-const CAP_MS = { inject: 5 * 60_000, reply: 60_000 }
+const CAP_MS = { inject: 5 * 60_000, inbox: 5 * 60_000, reply: 60_000 }
 const BASE_MS = 2_000
 const MAX_ATTEMPTS = 3
 
@@ -171,9 +171,9 @@ export class OutboxRunner {
    * scan until releaseHeld() flips it to 'queued' (slot admission). Per-ticket order survives: the held head
    * and any follow-up rows release together, oldest first.
    */
-  enqueue({ ticketId, triggerId, kind, to, body, sessionId, requestId, held }) {
+  enqueue({ id, ticketId, triggerId, kind, to, body, sessionId, requestId, held }) {
     return insertOutbox(this.store, {
-      ticketId: ticketId ?? null, kind, to, body, sessionId: sessionId ?? null, requestId, state: held === true ? 'held' : 'queued',
+      id, ticketId: ticketId ?? null, kind, to, body, sessionId: sessionId ?? null, requestId, state: held === true ? 'held' : 'queued',
       ...(triggerId !== undefined && { triggerId }),
     }, this.now)
   }
@@ -196,14 +196,15 @@ export class OutboxRunner {
     updateOutboxRow(this.store, row) // 双轴审查 P1-2: 三处逐字重复收敛到这一个写者
   }
 
-  /** All queued delivery rows, oldest first, grouped by ticket (null ticket groups under ''). */
-  #pendingByTicket() {
+  /** All queued delivery rows, oldest first, grouped by ticket or owner inbox. */
+  #pendingByTicket(kind) {
     const rows = this.store.db.prepare('SELECT value FROM outbox ORDER BY at, rowid').all()
       .map(raw => JSON.parse(String(raw.value)))
-      .filter(row => row.state === 'queued')
+      .filter(row => row.state === 'queued' && (kind === undefined || row.kind === kind))
     const groups = new Map()
     for (const row of rows) {
-      const key = row.ticketId ?? ''
+      const inbox = row.kind === 'inbox' || row.kind === 'stop'
+      const key = row.ticketId ?? (inbox ? row.kind + ':' + row.to : '')
       if (!groups.has(key)) groups.set(key, [])
       groups.get(key).push(row)
     }
@@ -221,9 +222,12 @@ export class OutboxRunner {
    * 3) 幂等 — 每次尝试之前重新读库里的当前行：别处（重投/丢弃/另一条路径）已经把它推进终态
    *    （sent/recorded/failed）或删掉时直接跳过，绝不凭旧快照再投一次；requestId 等字段一律沿用库里的当前值。
    */
-  async tick() {
+  async tick({ kind } = {}) {
     const nowMs = this.now()
-    for (const [key, rows] of this.#pendingByTicket()) {
+    const groups = this.#pendingByTicket(kind)
+    // Interrupts must not wait behind a blocked ordinary prompt.
+    const ordered = [...groups].sort(([, a], [, b]) => Number(b[0].kind === 'stop') - Number(a[0].kind === 'stop'))
+    for (const [key, rows] of ordered) {
       if (this.#activeDrains.has(key)) continue // 这张票已有一轮 drain 在途 → 本轮不重入
       this.#activeDrains.add(key)
       try {

@@ -17,7 +17,8 @@
  */
 import { randomUUID } from 'node:crypto'
 import { TaskBoard, STAGE_TEXT, normalizeStage, translateTaskError, CONFIRM_TIMEOUT_MS } from './tasks.js'
-import { OutboxRunner } from './outbox.js'
+import { OutboxRunner, insertOutbox } from './outbox.js'
+import { feishuPrompt, UNSUPPORTED_MESSAGE_TYPE } from './inbox.js'
 import { truncateWords } from './discipline.js'
 import { buildDigestText, buildAutoSummary } from './reporting.js'
 import { confirmTicketFork } from './fork.js'
@@ -56,6 +57,7 @@ export class Router {
   #lastAutoReportText = null
   // Owner queues protect execution slots. Trigger queues prevent duplicate tickets across owners.
   #queues = new Map()
+  #currentStops = new Map()
 
   constructor({ store, registry, sessions, tasks, runner, config, now, ids, onSystemProblem, placer }) {
     this.store = store
@@ -87,6 +89,19 @@ export class Router {
     })
   }
 
+  #persistWork(write) {
+    const db = this.store.db
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      const result = write()
+      db.exec('COMMIT')
+      return result
+    } catch (error) {
+      if (db.isTransaction) db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
   #insertTrigger(row) {
     this.store.db.prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)').run(row.id, JSON.stringify(row), row.at)
     return row
@@ -106,6 +121,93 @@ export class Router {
   getTrigger(id) {
     const raw = this.store.db.prepare('SELECT value FROM trigger WHERE id = ?').get(id)
     return raw === undefined ? undefined : JSON.parse(String(raw.value))
+  }
+
+  /** Save a Feishu receipt and its delivery intent together, before acknowledging the transport. */
+  async acceptFeishuTrigger(incoming) {
+    const { id } = incoming
+    const { messageId } = incoming.source
+    const requestId = 'hub-bot-feishu-' + messageId
+    const outboxId = 'out-inbox-' + id
+    const previous = this.getTrigger(id)
+    const pending = this.#outboxRow(outboxId)
+    const receipt = { triggerId: id, requestId, deduped: Boolean(previous), admitted: false, queued: false }
+    if (previous && (pending || previous.injectedAt !== null || previous.dropped || !previous.authorization || incoming.dropped)) {
+      return { ...receipt, dropped: previous.dropped ?? null, outboxId: pending?.id ?? null }
+    }
+
+    const stop = !previous && !incoming.dropped && ['停', '停止'].includes(incoming.message)
+    const sessionId = stop ? this.registry.get('chief')?.sessionId ?? null : null
+    const skipStop = stop && (!sessionId ? 'no-current-session' : this.#currentStops.has(sessionId) ? 'interrupt-in-flight' : null)
+    const trigger = {
+      ...(previous ?? incoming),
+      ownerId: 'chief',
+      injectedAt: null,
+      policy: previous?.policy ?? { ...incoming.policy, mode: incoming.dropped ? 'drop' : stop ? 'interrupt' : 'queue' },
+    }
+    this.#persistWork(() => {
+      if (previous) this.#updateTrigger(trigger)
+      else this.#insertTrigger(trigger)
+      if (trigger.dropped === 'unsupported-type') {
+        insertOutbox(this.store, {
+          id: outboxId, ticketId: null, triggerId: id, kind: 'reply', to: 'feishu:chat:' + trigger.source.chatId,
+          body: UNSUPPORTED_MESSAGE_TYPE, state: 'recorded', requestId: 'hub-bot-feishu-unsupported-' + messageId,
+        }, () => Date.parse(trigger.at))
+      } else if (skipStop) {
+        insertOutbox(this.store, {
+          id: outboxId, ticketId: null, triggerId: id, kind: 'stop', to: 'owner:chief',
+          body: trigger.message, sessionId, requestId, state: 'recorded', recordedAt: this.now(), skipReason: skipStop,
+        }, () => Date.parse(trigger.at))
+      } else if (!trigger.dropped) {
+        this.runner.enqueue({
+          id: outboxId, ticketId: null, triggerId: id, kind: stop ? 'stop' : 'inbox', to: 'owner:chief',
+          body: trigger.message, sessionId, requestId,
+        })
+      }
+    })
+    if (stop && !skipStop) {
+      this.#currentStops.set(sessionId, outboxId)
+      try {
+        await this.runner.tick({ kind: 'stop' })
+      } finally {
+        this.#currentStops.delete(sessionId)
+      }
+    }
+    const row = this.#outboxRow(outboxId)
+    return { ...receipt, deduped: false, dropped: trigger.dropped ?? null, outboxId: row?.id ?? null, queued: row?.state === 'queued' }
+  }
+
+  #updateTrigger(row) {
+    this.store.db.prepare('UPDATE trigger SET value = ? WHERE id = ?').run(JSON.stringify(row), row.id)
+  }
+
+  async #deliverIntake(row) {
+    const trigger = this.getTrigger(row.triggerId)
+    if (!trigger || trigger.dropped || !trigger.authorization) {
+      throw Object.assign(new Error('The original intake authorization is unavailable'), { permanent: true })
+    }
+    if (row.kind === 'stop') {
+      // A stop applies to the turn active when it was requested. A restart never replays it.
+      if (this.#currentStops.get(row.sessionId) !== row.id) return { recorded: true, skipped: 'interrupt-stale' }
+      if (!row.sessionId || row.sessionId !== this.registry.get('chief')?.sessionId) return { recorded: true, skipped: 'no-current-session' }
+      try {
+        await this.sessions.cancel({ sessionId: row.sessionId })
+      } catch (error) {
+        if (isMissingSession(error) || error?.code === 'session/not-found') return { recorded: true, skipped: 'no-current-session' }
+        throw Object.assign(new Error('Unable to interrupt the current session', { cause: error }), { permanent: true })
+      }
+      if (!this.store.closed) this.#updateTrigger({ ...trigger, interruptAt: this.now() })
+      return
+    }
+    if (trigger.injectedAt) return
+    const ensured = await this.#ensureChiefSession()
+    const model = this.config.chief?.model
+    if (model) {
+      try { await this.sessions.selectModel?.({ sessionId: ensured.sessionId, ...model }) }
+      catch { /* Keep the configured deployment model if selection is unavailable. */ }
+    }
+    await this.#promptOwner('chief', ensured, null, row.requestId, feishuPrompt(trigger))
+    if (!this.store.closed) this.#updateTrigger({ ...this.getTrigger(trigger.id), injectedAt: this.now() })
   }
 
   /** One Ticket row by id (stage normalized), or undefined. */
@@ -263,10 +365,12 @@ export class Router {
   }
 
   /** The chief's own Session (L1 统一出口): digests and replies are admitted here. */
-  async #ensureChiefSession() {
-    const chief = this.registry.get('chief')
-    if (!chief) throw new RouterError('chief-missing', 'the chief owner row is missing from the registry')
-    return this.#ensureSession(chief)
+  #ensureChiefSession() {
+    return this.#serialized('chief-session', async () => {
+      const chief = this.registry.get('chief')
+      if (!chief) throw new RouterError('chief-missing', 'the chief owner row is missing from the registry')
+      return await this.#ensureSession(chief)
+    })
   }
 
   /** Lazily binds an owner Session: create only when the registry names none. */
@@ -354,46 +458,58 @@ export class Router {
     const existing = triggerRef === undefined ? undefined : this.getTrigger(triggerRef)
     if (existing) {
       const ticket = this.#ticketByTrigger(triggerRef)
-      if (ticket || existing.kind !== 'feishu') {
+      if (ticket || !['feishu', 'route'].includes(existing.kind)) {
+        const sessionId = ticket ? ticket.targetSession ?? this.registry.get(ticket.owner)?.sessionId : owner.sessionId
         return {
-          ownerId: ticket?.owner ?? ownerId, sessionId: ticket?.targetSession ?? owner.sessionId,
-          ticketId: ticket?.id ?? null, requestId: ticket?.requestId ?? null,
+          ownerId: ticket?.owner ?? ownerId, ...(sessionId && { sessionId }),
+          ...(ticket && { ticketId: ticket.id }), requestId: ticket?.requestId ?? null,
           createdSession: false, rebuilt: false, deduped: true, stage: ticket ? normalizeStage(ticket.stage) : null,
         }
       }
-      if (existing.dropped || !existing.authorization || String(existing.source?.messageId ?? '').startsWith('om_selftest-')) {
-        throw new RouterError('invalid-route-trigger', 'route_to_owner: the Feishu message is not eligible for dispatch')
+      if (existing.dropped || !existing.authorization || existing.policy?.mode === 'interrupt'
+        || String(existing.source?.messageId ?? '').startsWith('om_selftest-')) {
+        throw new RouterError('invalid-route-trigger', 'route_to_owner: this event is not eligible for dispatch')
+      }
+      if (existing.kind === 'route' && existing.ownerId !== ownerId) {
+        throw new RouterError('route-owner-mismatch', 'route_to_owner: this event already belongs to another owner')
       }
     }
     const at = this.now()
     const auth = existing?.authorization ?? authorization ?? { actor: 'user', source: 'dsh', at }
-    const trigger = existing ?? this.#insertTrigger({ id: triggerRef ?? 'trg-' + this.ids.uuid(), kind: 'route', ownerId, message, authorization: auth, at })
-    const ensured = await this.#ensureSession(owner)
+    const addressing = auth.addressing ?? 'direct'
+    const instruction = existing?.kind === 'route' ? existing.message : message
+    const trigger = existing ?? {
+      id: triggerRef ?? 'trg-' + this.ids.uuid(), kind: 'route', ownerId, message: instruction, authorization: auth, at,
+      source: { kind: 'route', addressing },
+      policy: { addressing, mode: 'queue', allowed: true, reason: null },
+    }
     const requestId = 'hub-bot-route-' + this.ids.uuid()
     const freshTicketId = 'tsk-' + this.ids.uuid()
-    // #72 执行槽： with every per-owner slot busy the new task queues （排队中） — trigger, ticket and the
-    // HELD injection row are all stored now （先存后做）; the row delivers when a slot frees (#promoteQueued).
-    // The ledger counts working tickets only: handing a task back to a person releases the slot at once
-    // (spec「并发与人的优先」). count→insert→enqueue run synchronously — no interleaving mid-decision.
     const atCapacity = this.#workingCount(ownerId) >= this.#slotsPerOwner()
-    // 先存后做： the ticket waits as 待触发 (idle) — or 排队中 (queued) at capacity — until the stored
-    // injection is actually delivered.
-    this.#insertTicket({
-      id: freshTicketId, triggerId: trigger.id, owner: ownerId, stage: atCapacity ? 'queued' : 'idle', mechanism: 'inject',
-      targetSession: ensured.sessionId, requestId, authorization: auth, createdAt: at, updatedAt: at,
-      ...(existing && { routedMessage: message }),
+    // Write the source, ticket, and confirmation or delivery intent before creating a Session.
+    const awaitingConfirmation = this.#persistWork(() => {
+      if (!existing) this.#insertTrigger(trigger)
+      this.#insertTicket({
+        id: freshTicketId, triggerId: trigger.id, owner: ownerId, stage: atCapacity ? 'queued' : 'idle', mechanism: 'inject',
+        targetSession: owner.sessionId, requestId, authorization: auth, createdAt: at, updatedAt: at,
+        ...(existing?.kind === 'feishu' && { routedMessage: instruction }),
+      })
+      if (this.#holdDangerous(freshTicketId, instruction, 'route')) return true
+      const text = '[hub-bot 路由 ' + freshTicketId + '] ' + instruction + '\n\n授权：' + auth.actor + ' 经 ' + auth.source + ' 于 ' + auth.at + '；任务 ' + freshTicketId
+      this.runner.enqueue({
+        ticketId: freshTicketId, triggerId: trigger.id, kind: 'inject',
+        to: owner.sessionId ? 'session:' + owner.sessionId : 'owner:' + ownerId,
+        sessionId: owner.sessionId, body: text, requestId, held: atCapacity,
+      })
+      return false
     })
-    // 危险命令黑名单 (spec「Policy」安全兜底): 命中即挂起 — 票转 person/confirm, 原文落票面 action,
-    // 不 enqueue 任何注入; 用户确认后由 #confirmDangerousInject 放行。GitHub/飞书/L1/devApi 皆汇于此, 同护。
-    if (this.#holdDangerous(freshTicketId, message, 'route')) {
-      const heldTicket = this.tasks.getTicket(freshTicketId)
-      return { ownerId, sessionId: ensured.sessionId, ticketId: freshTicketId, requestId, createdSession: ensured.created, rebuilt: false, deduped: false, stage: heldTicket.stage }
-    }
-    const text = '[hub-bot 路由 ' + freshTicketId + '] ' + message + '\n\n授权：' + auth.actor + ' 经 ' + auth.source + ' 于 ' + auth.at + '；任务 ' + freshTicketId
-    this.runner.enqueue({ ticketId: freshTicketId, kind: 'inject', to: 'session:' + ensured.sessionId, sessionId: ensured.sessionId, body: text, requestId, held: atCapacity })
-    await this.runner.tick()
+    if (!awaitingConfirmation) await this.runner.tick()
     const stored = this.tasks.getTicket(freshTicketId)
-    return { ownerId, sessionId: stored.targetSession, ticketId: freshTicketId, requestId, createdSession: ensured.created, rebuilt: stored.lastDelivery?.rebuilt ?? false, deduped: false, stage: stored.stage }
+    const sessionId = stored.targetSession ?? this.registry.get(ownerId)?.sessionId ?? null
+    return {
+      ownerId, ...(sessionId !== null && { sessionId }), ticketId: freshTicketId, requestId, createdSession: !owner.sessionId && sessionId !== null,
+      rebuilt: stored.lastDelivery?.rebuilt ?? false, deduped: false, stage: stored.stage,
+    }
   }
 
   #serialized(key, fn) {
@@ -588,6 +704,7 @@ export class Router {
    * 投递故障，不需要重试或系统告警），行由 runner 记成终态，票面与审计历史原样保留。
    */
   async #deliverRow(row) {
+    if (row.kind === 'inbox' || row.kind === 'stop') return this.#deliverIntake(row)
     if (row.kind === 'digest') return this.#deliverDigest(row)
     if (row.kind === 'reply') return this.#deliverReply(row)
     if (row.kind !== 'inject') return
@@ -648,7 +765,7 @@ export class Router {
     const current = this.registry.get(ownerId)
     if (!current) throw new RouterError('unknown-owner', 'owner ' + ownerId + ' is no longer registered')
     if (current.sessionId === sessionId) this.registry.markSessionMissing(ownerId)
-    const replacement = await this.#ensureSession(this.registry.get(ownerId))
+    const replacement = await (ownerId === 'chief' ? this.#ensureChiefSession() : this.#ensureSession(this.registry.get(ownerId)))
     if (ticketClosed()) return null
     try {
       await this.sessions.prompt({ sessionId: replacement.sessionId, requestId, text })

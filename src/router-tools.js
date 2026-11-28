@@ -101,9 +101,13 @@ export function apply(ctx) {
             ? '已去重：任务 ' + value.ticketId
             : value.resumed
               ? '已恢复任务 ' + value.ticketId + ' 并注入追问（会话 ' + value.sessionId + (value.rebuilt ? '，已重建' : '') + '）'
-              : value.stage === 'idle'
-                ? '已存任务 ' + value.ticketId + '（待触发：注入暂未送达，自动重试中，勿重复调用）'
-                : '已路由到 ' + value.ownerId + '（会话 ' + value.sessionId + (value.createdSession ? '，新建' : '') + (value.rebuilt ? '，已重建' : '') + '；任务 ' + value.ticketId + '）' }],
+                : value.stage === 'person/confirm'
+                  ? '已存任务 ' + value.ticketId + '（等您确认）'
+                  : value.stage === 'queued'
+                    ? '已存任务 ' + value.ticketId + '（等待执行槽）'
+                    : value.stage === 'idle'
+                      ? '已存任务 ' + value.ticketId + '（待触发：注入暂未送达，自动重试中，勿重复调用）'
+                      : '已路由到 ' + value.ownerId + '（会话 ' + value.sessionId + (value.createdSession ? '，新建' : '') + (value.rebuilt ? '，已重建' : '') + '；任务 ' + value.ticketId + '）' }],
     },
     execute: async args => await api.router.routeToOwner({ ownerId: args.ownerId, message: args.message, triggerRef: args.triggerRef, ticketId: args.ticketId, resolution: args.resolution }),
   })
