@@ -262,7 +262,8 @@ export function apply(ctx, rawConfig) {
       async status({ sessionId }) {
         try {
           const state = await sessionController.state({ sessionId }, deadline(5000))
-          return state.running || state.queue?.length || state.pendingInput?.length ? 'busy' : 'idle'
+          const queued = state.queue?.some(entry => entry.placement === 'queued' || entry.placement === 'steering')
+          return state.running || queued || state.pendingInput?.length ? 'busy' : 'idle'
         } catch (error) {
           if (error?.code === 'session/not-found' || error?.name === 'ApiSessionNotFound') return 'missing'
           throw error
@@ -282,6 +283,7 @@ export function apply(ctx, rawConfig) {
       },
       prompt: sessions.prompt,
       cancel: sessions.cancel,
+      isArchived: sessions.isArchived,
       async archive({ sessionId }) {
         const controller = safeGetService(ctx, 'workspaceController')
         if (!controller?.archiveSession) throw new Error('此 DSH 实例暂时无法归档会话。')
@@ -289,7 +291,7 @@ export function apply(ctx, rawConfig) {
         if (!result?.archivedSessionIds?.includes(sessionId)) throw new Error('宿主未确认旧会话已归档。')
       },
     },
-    onChange: operation => hub.router.publishOwnerSwitchProgress(operation),
+    recordChange: operation => hub.router.publishOwnerSwitchProgress(operation),
   })
   hub.router.ownerSwitch = ownerSwitch
   const ownerSwitchAction = request => {

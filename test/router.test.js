@@ -45,6 +45,37 @@ function fixture({ failSessions = [], config } = {}) {
   return { router, registry, store, calls, advance, cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }) } }
 }
 
+test('an explicit chief switch fences same-chat messages around the durable control', async () => {
+  const { router, registry, calls, advance, cleanup } = fixture()
+  try {
+    registry.bindSession('chief', 'fixture-chief-old')
+    let phase
+    router.ownerSwitch = { phaseFor: () => phase, request(input) {
+      phase = 'waiting'
+      return { ...input, status: phase, oldSessionId: input.expectedSessionId, operationId: 'switch-fixture' }
+    } }
+    const receive = (messageId, message) => router.acceptFeishuTrigger({
+      id: 'feishu-' + messageId, kind: 'feishu', message, at: router.now(),
+      source: { kind: 'feishu', chatId: 'oc-fixture', openId: 'fixture-human', addressing: 'direct', messageId },
+      authorization: { source: 'feishu', actor: 'fixture-human', addressing: 'direct', messageId, at: router.now() },
+    })
+    await receive('before-switch', 'fixture-A-before-switch')
+    await receive('owner-switch', '/hub-switch wait chief')
+    await receive('after-switch', 'fixture-B-after-switch')
+    await router.tick()
+    assert.equal(phase, 'waiting')
+    assert.equal(calls.prompt.some(row => row.sessionId === 'fixture-chief-old' && row.text.includes('fixture-B-after-switch')), false)
+    registry.bindSession('chief', 'fixture-chief-new')
+    phase = undefined
+    advance(1000)
+    await router.tick()
+    const after = calls.prompt.filter(row => row.text.includes('fixture-B-after-switch'))
+    assert.equal(after.length, 1)
+    assert.equal(after[0].sessionId, 'fixture-chief-new')
+    assert.equal(after[0].text.includes('fixture-A-before-switch'), false)
+  } finally { cleanup() }
+})
+
 test('ordinary owner messages wait through a handoff and resume at the new current binding', async () => {
   const { router, registry, calls, advance, cleanup } = fixture()
   try {
@@ -480,6 +511,23 @@ test('redelivery after a crash prepends the recovery note to the STORED body (�
     const autoResume = calls.prompt.find(p => p.text.includes('[hub-bot 恢复 ' + t.ticketId + ']'))
     assert.ok(autoResume, 'working 票的自动恢复注入也到达')
     assert.ok(!autoResume.text.includes(RECOVERY_NOTE), 'note carried exactly once (by the older row)')
+  } finally { cleanup() }
+})
+
+test('an external answer is ready while internal chief reports wait through a switch', async () => {
+  const { router, store, cleanup } = fixture()
+  try {
+    router.ownerSwitch = { phaseFor: () => 'waiting' }
+    const internal = await router.replySource({ to: 'dsh:session:chief', text: 'fixture delayed internal report' })
+    const reply = await router.replySource({ to: 'feishu:chat:oc_fixture_urgent', text: 'fixture urgent answer' })
+    assert.equal(internal.state, 'queued')
+    assert.equal(reply.state, 'recorded')
+    const sent = []
+    await deliverRecordedReplies({
+      store, logger: { warn() {} }, now: router.now, channel: 'feishu', prefix: 'feishu:', maxAttempts: 5,
+      parseTarget: target => target, async send(_target, body) { sent.push(body) },
+    })
+    assert.deepEqual(sent, ['fixture urgent answer'])
   } finally { cleanup() }
 })
 
@@ -1108,6 +1156,9 @@ test('ordinary results share a recipient window and a promised reminder stays im
     await deliver(store)
     assert.equal(sent.length, 1)
     const second = await launch(ownerB, 2)
+    router.tasks.resume(second)
+    await router.reportBackground({ ticketId: second, sessionId: router.getTicket(second).workerSession.sessionId,
+      summary: 'latest fixture result two' })
     const third = await launch(ownerA, 3)
     const reminder = await launch(ownerB, 4, { notifyAtFire: true })
     const elsewhere = await launch(ownerA, 5, { chatId: 'oc_other_fixture' })
@@ -1129,6 +1180,9 @@ test('ordinary results share a recipient window and a promised reminder stays im
     const [batch] = throttle.flush()
     assert.deepEqual(throttle.flush(), [])
     assert.deepEqual(throttle.details(batch.id).tickets.map(ticket => ticket.ticketId), [second, third])
+    assert.match(batch.body, /latest fixture result two/)
+    assert.doesNotMatch(batch.body, /(?<!latest )fixture result 2/)
+    assert.equal(next.runs.get('run-' + second).results.length, 2)
     await deliver(reopened)
     assert.equal(sent.length, 4)
     assert.equal(next.runs.get('run-' + second).notification.id, batch.id)

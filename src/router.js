@@ -263,6 +263,10 @@ export class Router {
           body: [question, ...details, commands].join('\n'),
         }, () => Date.parse(this.now()))
         if (this.#ensureRun(ticket)) this.runs.linkOutbox(ticket.id, notification.id)
+      } else if (source.kind === 'github' && this.#ensureRun(ticket)) {
+        const label = action ? '需要确认' : '等待回复'
+        this.#queueBackgroundNotification(ticket, this.getTrigger(ticket.triggerId),
+          '后台任务 ' + ticketId + ' ' + label + '。请在 Hub Bot 面板查看请求 ' + request.requestId + '。')
       }
       return this.tasks.getTicket(ticketId)
     })
@@ -462,6 +466,7 @@ export class Router {
       policy: previous?.policy ?? { ...incoming.policy, mode: incoming.dropped ? 'drop' : stop ? 'interrupt' : command ? 'decision' : ownerCommand ? 'owner-switch' : 'queue' },
       ...(command && { decision: { requestId: command[1], decision: command[2], text: command[3] ?? '' } }),
       ...(ownerCommand && { ownerCommand }),
+      ...(!previous && !incoming.dropped && !stop && !command && !ownerCommand && { ownerSwitchRef: this.store.get('chief-inbox-switch-ref') ?? null }),
     }
     this.#persistWork(() => {
       if (previous) this.#updateTrigger(trigger)
@@ -476,9 +481,16 @@ export class Router {
           id: outboxId, ticketId: null, triggerId: id, kind: 'stop', to: 'owner:chief',
           body: trigger.message, sessionId, requestId, state: 'recorded', recordedAt: this.now(), skipReason: skipStop,
         }, () => Date.parse(trigger.at))
+      } else if (ownerCommand) {
+        if (ownerCommand.action === 'request' && ownerCommand.ownerId === 'chief') this.store.set('chief-inbox-switch-ref', id)
+        const control = insertOutbox(this.store, {
+          id: outboxId, ticketId: null, triggerId: id, kind: 'owner-switch-control', to: 'owner:chief',
+          body: trigger.message, requestId, state: 'recorded', recordedAt: this.now(),
+        }, () => Date.parse(trigger.at))
+        this.#deliverOwnerSwitch(control)
       } else if (!trigger.dropped) {
         this.runner.enqueue({
-          id: outboxId, ticketId: null, triggerId: id, kind: stop ? 'stop' : command ? 'deferred-decision' : ownerCommand ? 'owner-switch-control' : 'inbox', to: 'owner:chief',
+          id: outboxId, ticketId: null, triggerId: id, kind: stop ? 'stop' : command ? 'deferred-decision' : 'inbox', to: 'owner:chief',
           body: trigger.message, sessionId, requestId,
         })
       }
@@ -1501,7 +1513,8 @@ export class Router {
     this.runs.recordResult(ticket.id, { kind, reportId: report.id })
     const status = { result: '有结果待验收', failure: '执行失败', blocked: '需要介入' }[kind]
     const ordinary = kind === 'result' && !(trigger.source.kind === 'github' && trigger.source.event === 'comment')
-    this.#queueBackgroundNotification(ticket, trigger, '后台任务 ' + ticket.id + ' ' + status + '。在 Hub Bot 运行记录中可查看详情。', ordinary)
+    const summary = kind === 'result' ? ' ' + ticket.report.summary.replace(/\s+/g, ' ').slice(0, 180).trim() : ''
+    this.#queueBackgroundNotification(ticket, trigger, '后台任务 ' + ticket.id + ' ' + status + '。' + summary + ' 在 Hub Bot 运行记录中可查看详情。', ordinary)
   }
 
   #queuePromisedReminder(ticket, trigger) {
@@ -1727,10 +1740,15 @@ export class Router {
       }
     }
     const { text: body, truncated } = truncateWords(text.trim())
-    const row = this.runner.enqueue({
+    const intent = {
       ticketId: null, kind: 'reply', to: target, body, requestId: 'hub-bot-reply-' + this.ids.uuid(),
       ...(triggerRef !== undefined && { triggerId: triggerRef }),
-    })
+    }
+    if (typeof target === 'string' && /^(feishu|github):/.test(target)) {
+      const row = insertOutbox(this.store, { ...intent, state: 'recorded' }, () => Date.parse(this.now()))
+      return { outboxId: row.id, state: row.state, truncated }
+    }
+    const row = this.runner.enqueue(intent)
     await this.runner.tick({ excludeKind: 'deferred-decision' })
     return { outboxId: row.id, state: this.#outboxRow(row.id).state, truncated }
   }

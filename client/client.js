@@ -1937,7 +1937,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             state.loading ? h('p', { role: 'status' }, t('notificationLoading')) : null,
             state.error ? h('p', { role: 'alert' }, state.error) : null,
             state.detail ? h('ul', null, state.detail.tickets.map(ticket => h('li', { key: ticket.ticketId },
-              h('button', { type: 'button', style: settingsButtonStyle, onClick: () => onTask(ticket.ticketId) }, t('runTask') + ' ' + ticket.ticketId)))) : null);
+              h('button', { type: 'button', style: Object.assign({}, settingsButtonStyle, { maxWidth: '100%', overflowWrap: 'anywhere' }), onClick: () => onTask(ticket.ticketId) }, t('runTask') + ' ' + ticket.ticketId)))) : null);
         }
 
         function RunHistory({ onTask, onWorker, active }) {

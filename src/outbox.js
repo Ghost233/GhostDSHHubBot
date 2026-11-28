@@ -257,7 +257,8 @@ export class OutboxRunner {
     const groups = new Map()
     for (const row of rows) {
       const ownerLane = ['inbox', 'stop', 'deferred-decision', 'owner-switch-control'].includes(row.kind)
-      const key = row.ticketId ?? (ownerLane ? row.kind + ':' + row.to : '')
+      const channelReply = row.kind === 'reply' && typeof row.to === 'string' && /^(feishu|github):/.test(row.to)
+      const key = channelReply ? 'reply:' + row.to : row.ticketId ?? (ownerLane ? row.kind + ':' + row.to : '')
       if (!groups.has(key)) groups.set(key, [])
       groups.get(key).push(row)
     }
@@ -270,7 +271,8 @@ export class OutboxRunner {
     if (!raw) return null
     const trigger = JSON.parse(String(raw.value))
     const chatId = trigger.source?.chatId
-    return trigger.authorization && !trigger.dropped && !trigger.injectedAt && typeof chatId === 'string' && chatId ? chatId : null
+    if (!trigger.authorization || trigger.dropped || trigger.injectedAt || typeof chatId !== 'string' || !chatId) return null
+    return JSON.stringify([chatId, trigger.ownerSwitchRef ?? null])
   }
 
   /**

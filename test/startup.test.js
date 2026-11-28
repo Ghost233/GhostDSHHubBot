@@ -204,6 +204,7 @@ test('Feishu explicit switch and the management panel share a durable owner oper
   assert.equal(hub.router.ownerSwitch.get({ ownerId: owner.id, operationId: current.operationId }).status, 'waiting')
   assert.ok(hub.router.listOutbox().some(row => row.triggerId === 'feishu-om_fixture_switch_denied' && row.body.includes('请从发起更换的飞书账号')))
   activity.running = false
+  activity.queue.push({ id: 'fixture-context', placement: 'context', content: [] })
   await hub.router.ownerSwitch.tick()
   const accepted = hub.registry.get(owner.id).sessionId
   assert.notEqual(accepted, oldSession)

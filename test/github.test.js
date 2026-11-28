@@ -146,6 +146,30 @@ test('background GitHub checks leave silent, accepted and failed notification ev
   } finally { reopened?.store.close(); f.cleanup() }
 })
 
+test('a GitHub worker question creates an immediate audited notice at its original item', async () => {
+  const f = fixture()
+  try {
+    f.router.installDeferred(new DeferredRegistry({ store: f.store, tasks: f.router.tasks, now: f.source.now, owners: f.registry }))
+    const work = await f.source.handleIssueEvent(issue(), REPO_CFG)
+    await f.source.deliverReplies()
+    const sessionId = f.router.getTicket(work.ticketId).workerSession.sessionId
+    assert.equal(f.router.askWorker({ ticketId: work.ticketId, sessionId, question: 'A fixture question' }).stage, 'person/answer')
+    const questionId = f.router.getTicket(work.ticketId).deferred.requestId
+    const record = f.router.runs.get('run-' + work.ticketId)
+    assert.equal(record.status, 'waiting')
+    assert.ok(record.notification.id)
+    const row = f.outbox().find(item => item.id === record.notification.id)
+    assert.equal(row.to, 'github:' + REPO + ':42')
+    assert.equal(row.state, 'recorded')
+    assert.match(row.body, new RegExp(questionId))
+    assert.equal(row.notificationWindowMs, undefined)
+    await f.source.deliverReplies()
+    await f.source.deliverReplies()
+    assert.equal(f.posts.length, 2)
+    assert.equal(f.router.runs.get('run-' + work.ticketId).status, 'sent')
+  } finally { f.cleanup() }
+})
+
 test('an explicit GitHub comment receives a reply and progress keeps its ticket active', async () => {
   const f = fixture()
   try {

@@ -158,7 +158,7 @@ async function resolveTicket(ticket, resolution, message) {
   for (const button of buttons) button.disabled = true
   try {
     const result = await api('tickets/resolve', { method: 'POST',
-      body: { ticketId: ticket.id, resolution, message, requestId: ticket.deferred?.requestId } })
+      body: { ticketId: ticket.id, resolution, message, ...(['confirm', 'reject', 'answer'].includes(resolution) && { requestId: ticket.deferred?.requestId }) } })
     const labels = { confirm: '已确认', reject: '已拒绝', answer: '答复已保存' }
     showNotice(result.stage === 'person/confirm' ? '请求仍在等待确认。' : labels[resolution])
     await refresh()
@@ -176,6 +176,9 @@ function ticketActions(ticket) {
       const message = window.prompt(ticket.question?.text ?? '回复')?.trim()
       if (message) void resolveTicket(ticket, 'answer', message)
     } }, text('回复')))
+  }
+  if (['blocked', 'failed'].includes(ticket.stage)) {
+    return el('button', { class: 'btn', type: 'button', onclick: () => void resolveTicket(ticket, 'retry') }, text('重试任务'))
   }
   if (ticket.stage !== 'person/confirm') return null
   const wrap = el('span', { class: 'row-actions' })
@@ -245,7 +248,7 @@ function ticketRow(t) {
   }
   const actions = ticketActions(t)
   if (actions) row.append(actions)
-  const session = t.stage === 'person/review' ? ownerSessionLink(t.owner, t.ownerSessionId) : null
+  const session = ['person/review', 'blocked', 'failed'].includes(t.stage) ? ownerSessionLink(t.owner, t.ownerSessionId) : null
   if (session) row.append(session)
   row.append(lazyTicketDetails(t))
   return row
@@ -891,7 +894,7 @@ $('#notification-form').addEventListener('submit', async event => {
   try {
     const detail = await api('notifications/detail?id=' + encodeURIComponent(id))
     const entries = detail.tickets.map(ticket => el('li', {},
-      el('a', { href: '#ticket-' + encodeURIComponent(ticket.ticketId) }, text('查看工单 ' + ticket.ticketId))))
+      el('a', { href: '#ticket-' + encodeURIComponent(ticket.ticketId), style: 'display:block;overflow-wrap:anywhere' }, text('查看工单 ' + ticket.ticketId))))
     result.replaceChildren(el('ul', {}, ...entries))
   } catch (error) {
     result.replaceChildren(el('p', { role: 'alert' }, text(error.message)))

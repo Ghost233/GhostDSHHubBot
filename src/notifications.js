@@ -39,11 +39,10 @@ function fits(text) {
 
 function formatBody(id, tickets) {
   const lines = tickets.map(({ ticketId, latest }) => latest.body.includes(ticketId) ? latest.body : ticketId + ' · ' + latest.body)
-  // Preserve the immediate single-result format. Flushed batches carry an exact lookup ID.
-  if (tickets[0].latest.id === id && fits(lines[0])) return lines[0]
   const heading = '后台任务结果（' + tickets.length + ' 项）'
   const reference = '在 Hub Bot 运行记录中按通知编号 ' + id + ' 查看完整任务索引与详情。'
-  const summary = [heading, ...lines.map(line => '- ' + line), reference].join('\n')
+  const resultLines = tickets[0].latest.id === id ? lines : [heading, ...lines.map(line => '- ' + line)]
+  const summary = [...resultLines, reference].join('\n')
   if (fits(summary)) return summary
 
   // Keep whole IDs in the compact preview. The durable index carries every task, including any overflow.

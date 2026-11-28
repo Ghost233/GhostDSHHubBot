@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { wordCount } from '../src/discipline.js'
 import { NotificationThrottle } from '../src/notifications.js'
 import { deliverRecordedReplies, discardOutboxRows, insertOutbox, retryOutboxRows } from '../src/outbox.js'
 import { RunAudit } from '../src/runs.js'
@@ -55,20 +56,49 @@ function fixture(t, options = {}) {
   }
 }
 
-test('the first ordinary result is ready for the channel immediately and audited on acceptance', async t => {
+test('the first ordinary result is sent immediately with its exact notification lookup ID', async t => {
   const f = fixture(t)
-  const row = f.result('tsk-first', { body: '后台任务 tsk-first 有结果待验收。' })
+  const summary = '后台任务 tsk-first 有结果待验收。'
+  const row = f.result('tsk-first', { body: summary })
   assert.equal(row.state, 'recorded')
   assert.equal(f.run('tsk-first').status, 'waiting')
   assert.equal(f.run('tsk-first').notification.channelAccepted, false)
   await f.deliver()
-  assert.deepEqual(f.sent, [{
-    to: 'feishu:chat:oc_a', body: '后台任务 tsk-first 有结果待验收。', id: row.id, requestId: row.requestId,
-  }])
+  assert.equal(f.sent.length, 1)
+  const [{ to, body, id, requestId }] = f.sent
+  assert.deepEqual({ to, id, requestId }, { to: 'feishu:chat:oc_a', id: row.id, requestId: row.requestId })
+  const emittedId = /通知编号 (out-[a-f0-9-]+) 查看完整任务索引与详情。$/u.exec(body)?.[1]
+  assert.equal(emittedId, id)
+  assert.ok(body.startsWith(summary + '\n'))
+  assert.ok(Buffer.byteLength(body) <= 4_096)
+  assert.ok(wordCount(body) <= 100)
+
+  f.reopen()
+  assert.deepEqual(f.notifications.details(emittedId), {
+    id: emittedId, tickets: [{ ticketId: 'tsk-first', runId: 'run-tsk-first', sourceOutboxIds: [id] }],
+  })
   const { status, notification } = f.run('tsk-first')
   assert.equal(status, 'sent')
+  assert.equal(notification.id, emittedId)
   assert.equal(notification.channelAccepted, true)
   assert.equal(notification.acceptedAt, '2026-11-28T12:00:00.000Z')
+})
+
+test('an initial result near either reply limit keeps its task and lookup ID', async t => {
+  const f = fixture(t)
+  const results = [
+    f.result('tsk-words', { body: 'tsk-words ' + '字'.repeat(98) }),
+    f.result('tsk-bytes', { to: 'feishu:chat:oc_b', body: 'tsk-bytes ' + '📄'.repeat(1_020) }),
+  ]
+  await f.deliver()
+  assert.equal(f.sent.length, results.length)
+  for (const [i, { body }] of f.sent.entries()) {
+    const { id, ticketId } = results[i]
+    assert.ok(body.includes(ticketId))
+    assert.ok(body.includes(id))
+    assert.ok(Buffer.byteLength(body) <= 4_096)
+    assert.ok(wordCount(body) <= 100)
+  }
 })
 
 test('aliases and owner changes share a fixed window while every source remains in the audit', async t => {

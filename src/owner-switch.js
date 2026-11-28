@@ -25,6 +25,8 @@ export class OwnerSwitchError extends Error {
   }
 }
 
+class ProgressWriteError extends Error {}
+
 function receipt(row) {
   const { revision, initializationText, ...value } = row
   return value
@@ -38,27 +40,29 @@ function identifier(value) {
 export class OwnerSwitch {
   #inFlight = new Set()
 
-  constructor({ store, registry, sessions, buildFacts, now, ids, onChange, withAdmission }) {
+  /** recordChange writes progress synchronously to this Store within the switch transaction. */
+  constructor({ store, registry, sessions, buildFacts, now, ids, recordChange, withAdmission }) {
     this.store = store
     this.registry = registry
     this.sessions = sessions
     this.buildFacts = buildFacts
     this.now = now ?? (() => new Date().toISOString())
     this.ids = ids ?? { uuid: randomUUID }
-    this.onChange = onChange
+    this.recordChange = recordChange
     this.withAdmission = withAdmission ?? ((_ownerId, work) => work())
   }
 
   #transaction(work) {
     const db = this.store.db
-    if (db.isTransaction) return work()
-    db.exec('BEGIN IMMEDIATE')
+    // Feishu can call us within an intake transaction. Roll back local writes if it handles an error.
+    const nested = db.isTransaction
+    db.exec(nested ? 'SAVEPOINT owner_switch' : 'BEGIN IMMEDIATE')
     try {
       const result = work()
-      db.exec('COMMIT')
+      db.exec(nested ? 'RELEASE owner_switch' : 'COMMIT')
       return result
     } catch (error) {
-      if (db.isTransaction) db.exec('ROLLBACK')
+      if (db.isTransaction) db.exec(nested ? 'ROLLBACK TO owner_switch; RELEASE owner_switch' : 'ROLLBACK')
       throw error
     }
   }
@@ -79,8 +83,12 @@ export class OwnerSwitch {
     `).all(OPERATIONS, OPERATIONS_END, ownerId ?? null, ownerId ?? null).map(({ value }) => JSON.parse(value))
   }
 
-  #publish(row) {
-    if (this.onChange) void Promise.resolve(receipt(row)).then(value => this.onChange(value)).catch(() => {})
+  #recordProgress(row) {
+    try {
+      this.recordChange?.(receipt(row))
+    } catch (error) {
+      throw new ProgressWriteError('Unable to record owner switch progress.', { cause: error })
+    }
   }
 
   #same(row) {
@@ -89,7 +97,7 @@ export class OwnerSwitch {
 
   #transition(row, changes, bind) {
     if (this.store.closed) return undefined
-    const next = this.#transaction(() => {
+    return this.#transaction(() => {
       if (!this.#same(row)) return undefined
       const value = { ...row, ...changes, revision: row.revision + 1, updatedAt: this.now() }
       bind?.()
@@ -97,10 +105,9 @@ export class OwnerSwitch {
       if (HELD.has(row.status) && !HELD.has(value.status)) {
         this.store.db.prepare('DELETE FROM kv WHERE key = ?').run(HOLD + row.ownerId)
       }
+      if (value.status !== row.status) this.#recordProgress(value)
       return value
     })
-    if (next && next.status !== row.status) this.#publish(next)
-    return next
   }
 
   #requireOldBinding({ ownerId, oldSessionId }) {
@@ -125,21 +132,21 @@ export class OwnerSwitch {
     }
     const matches = row => row.ownerId === ownerId && row.oldSessionId === expectedSessionId && row.mode === mode
     const requestKey = requestId === undefined ? null : REQUESTS + requestId
-    const { row, created } = this.#transaction(() => {
+    const row = this.#transaction(() => {
       const existingId = requestKey && this.store.get(requestKey)
       if (existingId) {
         const existing = this.#read(existingId)
         if (!matches(existing)) {
           throw new OwnerSwitchError('owner-switch-request-conflict', 'This request ID belongs to a different switch.')
         }
-        return { row: existing, created: false }
+        return existing
       }
       this.#requireOldBinding({ ownerId, oldSessionId: expectedSessionId })
       const held = this.#hold(ownerId)
       if (held) {
         if (!matches(held)) throw new OwnerSwitchError('owner-switch-in-progress', 'This owner already has a pending switch.')
         if (requestKey) this.store.set(requestKey, held.operationId)
-        return { row: held, created: false }
+        return held
       }
 
       const nonce = this.ids.uuid()
@@ -158,9 +165,9 @@ export class OwnerSwitch {
       this.store.set(OPERATIONS + operationId, value)
       this.store.set(HOLD + ownerId, operationId)
       if (requestKey) this.store.set(requestKey, operationId)
-      return { row: value, created: true }
+      this.#recordProgress(value)
+      return value
     })
-    if (created) this.#publish(row)
     return receipt(row)
   }
 
@@ -297,12 +304,19 @@ export class OwnerSwitch {
       phase = 'commit'
       await this.withAdmission(row.ownerId, async () => {
         if (!this.#same(row)) return
+        this.#requireOldBinding(row)
+        this.#requireFreshSession(row.newSessionId)
         const replacementStatus = await this.sessions.status({ sessionId: row.newSessionId })
         if (!this.#same(row)) return
         if (replacementStatus !== 'idle' && replacementStatus !== 'busy') {
           throw new OwnerSwitchError('new-session-unavailable', 'The initialized owner session is unavailable.')
         }
-        if (await this.#oldStatus(row) !== 'idle') return
+        const oldIsIdle = replacementStatus === 'idle' && await this.#oldStatus(row) === 'idle'
+        if (!this.#same(row)) return
+        if (this.sessions.isArchived?.(row.newSessionId)) {
+          throw new OwnerSwitchError('new-session-archived', 'The initialized owner session is archived.')
+        }
+        if (!oldIsIdle) return
         this.#transition(row, { status: 'committed', committedAt: this.now() }, () => {
           this.#requireOldBinding(row)
           this.#requireFreshSession(row.newSessionId)
@@ -310,6 +324,7 @@ export class OwnerSwitch {
         })
       })
     } catch (error) {
+      if (error instanceof ProgressWriteError) throw error
       this.#fail(row, 'failed', 'owner-switch-preparation-failed', PREPARATION_FAILURE[phase], error)
     }
   }
@@ -329,10 +344,11 @@ export class OwnerSwitch {
         throw new OwnerSwitchError('owner-switch-archive-target-current', 'The original session is currently bound and cannot be archived.')
       }
       await this.sessions.archive({ sessionId: row.oldSessionId })
-      this.#transition(row, { status: 'completed', archivedAt: this.now() })
     } catch (error) {
       this.#fail(row, 'archive-failed', 'owner-switch-archive-failed', '无法归档原负责人会话。', error)
+      return
     }
+    this.#transition(row, { status: 'completed', archivedAt: this.now() })
   }
 
   /** Deliver persisted work once per operation per tick. A committed binding releases delivery before archival. */

@@ -9,6 +9,7 @@ import { buildOwnerFacts, formatOwnerFacts } from '../src/owner-facts.js'
 import { OwnerSwitch } from '../src/owner-switch.js'
 import { Router } from '../src/router.js'
 import { TimerService } from '../src/timers.js'
+import { insertOutbox } from '../src/outbox.js'
 
 const NOW = '2026-11-28T12:00:00.000Z'
 const OLD_SESSION = 'session-owner-old'
@@ -19,7 +20,7 @@ function latch() {
   return { promise, open }
 }
 
-function fixture(t, buildFactsOverride) {
+function fixture(t, buildFactsOverride, recordProgress) {
   const dir = mkdtempSync(join(tmpdir(), 'hub-bot-owner-switch-'))
   const now = () => NOW
   let sequence = 0
@@ -30,6 +31,7 @@ function fixture(t, buildFactsOverride) {
   const switchSvc = {}
   const ports = {
     status: async ({ sessionId }) => hosts.get(sessionId)?.state ?? 'missing',
+    isArchived: sessionId => hosts.get(sessionId)?.archived === true,
     create: async ({ owner, sessionId }) => {
       const agentPreset = owner.role === 'chief' ? 'hub-bot-router' : 'hub-bot-owner'
       if (!hosts.has(sessionId)) {
@@ -65,7 +67,10 @@ function fixture(t, buildFactsOverride) {
     const registry = new OwnerRegistry(store, { scratchRoot: join(dir, 'scratch'), now })
     const book = new OwnerSwitch({ store, registry, sessions: ports, now, ids, withAdmission,
       buildFacts: buildFactsOverride ?? (({ ownerId }) => formatOwnerFacts(buildOwnerFacts({ store, ownerId }))),
-      onChange: row => changes.push(row.status),
+      recordChange: row => {
+        recordProgress?.(store, row)
+        changes.push(row.status)
+      },
     })
     Object.assign(switchSvc, { store, registry, book })
   }
@@ -459,4 +464,148 @@ test('a pre-existing execution session cannot be claimed as the replacement', as
   assert.equal(hosts.get(operation.newSessionId).agentPreset, 'fixture-worker')
   assert.equal(switchSvc.registry.get(ownerId).sessionId, OLD_SESSION)
   assert.deepEqual(effects, [])
+})
+
+function recordSwitchProgress(store, operation) {
+  const id = 'out-' + operation.operationId + '-' + operation.status
+  insertOutbox(store, { id, requestId: id, kind: 'reply', state: 'recorded', to: 'feishu:chat:fixture',
+    body: operation.status,
+  }, () => Date.parse(NOW))
+}
+
+function rejectProgressInsert(store, phase) {
+  store.db.exec(`
+    CREATE TEMP TRIGGER reject_switch_progress BEFORE INSERT ON outbox
+    WHEN json_extract(NEW.value, '$.body') = '${phase}'
+    BEGIN SELECT RAISE(ABORT, 'fixture outbox insertion failed'); END;
+  `)
+}
+
+test('request and progress rows roll back together if the outbox insert fails', t => {
+  const { switchSvc: { book, registry, store }, ownerId } = fixture(t, undefined, recordSwitchProgress)
+  const request = { ownerId, expectedSessionId: OLD_SESSION, requestId: 'feishu-record-request' }
+  rejectProgressInsert(store, 'waiting')
+  // Feishu invokes the switch from its own transaction. The caller can keep its unrelated writes.
+  store.db.exec('BEGIN IMMEDIATE')
+  try {
+    store.set('fixture-intake-received', true)
+    assert.throws(() => book.request(request), /record owner switch progress/i)
+    assert.equal(book.isHeld(ownerId), false)
+    assert.deepEqual(book.list({ ownerId }), [])
+    store.db.exec('COMMIT')
+  } finally {
+    if (store.db.isTransaction) store.db.exec('ROLLBACK')
+  }
+  assert.equal(registry.get(ownerId).sessionId, OLD_SESSION)
+  assert.equal(store.get('fixture-intake-received'), true)
+  store.db.exec('DROP TRIGGER reject_switch_progress')
+  const operation = book.request(request)
+  assert.deepEqual(book.request(request), operation)
+  assert.equal(operation.status, 'waiting')
+  const router = new Router({ store, registry })
+  assert.deepEqual(router.listOutbox().map(row => row.body), ['waiting'])
+})
+
+test('progress insert failure preserves the prepared or committed phase for restart', async t => {
+  const { switchSvc, ownerId, hosts, ports, effects, reopen } = fixture(t, undefined, recordSwitchProgress)
+  const progress = () => new Router({ store: switchSvc.store, registry: switchSvc.registry, sessions: ports })
+    .listOutbox().map(row => row.body)
+  hosts.get(OLD_SESSION).state = 'idle'
+  const operation = switchSvc.book.request({ ownerId, expectedSessionId: OLD_SESSION, requestId: 'feishu-record-progress' })
+  const address = { ownerId, operationId: operation.operationId }
+  rejectProgressInsert(switchSvc.store, 'committed')
+  await assert.rejects(switchSvc.book.tick(), /record owner switch progress/i)
+  assert.equal(switchSvc.book.get(address).status, 'preparing')
+  assert.equal(switchSvc.book.isHeld(ownerId), true)
+  assert.equal(switchSvc.registry.get(ownerId).sessionId, OLD_SESSION)
+  assert.deepEqual(progress(), ['waiting', 'preparing'])
+
+  reopen()
+  await switchSvc.book.tick()
+  assert.equal(switchSvc.book.get(address).status, 'committed')
+  assert.equal(switchSvc.registry.get(ownerId).sessionId, operation.newSessionId)
+  rejectProgressInsert(switchSvc.store, 'completed')
+  await assert.rejects(switchSvc.book.tick(), /record owner switch progress/i)
+  assert.equal(switchSvc.book.get(address).status, 'committed')
+  assert.equal(switchSvc.registry.get(ownerId).sessionId, operation.newSessionId)
+  assert.equal(hosts.get(OLD_SESSION).archived, true)
+  assert.deepEqual(progress(), ['waiting', 'preparing', 'committed'])
+
+  reopen()
+  await switchSvc.book.tick()
+  assert.equal(switchSvc.book.get(address).status, 'completed')
+  assert.deepEqual(progress(), ['waiting', 'preparing', 'committed', 'completed'])
+  assert.deepEqual(effects.map(([effect]) => effect), ['create', 'prompt', 'archive'])
+})
+
+test('a replacement archived during the final idle check never becomes current', async t => {
+  const { switchSvc: { book, registry }, ownerId, ports, hosts, effects } = fixture(t)
+  hosts.get(OLD_SESSION).state = 'idle'
+  const operation = book.request({ ownerId, expectedSessionId: OLD_SESSION })
+  const readingOld = latch()
+  const allowOldRead = latch()
+  const status = ports.status
+  ports.status = async request => {
+    const result = await status(request)
+    if (request.sessionId === OLD_SESSION && hosts.get(operation.newSessionId)?.prompts?.size) {
+      readingOld.open()
+      await allowOldRead.promise
+    }
+    return result
+  }
+  const switched = book.tick()
+  await readingOld.promise
+  hosts.get(operation.newSessionId).archived = true
+  allowOldRead.open()
+  await switched
+
+  const result = book.get({ ownerId, operationId: operation.operationId })
+  assert.equal(result.status, 'failed')
+  assert.equal(result.errorCode, 'new-session-archived')
+  assert.equal(registry.get(ownerId).sessionId, OLD_SESSION)
+  assert.equal(book.isHeld(ownerId), false)
+  await book.tick()
+  assert.deepEqual(effects.map(([effect]) => effect), ['create', 'prompt'])
+})
+
+test('accepted facts keep ordinary work held until the replacement finishes initializing', async t => {
+  const { switchSvc, ownerId, hosts, ports, effects, reopen } = fixture(t)
+  let router
+  reopen((id, work) => router.withOwnerAdmission(id, work))
+  const { book, store, registry } = switchSvc
+  let now = Date.parse(NOW)
+  router = new Router({ store, registry, now: () => new Date(now).toISOString(), sessions: { prompt: ports.prompt } })
+  router.ownerSwitch = book
+  hosts.get(OLD_SESSION).state = 'idle'
+  const operation = book.request({ ownerId, expectedSessionId: OLD_SESSION })
+  const address = { ownerId, operationId: operation.operationId }
+  const admit = ports.prompt
+  ports.prompt = async request => {
+    const result = await admit(request)
+    hosts.get(request.sessionId).state = 'busy'
+    return result
+  }
+  const queued = await router.routeToOwner({ ownerId, message: 'Work after initialization' })
+  await book.tick()
+  assert.equal(book.get(address).status, 'preparing')
+  assert.equal(book.isHeld(ownerId), true)
+  assert.equal(registry.get(ownerId).sessionId, OLD_SESSION)
+  assert.ok(hosts.get(operation.newSessionId).prompts.has(operation.initializationRequestId))
+  now += 1000
+  await router.tick()
+  await book.tick()
+  assert.equal(book.get(address).status, 'preparing')
+  assert.deepEqual(effects.map(([effect]) => effect), ['create', 'prompt'])
+
+  hosts.get(operation.newSessionId).state = 'idle'
+  await book.tick()
+  assert.equal(book.get(address).status, 'committed')
+  assert.equal(book.isHeld(ownerId), false)
+  assert.equal(registry.get(ownerId).sessionId, operation.newSessionId)
+  now += 1000
+  await router.tick()
+  assert.ok(hosts.get(operation.newSessionId).prompts.get(queued.requestId).includes('Work after initialization'))
+  await book.tick()
+  assert.equal(book.get(address).status, 'completed')
+  assert.deepEqual(effects.at(-1), ['archive', OLD_SESSION])
 })
