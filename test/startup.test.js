@@ -189,6 +189,69 @@ test('only a complete own-session history can rule out an in-flight prompt recei
   assert.equal(reads.length, 5)
 })
 
+test('GitHub stop removes only its queued IDs or stops its still-current turn', async t => {
+  const homeRepo = await mkdtemp(join(tmpdir(), 'hub-bot-exact-stop-host-'))
+  const Context = contexts.at(-1)[1]
+  const root = new Context()
+  const sessionId = 'exact-background-worker'
+  const managed = 'hub-bot-fixture-request'
+  const removals = [], cancelled = []
+  const queue = [{ id: 'original-queue-item', rpcId: managed }, { id: 'unrelated-queue-item', rpcId: 'unrelated' }]
+  let events = []
+  let running = false, stale = false
+  let reads = 0
+  root.provide('sessionController', {
+    async state(address) {
+      assert.deepEqual(address, { sessionId })
+      const cursor = (events.at(-1)?.seq ?? -1) + (stale && reads++ % 3 === 2 ? 1 : 0)
+      return { running, queue: [...queue], cursor }
+    },
+    async updateQueue(request) {
+      removals.push(request)
+      queue.splice(queue.findIndex(item => item.id === request.itemId), 1)
+      return { accepted: true }
+    },
+    async cancel(request) { cancelled.push(request); return { accepted: true } },
+  })
+  root.provide('sessionPersistence', {
+    async flush() {},
+    async open(id, access) {
+      assert.equal(access, 'read')
+      return { id, inheritedEventCount: 0, async close() {}, async read(offset, count) { return { events: events.slice(offset, offset + count) } } }
+    },
+  })
+  root.provide('webServer', { host: '127.0.0.1', port: 3199 })
+  const mounted = root.plugin(plugin, { homeRepo, stateDir: join(homeRepo, 'state'), workspaces: { enabled: false } })
+  t.after(async () => { await mounted.dispose(); await rm(homeRepo, { recursive: true, force: true }) })
+  await mounted
+  const { sessions } = root.reflect.get('hubBot', false)
+  const stop = (isCurrent = () => true) => sessions.stopBackgroundWork({ sessionId, requestIds: [managed], isCurrent })
+  assert.deepEqual(await stop(), { status: 'cancelled' })
+  assert.deepEqual(removals, [{ sessionId, itemId: 'original-queue-item', action: { kind: 'remove' } }])
+  assert.deepEqual(queue.map(item => item.id), ['unrelated-queue-item'])
+  assert.deepEqual(cancelled, [])
+  running = true
+  const input = rpcId => ({ seq: 1, type: 'user/message', data: { source: { kind: 'user', rpcId } } })
+  events = [{ seq: 0, type: 'turn/start' }, input('unrelated')]
+  assert.deepEqual(await stop(), { status: 'skipped' })
+  assert.deepEqual(cancelled, [])
+  events = [{ seq: 0, type: 'turn/start' }, input(managed)]
+  assert.deepEqual(await stop(() => false), { status: 'skipped' })
+  stale = true
+  assert.deepEqual(await stop(), { status: 'skipped' })
+  assert.deepEqual(cancelled, [])
+  stale = false
+  assert.deepEqual(await stop(), { status: 'cancelled' })
+  assert.deepEqual(cancelled, [{ sessionId }])
+  events.push(...Array.from({ length: 1024 }, (_, index) => ({ seq: index + 2, type: 'step/start' })))
+  assert.deepEqual(await stop(), { status: 'cancelled' })
+  assert.deepEqual(cancelled, [{ sessionId }, { sessionId }])
+  events[1] = input('unrelated')
+  events.push({ ...input(managed), seq: events.length })
+  assert.deepEqual(await stop(), { status: 'skipped' })
+  assert.deepEqual(cancelled, [{ sessionId }, { sessionId }])
+})
+
 test('an old mount can flush a Host answer accepted during reload', async t => {
   const homeRepo = await mkdtemp(join(tmpdir(), 'hub-bot-reload-prompt-'))
   const Context = contexts.at(-1)[1]

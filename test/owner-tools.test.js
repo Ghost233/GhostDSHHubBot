@@ -31,7 +31,7 @@ import { buildForkAction, forkConfirmText, FORK_ACTION_TYPE } from '../src/fork.
 import * as ownerTools from '../src/owner-tools.js'
 
 /** registry+router over a fresh tmp store with a real owner (identity/cwd guards stay genuine). */
-function fixture() {
+function fixture({ legacyWorker = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'hub-bot-owner-tools-'))
   const store = new Store(dir)
   const registry = new OwnerRegistry(store, { scratchRoot: join(dir, 'scratch') })
@@ -41,13 +41,28 @@ function fixture() {
   // 否则 callerOwner 按设计拒绝一切调用。这里绑定的是注册表真身，不是测试假造的旁路。
   const ownerSessionId = 'session-owner-l2'
   registry.bindSession(owner.id, ownerSessionId)
+  const archived = new Set()
+  const forks = []
   const sessions = {
     create: async () => ({ sessionId: 'session-unused' }),
     prompt: async () => ({ accepted: true }),
+    isArchived: sessionId => archived.has(sessionId),
+    fork: async request => { forks.push(request); return { sessionId: 'session-forked-worker' } },
+    workerInfo: async sessionId => sessionId === 'session-w1' ? { cwd: join(owner.cwd, 'worker') } : undefined,
   }
-  const router = new Router({ store, registry, sessions, now: () => '2026-11-15T00:00:00.000Z' })
+  const now = () => '2026-11-15T00:00:00.000Z'
+  const router = new Router({ store, registry, sessions, now })
+  if (legacyWorker) {
+    // The earliest managed-worker rows had no assignment history.
+    const id = 'tsk-v1-worker'
+    store.db.prepare('INSERT INTO ticket (id, value) VALUES (?, ?)').run(id, JSON.stringify({
+      id, owner: owner.id, stage: 'working', createdAt: now(),
+      authorization: { actor: 'fixture-user', source: 'dsh', at: now() },
+      workerSession: { sessionId: 'session-w1', cwd: join(owner.cwd, 'worker'), at: now() },
+    }))
+  }
   return {
-    registry, store, router, owner, ownerSessionId,
+    registry, store, router, owner, ownerSessionId, archived, forks,
     cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }) },
   }
 }
@@ -84,25 +99,29 @@ function transcriptPage() {
  * `searchItems` 让内容搜索路径也返回命中项（与清单同样经 sessionCwd 复核责任边界）。
  * `agentId` 是调用方身份（dsh-agent 的 agent.id 即 SessionId）；`undefined` 表示 agent 上下文里没有 id。
  */
-function ownerToolsHarness(f, { agentId = f.ownerSessionId, extraSessions = [], searchItems = [], presets = {}, ensureCwd = async () => f.owner.cwd } = {}) {
+function ownerToolsHarness(f, {
+  agentId = f.ownerSessionId, extraSessions = [], searchItems = [], presets = {},
+  ensureCwd = async () => f.owner.cwd, readPage = async () => transcriptPage(),
+  statSession = async id => presets[id] ? { header: { agentPreset: presets[id] } } : undefined,
+} = {}) {
   const tools = new Map()
   const pageRequests = []
   const prompts = []
   const creates = []
-  const api = { registry: f.registry, tasks: f.router.tasks, store: f.store, router: f.router }
+  const api = { registry: f.registry, tasks: f.router.tasks, store: f.store, router: f.router, sessions: f.router.sessions }
   const ctx = {
     reflect: { get: () => api },
     systemPrompt: { section() {} },
     tools: { register: def => tools.set(def.name, def) },
     workingDirectory: { ensure: ensureCwd },
-    sessionPersistence: { stat: async id => presets[id] ? { header: { agentPreset: presets[id] } } : undefined },
+    sessionPersistence: { stat: statSession },
     sessionController: {
       // 目标会话在负责人 cwd 子树内 → 越界拒执不拦；责任边界判定是真实代码路径。
       list: async () => ({ items: [
         { sessionId: 'session-w1', cwd: join(f.owner.cwd, 'worker'), running: false },
         ...extraSessions,
       ] }),
-      page: async request => { pageRequests.push(request); return transcriptPage() },
+      page: async request => { pageRequests.push(request); return readPage(request) },
       search: async () => ({ items: searchItems }),
       prompt: async request => { prompts.push(request); return { accepted: true } },
       create: async request => { creates.push(request); return { sessionId: 'session-worker-created' } },
@@ -137,7 +156,7 @@ function observedNumbers(value, out = new Set()) {
 }
 
 test('S03 regression: read_session exposes a verifiable event seq usable as fork atSeq', async () => {
-  const f = fixture()
+  const f = fixture({ legacyWorker: true })
   try {
     const h = ownerToolsHarness(f)
     const tool = h.tools.get('read_session')
@@ -254,7 +273,7 @@ test('S03 regression: a worker Session caller is refused by the L2 owner tools',
  * owner's Session all count. read_session/inject_session/fork_session refuse them by name instead of no-oping.
  */
 test('S03 regression: an owner Session is refused as an L3 target for read/inject/fork', async () => {
-  const f = fixture()
+  const f = fixture({ legacyWorker: true })
   try {
     const h = ownerToolsHarness(f)
     // 当前绑定：负责人自己的会话。
@@ -300,7 +319,7 @@ test('S03 regression: an owner Session is refused as an L3 target for read/injec
  * refused, while the new CURRENT binding keeps working.
  */
 test('S03 regression: a stale displaced binding does not authorize the owner tools', async () => {
-  const f = fixture()
+  const f = fixture({ legacyWorker: true })
   try {
     const staleSessionId = f.ownerSessionId
     const currentSessionId = 'session-owner-current'
@@ -322,15 +341,9 @@ test('S03 regression: a stale displaced binding does not authorize the owner too
   } finally { f.cleanup() }
 })
 
-/**
- * 会话清单里的角色标注（issue #34）：当前绑定与被顶掉的历史负责人会话都标 role='owner'，
- * 让模型一眼看出「这些不能注入」，两条搜索路径（清单 / 内容搜索）判定一致。
- *
- * search_sessions tags every owner instance — current binding and displaced history — as role 'owner', so the model
- * never mistakes one for a reusable L3 worker; the list path and the content-search path classify identically.
- */
+/** Owner metadata is labeled in inventory. Content search returns only authorized workers. */
 test('S03 regression: search_sessions tags current and displaced owner Sessions as owner', async () => {
-  const f = fixture()
+  const f = fixture({ legacyWorker: true })
   try {
     const displacedSessionId = 'session-owner-displaced'
     const currentSessionId = 'session-owner-current'
@@ -349,11 +362,8 @@ test('S03 regression: search_sessions tags current and displaced owner Sessions 
     assert.equal(roles.get(displacedSessionId), 'owner', '被顶掉的历史负责人会话在清单里同样标 role=owner（否则会被误当 worker 注入）')
     assert.equal(roles.get('session-w1'), 'session', '普通执行会话不被误标为负责人')
 
-    // 内容搜索路径：同一判定，不能出现「清单里标 owner、搜索里当 worker」的两套标准。
     const searched = await h.tools.get('search_sessions').execute({ query: '登录' }, h.exec)
-    const searchRoles = new Map(searched.sessions.map(s => [s.sessionId, s.role]))
-    assert.equal(searchRoles.get(currentSessionId), 'owner', '内容搜索路径同样把当前负责人会话标 role=owner')
-    assert.equal(searchRoles.get(displacedSessionId), 'owner', '内容搜索路径同样把历史负责人会话标 role=owner')
+    assert.deepEqual(searched.sessions, [])
   } finally { f.cleanup() }
 })
 
@@ -367,10 +377,10 @@ test('legacy owner presets are not exposed as workers when old bindings were nev
       searchItems: [{ sessionId, snippet: 'old owner' }],
       presets: { [sessionId]: 'hub-bot-owner' },
     })
-    for (const args of [{}, { query: 'old owner' }]) {
-      const { sessions } = await h.tools.get('search_sessions').execute(args, h.exec)
-      assert.equal(sessions.find(item => item.sessionId === sessionId).role, 'owner')
-    }
+    const search = h.tools.get('search_sessions')
+    const { sessions } = await search.execute({}, h.exec)
+    assert.equal(sessions.find(item => item.sessionId === sessionId).role, 'owner')
+    assert.deepEqual(await search.execute({ query: 'old owner' }, h.exec), { sessions: [] })
     await assert.rejects(h.tools.get('read_session').execute({ sessionId }, h.exec), /is an owner session/)
     await assert.rejects(h.tools.get('inject_session').execute({ sessionId, text: 'fixture' }, h.exec), /is an owner session/)
     await assert.rejects(h.tools.get('fork_session').execute({ sessionId, ticketId: 'fixture', reason: 'fixture' }, h.exec), /is an owner session/)
@@ -419,7 +429,7 @@ test('create_session validates the normalized absolute worker directory', async 
 })
 
 test('read_session requests the chosen history page and exposes its continuation', async () => {
-  const f = fixture()
+  const f = fixture({ legacyWorker: true })
   try {
     const h = ownerToolsHarness(f)
     const page = await h.tools.get('read_session').execute({ sessionId: 'session-w1', maxMessages: 12, beforeSeq: 800 }, h.exec)
@@ -430,20 +440,40 @@ test('read_session requests the chosen history page and exposes its continuation
   } finally { f.cleanup() }
 })
 
-test('fork_session verifies the cut in the selected worker before requesting confirmation', async () => {
+test('a discovered worker forks at the observed event only after approval', async () => {
   const f = fixture()
   try {
-    const ticket = await f.router.routeToOwner({ ownerId: f.owner.id, message: 'fixture work' })
-    const h = ownerToolsHarness(f)
+    const { ticketId } = await f.router.routeToOwner({ ownerId: f.owner.id, message: 'fixture work' })
+    const cwd = join(f.owner.cwd, 'worker')
+    f.router.tasks.bindWorkerSession(ticketId, { sessionId: 'session-w1', cwd })
+    const forkedId = 'session-forked-worker'
+    const h = ownerToolsHarness(f, { extraSessions: [{ sessionId: forkedId, cwd }] })
+    const { sessions } = await h.tools.get('search_sessions').execute({}, h.exec)
+    const [worker] = sessions
+    assert.equal(worker.sessionId, 'session-w1')
+    const { seqs } = await h.tools.get('read_session').execute({ sessionId: worker.sessionId }, h.exec)
+    const atSeq = seqs.find(seq => seq === PAGE_SEQS.clean)
     const tool = h.tools.get('fork_session')
-    const args = { sessionId: 'session-w1', ticketId: ticket.ticketId, reason: 'fixture clean boundary' }
+    const args = { sessionId: worker.sessionId, ticketId, reason: 'fixture clean boundary' }
     await assert.rejects(tool.execute({ ...args, atSeq: 800 }, h.exec), /fork-atseq-not-found/)
-    assert.equal(f.router.getTicket(ticket.ticketId).stage, 'working')
-    await tool.execute({ ...args, atSeq: PAGE_SEQS.clean }, h.exec)
-    assert.deepEqual(h.pageRequests.map(request => request.throughSeq), [800, PAGE_SEQS.clean])
-    const saved = f.router.getTicket(ticket.ticketId).pendingConfirm?.action
-    assert.equal(saved.sessionId, 'session-w1')
+    assert.equal(f.router.getTicket(ticketId).stage, 'working')
+    await tool.execute({ ...args, atSeq }, h.exec)
+    assert.deepEqual(h.pageRequests.slice(1).map(request => request.throughSeq), [800, PAGE_SEQS.clean])
+    const saved = f.router.getTicket(ticketId).pendingConfirm?.action
+    assert.equal(saved.sessionId, worker.sessionId)
     assert.equal(saved.atSeq, PAGE_SEQS.clean)
+    assert.deepEqual(f.forks, [])
+
+    const approved = await f.router.routeToOwner({ ownerId: f.owner.id, ticketId, resolution: 'confirm', message: 'Approve fixture fork' })
+    assert.equal(approved.confirmed, true)
+    assert.deepEqual(f.forks, [{ sessionId: worker.sessionId, atSeq: PAGE_SEQS.clean }])
+    assert.equal(f.router.getTicket(ticketId).workerSession.sessionId, forkedId)
+    const inject = h.tools.get('inject_session')
+    const text = 'Continue fixture work'
+    assert.equal((await inject.execute({ sessionId: forkedId, ticketId, text }, h.exec)).accepted, true)
+    await assert.rejects(inject.execute({ sessionId: worker.sessionId, text }, h.exec), /not an eligible managed worker/)
+    const original = await h.tools.get('read_session').execute({ sessionId: worker.sessionId }, h.exec)
+    assert.deepEqual(original.seqs, seqs)
   } finally { f.cleanup() }
 })
 
@@ -458,4 +488,187 @@ test('the worker tools refuse out-of-scope sessions before host effects', async 
     assert.equal(h.pageRequests.length, 0)
     assert.equal(h.prompts.length, 0)
   } finally { f.cleanup() }
+})
+
+test('inject_session requires the owned ticket to reference the exact worker', async () => {
+  const f = fixture()
+  try {
+    const { ticketId } = await f.router.routeToOwner({ ownerId: f.owner.id, message: 'fixture work' })
+    const cwd = join(f.owner.cwd, 'worker')
+    f.router.tasks.bindWorkerSession(ticketId, { sessionId: 'session-w1', cwd })
+    const sessionId = 'fixture-unrelated-session'
+    const h = ownerToolsHarness(f, {
+      extraSessions: [{ sessionId, cwd }],
+      searchItems: [{ sessionId, snippet: 'Unrelated fixture text' }, { sessionId: 'session-w1', snippet: 'Managed fixture text' }],
+    })
+    const inject = h.tools.get('inject_session')
+    const text = 'Continue fixture work'
+    await assert.rejects(inject.execute({ sessionId, ticketId, text }, h.exec), /not the worker assigned to ticket/)
+    await assert.rejects(inject.execute({ sessionId, text }, h.exec), /not an eligible managed worker/)
+    await assert.rejects(h.tools.get('read_session').execute({ sessionId }, h.exec), /not an eligible managed worker/)
+    await assert.rejects(h.tools.get('fork_session').execute({ sessionId, ticketId, reason: text, atSeq: PAGE_SEQS.clean }, h.exec), /not the worker assigned to ticket/)
+    assert.equal(h.prompts.length, 0)
+    assert.equal(h.pageRequests.length, 0)
+    assert.equal(f.router.getTicket(ticketId).stage, 'working')
+
+    const search = h.tools.get('search_sessions')
+    const inventory = await search.execute({}, h.exec)
+    assert.deepEqual(inventory.sessions.map(item => item.sessionId), ['session-w1'])
+    const matches = await search.execute({ query: 'fixture text', limit: 1 }, h.exec)
+    assert.deepEqual(matches.sessions.map(item => item.snippet), ['Managed fixture text'])
+    const managed = await inject.execute({ sessionId: 'session-w1', ticketId, text }, h.exec)
+    assert.equal(managed.accepted, true)
+    assert.match(h.prompts[0].content[0].text, /授权：/)
+  } finally { f.cleanup() }
+})
+
+for (const [name, fields] of [
+  ['report', { summary: 'Fixture result' }],
+  ['escalate', { reason: 'Fixture blocker' }],
+]) {
+  test(name + ' refuses an owner displaced during directory lookup', { timeout: 2000 }, async () => {
+    const f = fixture()
+    const lookupStarted = Promise.withResolvers()
+    const directory = Promise.withResolvers()
+    try {
+      const { ticketId } = await f.router.routeToOwner({ ownerId: f.owner.id, message: 'fixture work' })
+      const h = ownerToolsHarness(f, { ensureCwd() {
+        lookupStarted.resolve()
+        return directory.promise
+      } })
+      const call = h.tools.get(name).execute({ ticketId, ...fields }, h.exec)
+      await lookupStarted.promise
+      f.registry.bindSession(f.owner.id, 'session-new-owner')
+      directory.resolve(f.owner.cwd)
+      const [attempt] = await Promise.allSettled([call])
+      assert.deepEqual({ status: attempt.status, stage: f.router.getTicket(ticketId).stage }, { status: 'rejected', stage: 'working' })
+      assert.deepEqual(f.router.listOutbox().filter(row => ['digest', 'escalation'].includes(row.kind)), [])
+    } finally { directory.resolve(f.owner.cwd); f.cleanup() }
+  })
+}
+
+test('standalone L2 creation remains usable without a ticket after the store reopens and the owner rebinds', async () => {
+  const f = fixture()
+  let reopened
+  try {
+    const h = ownerToolsHarness(f)
+    const created = await h.tools.get('create_session').execute({}, h.exec)
+    assert.deepEqual(h.creates, [{ cwd: f.owner.cwd }])
+    f.store.close()
+    reopened = new Store(f.store.stateDir)
+    const registry = new OwnerRegistry(reopened, { scratchRoot: join(f.store.stateDir, 'scratch') })
+    const agentId = 'session-fresh-owner'
+    registry.bindSession(f.owner.id, agentId)
+    const router = new Router({ store: reopened, registry, sessions: f.router.sessions, now: f.router.now })
+    const live = ownerToolsHarness({ ...f, store: reopened, registry, router }, { agentId, extraSessions: [created] })
+    const { sessions } = await live.tools.get('search_sessions').execute({}, live.exec)
+    assert.deepEqual(sessions.map(item => [item.sessionId, item.readOnly]), [[created.sessionId, false]])
+    const read = await live.tools.get('read_session').execute({ sessionId: created.sessionId }, live.exec)
+    assert.deepEqual(read.seqs, Object.values(PAGE_SEQS))
+    const result = await live.tools.get('inject_session').execute({ sessionId: created.sessionId, text: 'Continue' }, live.exec)
+    assert.equal(result.accepted, true)
+    assert.equal(live.prompts.length, 1)
+  } finally { reopened?.close(); f.cleanup() }
+})
+
+test('worker provenance is isolated between owners whose directories overlap', async () => {
+  const f = fixture()
+  try {
+    const cwd = join(f.owner.cwd, 'worker')
+    const sessionId = 'session-w1'
+    const nested = f.registry.create({ kind: 'dir', cwd })
+    const nestedSessionId = 'session-nested-owner'
+    f.registry.bindSession(nested.id, nestedSessionId)
+    const { ticketId: nestedTicket } = await f.router.routeToOwner({ ownerId: nested.id, message: 'Nested fixture' })
+    f.router.tasks.bindWorkerSession(nestedTicket, { sessionId, cwd })
+    const parent = ownerToolsHarness(f, { searchItems: [{ sessionId, snippet: 'nested work' }] })
+    assert.deepEqual((await parent.tools.get('search_sessions').execute({ query: 'nested work' }, parent.exec)).sessions, [])
+    await assert.rejects(parent.tools.get('read_session').execute({ sessionId }, parent.exec), /not an eligible managed worker/)
+    const { ticketId } = await f.router.routeToOwner({ ownerId: f.owner.id, message: 'Parent fixture' })
+    f.router.tasks.bindWorkerSession(ticketId, { sessionId, cwd })
+    await assert.rejects(parent.tools.get('inject_session').execute({ sessionId, ticketId, text: 'Continue' }, parent.exec), /not an eligible managed worker/)
+    const child = ownerToolsHarness({ ...f, owner: nested, ownerSessionId: nestedSessionId }, { extraSessions: [{ sessionId, cwd }] })
+    await assert.rejects(child.tools.get('read_session').execute({ sessionId }, child.exec), /not an eligible managed worker/)
+    assert.deepEqual([parent.pageRequests.length, parent.prompts.length, child.pageRequests.length], [0, 0, 0])
+  } finally { f.cleanup() }
+})
+
+for (const stage of ['done', 'failed']) {
+  test('the worker of a ' + stage + ' ticket is read-only and disappears once archived', async () => {
+    const f = fixture({ legacyWorker: true })
+    try {
+      const ticketId = 'tsk-v1-worker'
+      const sessionId = 'session-w1'
+      if (stage === 'done') {
+        f.router.tasks.report({ ticketId, summary: 'Fixture complete' })
+        f.router.tasks.accept(ticketId)
+      } else {
+        f.router.tasks.fail({ ticketId, reason: 'Fixture failure' })
+      }
+      const h = ownerToolsHarness(f)
+      const search = h.tools.get('search_sessions')
+      const read = h.tools.get('read_session')
+      const inject = h.tools.get('inject_session')
+      assert.equal((await search.execute({}, h.exec)).sessions[0].readOnly, true)
+      assert.deepEqual((await read.execute({ sessionId }, h.exec)).seqs, Object.values(PAGE_SEQS))
+      await assert.rejects(inject.execute({ sessionId, ticketId, text: 'Continue' }, h.exec), /terminal/)
+      await assert.rejects(inject.execute({ sessionId, text: 'Continue' }, h.exec), /not an eligible managed worker/)
+      f.archived.add(sessionId)
+      assert.deepEqual((await search.execute({}, h.exec)).sessions, [])
+      await assert.rejects(read.execute({ sessionId }, h.exec), /is archived/)
+      await assert.rejects(inject.execute({ sessionId, text: 'Continue' }, h.exec), /is archived/)
+      await assert.rejects(h.tools.get('fork_session').execute({ sessionId, ticketId, reason: 'Continue' }, h.exec), /is archived/)
+      assert.equal(h.pageRequests.length, 1)
+      assert.equal(h.prompts.length, 0)
+    } finally { f.cleanup() }
+  })
+}
+
+test('fork_session rechecks the exact ticket worker after loading the boundary event', { timeout: 2000 }, async () => {
+  const f = fixture()
+  const pageStarted = Promise.withResolvers()
+  const page = Promise.withResolvers()
+  try {
+    const { ticketId } = await f.router.routeToOwner({ ownerId: f.owner.id, message: 'fixture work' })
+    const sessionId = 'session-w1'
+    const cwd = join(f.owner.cwd, 'worker')
+    f.router.tasks.bindWorkerSession(ticketId, { sessionId, cwd })
+    const h = ownerToolsHarness(f, { readPage() {
+      pageStarted.resolve()
+      return page.promise
+    } })
+    const fork = h.tools.get('fork_session').execute({ sessionId, ticketId, reason: 'Continue from the boundary', atSeq: PAGE_SEQS.clean }, h.exec)
+    await pageStarted.promise
+    f.router.tasks.bindWorkerSession(ticketId, { sessionId: 'fixture-new-worker', cwd })
+    page.resolve(transcriptPage())
+    await assert.rejects(fork, /not the worker assigned to ticket/)
+    assert.equal(f.router.getTicket(ticketId).pendingConfirm, undefined)
+    assert.deepEqual(f.forks, [])
+  } finally { page.resolve(transcriptPage()); f.cleanup() }
+})
+
+test('content search drops a worker archived during another hit’s metadata lookup', { timeout: 2000 }, async () => {
+  const f = fixture({ legacyWorker: true })
+  const lookupStarted = Promise.withResolvers()
+  const metadata = Promise.withResolvers()
+  try {
+    const { ticketId } = await f.router.routeToOwner({ ownerId: f.owner.id, message: 'Second fixture' })
+    const sessionId = 'fixture-second-worker'
+    const cwd = join(f.owner.cwd, 'worker')
+    f.router.tasks.bindWorkerSession(ticketId, { sessionId, cwd })
+    const h = ownerToolsHarness(f, {
+      extraSessions: [{ sessionId, cwd }],
+      searchItems: [{ sessionId: 'session-w1', snippet: 'First hit' }, { sessionId, snippet: 'Second hit' }],
+      async statSession(id) {
+        if (id !== sessionId) return undefined
+        lookupStarted.resolve()
+        return metadata.promise
+      },
+    })
+    const results = h.tools.get('search_sessions').execute({ query: 'hit' }, h.exec)
+    await lookupStarted.promise
+    f.archived.add('session-w1')
+    metadata.resolve()
+    assert.deepEqual((await results).sessions.map(entry => entry.snippet), ['Second hit'])
+  } finally { metadata.resolve(); f.cleanup() }
 })

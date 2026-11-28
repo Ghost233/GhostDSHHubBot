@@ -22,7 +22,7 @@ import { insertOutbox } from '../src/outbox.js'
 import { resolveConfig } from '../src/config.js'
 
 /** Router and Feishu adapter over one SQLite store and fake host ports. */
-function fixture({ botOpenId = 'ou_bot', larkOverrides = {}, chiefConfig, credentials = fakeCredentialsPort(), config } = {}) {
+function fixture({ botOpenId = 'ou_bot', larkOverrides = {}, chiefConfig, credentials = fakeCredentialsPort(), config, logger = { info() {}, warn() {} } } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'hub-bot-feishu-'))
   const store = new Store(dir)
   const registry = new OwnerRegistry(store, { scratchRoot: join(dir, 'scratch') })
@@ -48,7 +48,7 @@ function fixture({ botOpenId = 'ou_bot', larkOverrides = {}, chiefConfig, creden
   const source = new FeishuSource({
     store, router,
     config: config ?? { enabled: true, botOpenId },
-    logger: { info() {}, warn() {} },
+    logger,
     lark: fakeLark,
     now: () => new Date(nowMs).toISOString(),
     credentials,
@@ -260,6 +260,52 @@ test('deliverReplies sends recorded feishu intents and marks them sent only on r
   } finally { cleanup() }
 })
 
+test('deliverReplies reuses a bounded Feishu UUID after a lost acknowledgment across mounts', async () => {
+  const requests = []
+  const publications = []
+  const larkOverrides = {
+    client: { im: { message: {
+      async create({ data }) {
+        requests.push(data.uuid)
+        if (!data.uuid || !publications.includes(data.uuid)) publications.push(data.uuid)
+        if (requests.length === 1) throw new Error('fixture acknowledgment lost after publication')
+        return { code: 0 }
+      },
+    } } },
+  }
+  const f = fixture({ larkOverrides })
+  try {
+    const reply = {
+      ticketId: null, kind: 'reply', to: 'feishu:chat:oc_9', body: '工单已验收',
+      state: 'recorded', requestId: 'fixture-shared-request',
+    }
+    const longId = 'out-' + 'long-id-'.repeat(12)
+    const first = insertOutbox(f.store, { ...reply, id: longId + '1' })
+    assert.deepEqual(await f.source.deliverReplies(), { delivered: 0 })
+    assert.equal(publications.length, 1)
+    assert.equal(f.outbox()[0].state, 'recorded')
+    assert.equal(f.outbox()[0].attempts, 1)
+
+    const second = insertOutbox(f.store, { ...reply, id: longId + '2' })
+    const reopened = new Store(f.dir)
+    try {
+      const remounted = new FeishuSource({
+        store: reopened, config: { enabled: true }, lark: f.fakeLark, logger: { info() {}, warn() {} },
+      })
+      assert.deepEqual(await remounted.deliverReplies(), { delivered: 2 })
+    } finally { reopened.close() }
+    assert.equal(publications.length, 2, 'retry dedupes, while the separate publication is sent')
+    assert.equal(requests.length, 3)
+    for (const uuid of requests) {
+      assert.equal(typeof uuid, 'string')
+      assert.ok(uuid.length > 0 && uuid.length <= 50)
+    }
+    assert.equal(requests[0], requests[1])
+    assert.notEqual(requests[1], requests[2])
+    assert.deepEqual(f.outbox().map(({ id, state }) => [id, state]), [[first.id, 'sent'], [second.id, 'sent']])
+  } finally { f.cleanup() }
+})
+
 test('deliverReplies leaves failures recorded with an attempt counter; five failures fail the row and report a system problem', async () => {
   const { source, store, cleanup } = fixture({
     larkOverrides: { client: { im: { message: { create: async () => { throw new Error('HTTP 429') } } }, request: async () => ({ code: 0 }) } },
@@ -361,6 +407,56 @@ test('register() surfaces the QR and waits for the DSH grant before connecting',
     assert.equal(calls.patch.length, 1, 'event-subscription mode auto-config attempted once')
     assert.ok(String(calls.patch[0].url).includes('application'), 'application-config patch')
   } finally { cleanup() }
+})
+
+test('Feishu WS rejects a failed durable write and acknowledges its retry and policy drops', async () => {
+  let receive
+  const warnings = []
+  const f = fixture({
+    logger: { info() {}, warn(...args) { warnings.push(args) } },
+    larkOverrides: {
+      WSClient: class {
+        async start({ eventDispatcher }) { receive = eventDispatcher.handlers['im.message.receive_v1'] }
+        close() {}
+      },
+      EventDispatcher: class { register(handlers) { this.handlers = handlers; return this } },
+    },
+  })
+  // The WS SDK acknowledges a fulfilled event handler with 200 and a rejected handler with 500.
+  async function acknowledge(data) {
+    try {
+      await receive(data)
+      return { code: 200 }
+    } catch (error) {
+      return { code: 500, error: String(error) }
+    }
+  }
+  try {
+    await f.source.saveCredentials({ appId: 'fixture-app', appSecret: 'fixture-secret' })
+    assert.deepEqual(await f.source.connect(), { started: true })
+    f.store.db.exec(`CREATE TEMP TRIGGER fail_outbox_insert BEFORE INSERT ON outbox
+      BEGIN SELECT RAISE(ABORT, 'fixture private SQLite detail'); END`)
+    const delivery = event({ messageId: 'om_sqlite_retry' })
+    const failedAck = await acknowledge(delivery)
+    assert.equal(failedAck.code, 500)
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0][0], /event handling failed.*SQLite [0-9]+/)
+    assert.doesNotMatch(JSON.stringify({ failedAck, warnings }), /fixture private SQLite detail/)
+    assert.equal(f.trigger('feishu-om_sqlite_retry'), null, 'SQLite rolls back the partial acceptance')
+    assert.equal(f.outbox().length, 0)
+
+    f.store.db.exec('DROP TRIGGER fail_outbox_insert')
+    assert.equal((await acknowledge(delivery)).code, 200)
+    assert.equal((await acknowledge(delivery)).code, 200, 'redelivery of the persisted message is idempotent')
+    assert.ok(f.trigger('feishu-om_sqlite_retry'))
+    assert.equal(f.outbox().filter(row => row.triggerId === 'feishu-om_sqlite_retry').length, 1)
+    await f.router.tick()
+    assert.equal(f.calls.prompt.length, 1)
+
+    assert.equal((await acknowledge(event({ messageId: 'om_policy_drop', chatType: 'group' }))).code, 200)
+    assert.equal(f.trigger('feishu-om_policy_drop').dropped, 'no-mention')
+    assert.ok(f.outbox().every(row => row.triggerId !== 'feishu-om_policy_drop'))
+  } finally { f.source.disconnect(); f.cleanup() }
 })
 
 test('pausing Feishu closes the active socket and ignores stale callbacks', async () => {

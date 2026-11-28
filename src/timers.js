@@ -158,6 +158,13 @@ function latestScheduledOccurrence(timer, nowMs) {
   }
 }
 
+function parseCivilInstant(value) {
+  if (typeof value !== 'string' || !ABSOLUTE_TIMESTAMP.test(value) || !LOCAL_TIME.test(value.slice(11, 16))) return NaN
+  // Date.parse can normalize a calendar date that never existed.
+  if (new Date(value.slice(0, 10) + 'T00:00:00Z').getUTCDate() !== Number(value.slice(8, 10))) return NaN
+  return Date.parse(value)
+}
+
 /** Keeps just the identity of a Feishu origin resolved by the caller. */
 function feishuOrigin(origin) {
   if (origin === undefined) return undefined
@@ -173,9 +180,7 @@ function feishuAuthorization(authorization, origin) {
   if (authorization === undefined) return undefined
   const saved = { ...authorization }
   const { at } = saved
-  // Date.parse can normalize an impossible calendar day, such as February 30.
-  const validTimestamp = typeof at === 'string' && ABSOLUTE_TIMESTAMP.test(at) && Number.isFinite(Date.parse(at))
-    && new Date(at.slice(0, 10) + 'T00:00:00Z').getUTCDate() === Number(at.slice(8, 10))
+  const validTimestamp = Number.isFinite(parseCivilInstant(at))
   if (!origin || saved.actor !== origin.actor || saved.source !== origin.kind || !validTimestamp) {
     throw new TimerError('timer-authorization-invalid', 'Timer authorization must match its Feishu origin and have a valid absolute timestamp.')
   }
@@ -321,8 +326,7 @@ export class TimerService {
    * Lists timers in creation order (oldest first), optionally scoped to one owner. `remainingMs` is a computed
    * view field (never persisted): time until the stored `fireAt` for a pending or paused timer.
    *
-   * The SQL `ORDER BY at` only pre-sorts the scan; `at` is the NEVER_DUE sentinel for paused/terminal rows, so
-   * it is NOT a display order. The authoritative order is applied below: `createdAt`, then `rowid` (insertion
+   * Display order is `createdAt`, then `rowid` (insertion
    * sequence). The rowid tiebreak matters — two timers created within the same clock reading share a
    * `createdAt`, and `id` is a random uuid, so tiebreaking on `id` would shuffle them randomly.
    *
@@ -331,10 +335,11 @@ export class TimerService {
    */
   list({ ownerId } = {}) {
     const nowMs = this.#nowMs()
-    const rows = this.#store.db.prepare('SELECT id, value, rowid AS seq FROM timer ORDER BY at, rowid').all()
+    const query = 'SELECT value, rowid AS seq FROM timer'
+    const rows = ownerId === undefined ? this.#store.db.prepare(query).all()
+      : this.#store.db.prepare(query + ' WHERE owner = ?').all(ownerId)
     return rows
       .map(row => ({ seq: Number(row.seq), timer: JSON.parse(String(row.value)) }))
-      .filter(entry => ownerId === undefined || entry.timer.ownerId === ownerId)
       .sort((a, b) => (a.timer.createdAt === b.timer.createdAt
         ? a.seq - b.seq
         : (a.timer.createdAt < b.timer.createdAt ? -1 : 1)))
@@ -610,7 +615,7 @@ export class TimerService {
       throw new TimerError('fire-at-format',
         'timer_create: fireAt "' + value + '" must be an absolute timestamp with an explicit timezone/offset (Z or ±HH:MM) — a bare local time is ambiguous')
     }
-    const ms = Date.parse(value)
+    const ms = parseCivilInstant(value)
     if (!Number.isFinite(ms)) {
       throw new TimerError('fire-at-format', 'timer_create: fireAt "' + value + '" is not a real instant')
     }
