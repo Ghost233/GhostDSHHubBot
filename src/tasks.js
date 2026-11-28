@@ -141,13 +141,14 @@ export class TaskBoard {
   }
 
   /** Applies one guarded transition, recording it on the ticket's audit trail. */
-  #transition(ticketId, to, by) {
+  #transition(ticketId, to, by, reason) {
     const ticket = this.#mustGet(ticketId)
-    if (!canTransition(ticket.stage, to)) {
+    const backgroundChecked = reason === 'background-no-result' && ticket.background && ticket.stage === 'working' && to === 'done'
+    if (!backgroundChecked && !canTransition(ticket.stage, to)) {
       throw new TaskError('illegal-transition', 'ticket ' + ticketId + ': cannot move ' + ticket.stage + ' → ' + to)
     }
     const at = this.now()
-    const transitions = [...(ticket.transitions ?? []), { from: ticket.stage, to, by, at }]
+    const transitions = [...(ticket.transitions ?? []), { from: ticket.stage, to, by, at, ...(reason && { reason }) }]
     return this.#updateTicket({ ...ticket, stage: to, transitions, updatedAt: at })
   }
 
@@ -251,6 +252,13 @@ export class TaskBoard {
       throw new TaskError('illegal-transition', 'ticket ' + ticketId + ': cannot resume from ' + ticket.stage)
     }
     return this.#transition(ticketId, 'working', by ?? 'route')
+  }
+
+  /** A background check without a new result has nothing for the user to accept. */
+  finishBackgroundCheck(ticketId) {
+    const ticket = this.#mustGet(ticketId)
+    if (!ticket.background || ticket.stage !== 'working') throw new TaskError('illegal-transition', 'Only an active background check can finish without a result.')
+    return this.#transition(ticketId, 'done', 'system', 'background-no-result')
   }
 
   /** The user accepts the reported result (person/review → done; 等用户验收是挡板）. */

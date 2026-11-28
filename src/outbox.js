@@ -20,6 +20,7 @@
  * mergedCount includes the head. An accepted cohort settles its rows together. Only a merge adds mergedRows.
  */
 import { randomUUID } from 'node:crypto'
+import { archiveRunNotification } from './runs.js'
 
 /** Backoff caps by row kind (spec: 回复上限 1 分钟、注入上限 5 分钟）. */
 const CAP_MS = { inject: 5 * 60_000, inbox: 5 * 60_000, reply: 60_000 }
@@ -104,6 +105,7 @@ export function discardOutboxRows(store, ids = null) {
     for (const [, rows] of failedOutboxGroups(store, ids)) {
       for (const row of rows) {
         if (row.kind === 'inbox' && row.triggerId) discardIntake.run(row.triggerId)
+        archiveRunNotification(store, row)
         del.run(row.id)
       }
       discarded += rows.length

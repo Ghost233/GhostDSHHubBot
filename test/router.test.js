@@ -154,6 +154,98 @@ test('a deleted owner Session rebuilds on delivery and the registry is updated',
   } finally { cleanup() }
 })
 
+test('a rebuilt owner receives current durable facts with the original delivery request', async () => {
+  const dead = []
+  const { router, registry, store, calls, cleanup } = fixture({ failSessions: dead })
+  let reopened
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Cold start fixture', cwd: '/repos/fixture' })
+    const other = registry.create({ kind: 'repo', workspace: 'Other owner', cwd: '/repos/other' })
+    const first = await router.routeToOwner({ ownerId: owner.id, message: 'first fixture task' })
+    router.tasks.bindWorkerSession(first.ticketId, { sessionId: 'cold-start-original-worker', cwd: owner.cwd })
+    const outside = await router.routeToOwner({ ownerId: other.id, message: 'other task' })
+    router.tasks.report({ ticketId: outside.ticketId, summary: 'unrelated-report-marker' })
+    router.installDeferred(new DeferredRegistry({ store, tasks: router.tasks, now: router.now,
+      owners: { currentBinding: id => registry.get(id), isOwnerSession: id => registry.isOwnerSession(id) } }))
+    const waiting = router.openQuestion({ ticketId: first.ticketId, question: 'Which saved fixture input?' })
+    store.close()
+    reopened = new Store(store.stateDir)
+    const currentRegistry = new OwnerRegistry(reopened, { scratchRoot: join(reopened.stateDir, 'scratch') })
+    const routerAfter = new Router({ store: reopened, registry: currentRegistry, sessions: router.sessions, now: router.now })
+    await routerAfter.markRestart()
+    assert.equal(currentRegistry.get(owner.id).sessionId, first.sessionId)
+    assert.equal(calls.create.length, 2)
+    dead.push(first.sessionId)
+    const input = { ownerId: owner.id, message: 'resume after loss', triggerRef: 'fixture-owner-rebuild' }
+    const recovered = await routerAfter.routeToOwner(input)
+    const prompts = calls.prompt.slice(-2)
+    assert.equal(recovered.rebuilt, true)
+    assert.equal(calls.create.at(-1).agentPreset, 'hub-bot-owner')
+    assert.equal(prompts[0].sessionId, first.sessionId)
+    assert.equal(prompts[0].requestId, prompts[1].requestId)
+    assert.equal(prompts[1].requestId, recovered.requestId)
+    assert.ok(prompts[1].text.includes('Cold start fixture'))
+    assert.ok(prompts[1].text.includes(waiting.deferred.requestId))
+    assert.ok(prompts[1].text.includes(waiting.deferred.expiresAt))
+    assert.ok(prompts[1].text.includes('cold-start-original-worker'))
+    assert.ok(!prompts[1].text.includes('unrelated-report-marker'))
+    assert.deepEqual(routerAfter.getTicket(first.ticketId).authorization, waiting.authorization)
+    assert.equal(routerAfter.getTicket(first.ticketId).deferred.expiresAt, waiting.deferred.expiresAt)
+    assert.equal((await routerAfter.routeToOwner(input)).deduped, true)
+    assert.equal(calls.prompt.at(-1), prompts[1])
+    await routerAfter.routeToOwner({ ownerId: owner.id, message: 'later ordinary request' })
+    assert.ok(!calls.prompt.at(-1).text.includes(waiting.deferred.requestId))
+  } finally { reopened?.close(); cleanup() }
+})
+
+test('owner rebuild reuses its persisted proposal after the host response is lost', async () => {
+  const { router, registry, store, calls, advance, cleanup } = fixture()
+  let reopened
+  try {
+    const owner = registry.create({ kind: 'dir', cwd: '/repos/rebuild' })
+    const oldSession = 'deleted-owner-fixture'
+    registry.bindSession(owner.id, oldSession)
+    const created = new Set()
+    const sessions = {
+      create: async input => {
+        calls.create.push(input)
+        assert.ok(input.sessionId)
+        assert.equal(input.agentPreset, 'hub-bot-owner')
+        if (!created.has(input.sessionId)) {
+          created.add(input.sessionId)
+          throw new Error('The create result was lost after the host committed it.')
+        }
+        return { sessionId: input.sessionId, agentPreset: input.agentPreset }
+      },
+      prompt: async input => {
+        calls.prompt.push(input)
+        if (input.sessionId === oldSession) throw Object.assign(new Error('fixture missing session'), { code: 'session/not-found' })
+        assert.ok(created.has(input.sessionId))
+        return { accepted: true }
+      },
+    }
+    router.sessions = sessions
+    const work = await router.routeToOwner({ ownerId: owner.id, message: 'fixture first request' })
+    assert.equal(work.stage, 'idle')
+    assert.equal(registry.get(owner.id).sessionId, null)
+    store.close()
+    reopened = new Store(store.stateDir)
+    const nextRegistry = new OwnerRegistry(reopened, { scratchRoot: join(reopened.stateDir, 'scratch') })
+    const restarted = new Router({ store: reopened, registry: nextRegistry, sessions, now: router.now })
+    advance(2000)
+    await restarted.markRestart()
+    await restarted.tick()
+    assert.equal(calls.create.length, 2)
+    assert.equal(calls.create[0].sessionId, calls.create[1].sessionId)
+    assert.equal(created.size, 1)
+    assert.equal(nextRegistry.get(owner.id).sessionId, calls.create[0].sessionId)
+    assert.equal(calls.prompt[0].requestId, work.requestId)
+    assert.equal(calls.prompt[1].requestId, work.requestId)
+    assert.match(calls.prompt[1].text, /负责人事实/)
+    assert.equal(restarted.getTicket(work.ticketId).lastDelivery.state, 'sent')
+  } finally { reopened?.close(); cleanup() }
+})
+
 test('three consecutive delivery failures report a system problem (一次性错误不惊动人)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'hub-bot-router-'))
   const store = new Store(dir)
@@ -929,6 +1021,38 @@ test('restart resumes interrupted background work in its original execution sess
   } finally { cleanup() }
 })
 
+test('a paused recurring occurrence leaves the next owner slot available and resumes its saved request', async () => {
+  const { router, registry, store, calls, advance, cleanup } = fixture({ config: { concurrency: { slotsPerOwner: 1 } } })
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Paused occurrence', cwd: '/repos/fixture' })
+    const work = await router.routeToOwner({ ownerId: owner.id, message: 'occupy the owner slot' })
+    const { TimerService } = await import('../src/timers.js')
+    const timers = new TimerService({ store, now: router.now, getOwner: id => registry.get(id), getTicket: id => router.getTicket(id),
+      routeBackground: request => router.routeBackground(request) })
+    router.timerDeliveryState = (id, ref) => timers.deliveryState(id, ref)
+    const timer = timers.create({ ownerId: owner.id, createdBy: 'fixture-owner', message: 'queued recurring check',
+      schedule: { frequency: 'daily', time: '08:01' } })
+    advance(60_000)
+    await timers.tick()
+    const { ticketId } = timers.get(timer.id).delivery
+    const requestId = router.getTicket(ticketId).requestId
+    assert.equal(router.getTicket(ticketId).stage, 'queued')
+    timers.pause(timer.id)
+    const later = await router.routeToOwner({ ownerId: owner.id, message: 'later user request' })
+    router.tasks.report({ ticketId: work.ticketId, summary: 'released the slot' })
+    await router.tick()
+    assert.equal(router.getTicket(ticketId).stage, 'queued')
+    assert.equal(router.getTicket(later.ticketId).stage, 'working')
+    assert.equal(calls.prompt.some(call => call.requestId === requestId), false)
+    router.tasks.report({ ticketId: later.ticketId, summary: 'released the slot again' })
+    timers.resume(timer.id)
+    advance(1000)
+    await router.tick()
+    assert.equal(calls.prompt.filter(call => call.requestId === requestId).length, 1)
+    assert.equal(timers.get(timer.id).delivery.state, 'sent')
+  } finally { cleanup() }
+})
+
 test('separate occurrences reuse the same follow-up worker without reusing the owner', async () => {
   const { router, registry, calls, cleanup } = fixture()
   try {
@@ -1084,7 +1208,7 @@ test('an exhausted initial reminder appears failed without claiming delivery', a
     const { TimerService } = await import('../src/timers.js')
     const timers = new TimerService({ store, now: () => instant, getOwner: id => registry.get(id),
       getTicket: id => router.getTicket(id), routeBackground: request => router.routeBackground(request) })
-    router.timerCanDeliver = (id, ref) => timers.canDeliver(id, ref)
+    router.timerDeliveryState = (id, ref) => timers.deliveryState(id, ref)
     const timer = timers.create({ ownerId: owner.id, createdBy: 'fixture-creator',
       fireAt: new Date(instant + 1000).toISOString(), message: 'fixture timer failing transport' })
     router.sessions.prompt = async () => { throw Error('fixture host unavailable') }

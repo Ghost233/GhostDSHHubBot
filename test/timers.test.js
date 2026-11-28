@@ -1,5 +1,5 @@
 /**
- * TimerService tests (S09 / issue #40): persistent ONE-SHOT follow-up timers.
+ * TimerService tests for durable one-shot and recurring timers.
  *
  * These run against the real Store (a throwaway SQLite database per test), a fake clock, and a fake Router
  * port — no host, no network, no Session. What is asserted is the reliability contract:
@@ -83,6 +83,325 @@ function schedule(timers, overrides = {}) {
     message: '跟进：检查 #40 的定时器是否已落地', ...overrides,
   })
 }
+
+test('daily creation stores the first Shanghai occurrence across local midnight', t => {
+  // 23:59 Sunday in Shanghai, still Sunday afternoon in UTC.
+  const f = fixture({ startAt: Date.parse('2026-11-15T15:59:00Z') })
+  t.after(() => f.cleanup())
+  const timer = f.timers.create({
+    ownerId: 'repo-DSH', createdBy: 'user:l1', message: 'Daily follow-up',
+    schedule: { frequency: 'daily', time: '00:01' },
+  })
+  assert.deepEqual(timer.schedule, { frequency: 'daily', time: '00:01', timeZone: 'Asia/Shanghai' })
+  assert.equal(timer.fireAt, '2026-11-15T16:01:00.000Z')
+  assert.equal(timer.occurrenceId, '1')
+  assert.equal(timer.remainingMs, 120_000)
+  assert.deepEqual(f.timers.get(timer.id), timer)
+})
+
+test('weekly downtime catches up only the latest Shanghai occurrence', async t => {
+  const before = fixture({ startAt: Date.parse('2026-11-15T15:59:00Z') })
+  t.after(() => before.cleanup())
+  const timer = before.timers.create({
+    ownerId: 'repo-DSH', createdBy: 'user:l1', message: 'Weekly follow-up',
+    schedule: { frequency: 'weekly', weekday: 1, time: '00:10' },
+  })
+  assert.equal(timer.fireAt, '2026-11-15T16:10:00.000Z')
+  before.closeOnly()
+
+  const f = fixture({ dir: before.stateDir, startAt: Date.parse('2026-12-08T00:00:00Z') })
+  t.after(() => f.closeOnly())
+  await Promise.all([f.timers.tick(), f.timers.tick(), f.timers.tick()])
+  await f.timers.tick()
+  assert.deepEqual(f.calls.map(call => call.source), [{
+    kind: 'timer', timerId: timer.id, occurrenceId: '4', fireAt: '2026-12-06T16:10:00.000Z', late: true,
+  }])
+  assert.equal(f.calls[0].triggerRef, `timer:${timer.id}:4`)
+  assert.equal(f.timers.get(timer.id).status, 'pending')
+  assert.equal(f.timers.get(timer.id).fireAt, '2026-12-13T16:10:00.000Z')
+  assert.equal(f.timers.get(timer.id).occurrenceId, '5')
+
+  f.setNow(Date.parse('2026-12-13T16:10:00Z'))
+  await f.timers.tick()
+  assert.equal(f.calls.length, 2)
+  assert.equal(f.calls[1].triggerRef, `timer:${timer.id}:5`)
+  assert.equal(f.calls[1].source.late, false)
+  assert.equal(f.timers.get(timer.id).fireAt, '2026-12-20T16:10:00.000Z')
+})
+
+test('a single recurring slot missed during short downtime fires once and is late', async t => {
+  const before = fixture()
+  t.after(() => before.cleanup())
+  const timer = before.timers.create({
+    ownerId: 'repo-DSH', createdBy: 'user:l1', message: 'Daily follow-up',
+    schedule: { frequency: 'daily', time: '08:01' },
+  })
+  before.closeOnly()
+  const reopened = fixture({ dir: before.stateDir, startAt: Date.parse('2026-11-15T00:01:05Z') })
+  t.after(() => reopened.closeOnly())
+  await reopened.timers.tick()
+  await reopened.timers.tick()
+  assert.deepEqual(reopened.calls.map(call => call.source), [{
+    kind: 'timer', timerId: timer.id, occurrenceId: '1', fireAt: '2026-11-15T00:01:00.000Z', late: true,
+  }])
+  assert.equal(reopened.timers.get(timer.id).fireAt, '2026-11-16T00:01:00.000Z')
+})
+
+test('a later occurrence preserves an earlier queued receipt across restart', async t => {
+  const f = fixture({ route: async (_request, count) => ({ ticketId: `tsk-${count}`, stage: 'queued', admitted: false }) })
+  t.after(() => f.cleanup())
+  const timer = f.timers.create({
+    ownerId: 'repo-DSH', createdBy: 'user:l1', message: 'Daily follow-up',
+    schedule: { frequency: 'daily', time: '08:01' },
+  })
+  f.setNow(Date.parse('2026-11-15T00:01:00Z'))
+  await f.timers.tick()
+  const first = f.calls[0].triggerRef
+  assert.equal(f.timers.canDeliver(timer.id, first), true)
+
+  f.setNow(Date.parse('2026-11-16T00:01:00Z'))
+  await f.timers.tick()
+  const second = f.calls[1].triggerRef
+  assert.notEqual(first, second)
+  assert.equal(f.timers.get(timer.id).delivery.ticketId, 'tsk-2')
+  assert.equal(f.timers.canDeliver(timer.id, first), true)
+  f.closeOnly()
+
+  const reopened = fixture({ dir: f.stateDir, startAt: f.now() })
+  t.after(() => reopened.closeOnly())
+  assert.equal(reopened.timers.deliveryState(timer.id, first), 'ready')
+  assert.equal(reopened.timers.deliveryState(timer.id, second), 'ready')
+  assert.equal(reopened.timers.deliveryState(timer.id, `timer:${timer.id}:3`), 'closed')
+  assert.equal(reopened.timers.get(timer.id).fireAt, '2026-11-17T00:01:00.000Z')
+  await reopened.timers.tick()
+  assert.equal(reopened.calls.length, 0)
+})
+
+test('cancelling a recurring timer after host admission keeps the sent receipt and stops later wakes', async t => {
+  const f = fixture()
+  t.after(() => f.cleanup())
+  const timer = f.timers.create({
+    ownerId: 'repo-DSH', createdBy: 'user:l1', message: 'Daily follow-up',
+    schedule: { frequency: 'daily', time: '08:01' },
+  })
+  f.setNow(Date.parse('2026-11-15T00:01:00Z'))
+  await f.timers.tick()
+  const receipt = f.timers.get(timer.id).delivery
+  assert.equal(receipt.state, 'sent')
+
+  const result = f.timers.cancel(timer.id)
+  assert.equal(result.changed, true)
+  assert.equal(result.timer.status, 'cancelled')
+  assert.deepEqual(result.timer.delivery, receipt)
+  assert.equal(f.timers.deliveryState(timer.id, receipt.triggerRef), 'closed')
+  f.setNow(Date.parse('2026-11-20T00:01:00Z'))
+  await f.timers.tick()
+  assert.equal(f.calls.length, 1)
+  assert.equal(f.timers.cancel(timer.id).changed, false)
+})
+
+test('pausing suspends queued recurring work and resume catches up only the latest day', async t => {
+  const f = fixture({ route: async (_request, count) => ({ ticketId: `tsk-${count}`, stage: 'queued', admitted: false }) })
+  t.after(() => f.cleanup())
+  const timer = f.timers.create({
+    ownerId: 'repo-DSH', createdBy: 'user:l1', message: 'Daily follow-up',
+    schedule: { frequency: 'daily', time: '08:01' },
+  })
+  f.setNow(Date.parse('2026-11-15T00:01:00Z'))
+  await f.timers.tick()
+  const first = f.calls[0].triggerRef
+  assert.equal(f.timers.pause(timer.id).timer.fireAt, '2026-11-16T00:01:00.000Z')
+  assert.equal(f.timers.deliveryState(timer.id, first), 'paused')
+  assert.equal(f.timers.canDeliver(timer.id, first), false)
+  f.setNow(Date.parse('2026-11-18T00:01:30Z'))
+  await f.timers.tick()
+  assert.equal(f.calls.length, 1)
+
+  assert.equal(f.timers.resume(timer.id).changed, true)
+  assert.equal(f.timers.deliveryState(timer.id, first), 'ready')
+  await f.timers.tick()
+  assert.equal(f.calls.length, 2)
+  assert.deepEqual(f.calls[1].source, {
+    kind: 'timer', timerId: timer.id, occurrenceId: '4', fireAt: '2026-11-18T00:01:00.000Z', late: true,
+  })
+  assert.equal(f.timers.get(timer.id).fireAt, '2026-11-19T00:01:00.000Z')
+  const second = f.calls[1].triggerRef
+  assert.equal(f.timers.deliveryState(timer.id, first), 'ready')
+  assert.equal(f.timers.deliveryState(timer.id, second), 'ready')
+
+  const cancelled = f.timers.cancel(timer.id)
+  assert.equal(cancelled.changed, true)
+  assert.equal(cancelled.timer.delivery.state, 'cancelled')
+  assert.equal(f.timers.deliveryState(timer.id, first), 'closed')
+  assert.equal(f.timers.deliveryState(timer.id, second), 'closed')
+})
+
+test('weekly creation defaults to the Shanghai weekday and validates the timing inputs', t => {
+  // This is Monday in Shanghai. Creation at the scheduled instant chooses next Monday.
+  const f = fixture({ startAt: Date.parse('2026-11-15T16:10:00Z') })
+  t.after(() => f.cleanup())
+  const request = { ownerId: 'repo-DSH', createdBy: 'user:l1', message: 'Weekly follow-up' }
+  const schedule = { frequency: 'weekly', time: '00:10' }
+  const timer = f.timers.create({ ...request, schedule })
+  assert.deepEqual(timer.schedule, { ...schedule, timeZone: 'Asia/Shanghai', weekday: 1 })
+  assert.equal(timer.fireAt, '2026-11-22T16:10:00.000Z')
+  const bad = (timing, code) => assert.throws(() => f.timers.create({ ...request, ...timing }),
+    error => error instanceof TimerError && error.code === code)
+  bad({}, 'fire-at-required')
+  bad({ fireAt: '2026-11-17T00:00:00Z', schedule }, 'timer-schedule-conflict')
+  bad({ schedule: { ...schedule, timeZone: 'UTC' } }, 'timer-schedule-invalid')
+  bad({ schedule: null }, 'timer-schedule-invalid')
+  bad({ schedule: { ...schedule, frequency: 'monthly' } }, 'timer-schedule-frequency')
+  bad({ schedule: { ...schedule, time: '24:00' } }, 'timer-schedule-time')
+  bad({ schedule: { ...schedule, time: '8:00' } }, 'timer-schedule-time')
+  bad({ schedule: { ...schedule, weekday: 0 } }, 'timer-schedule-weekday')
+  bad({ schedule: { ...schedule, weekday: '1' } }, 'timer-schedule-weekday')
+  bad({ schedule: { ...schedule, frequency: 'daily', weekday: 1 } }, 'timer-schedule-weekday')
+  assert.equal(f.timers.list().length, 1)
+})
+
+test('a recurring retry keeps its original occurrence and Feishu authorization across downtime', async t => {
+  const before = fixture({ route: async () => { throw new Error('temporarily unavailable') } })
+  t.after(() => before.cleanup())
+  const origin = { kind: 'feishu', triggerId: 'trg-original', chatId: 'oc-original', actor: 'ou-sender' }
+  const authorization = { actor: 'ou-sender', source: 'feishu', at: '2026-11-15T07:55:00+08:00', addressing: 'mention' }
+  const timer = before.timers.create({
+    ownerId: 'repo-DSH', createdBy: 'user:l1', message: 'Daily follow-up', origin, authorization,
+    schedule: { frequency: 'daily', time: '08:01' },
+  })
+  before.setNow(Date.parse('2026-11-15T00:01:00Z'))
+  assert.equal((await before.timers.tick()).retried, 1)
+  const initial = before.calls[0]
+  assert.equal(initial.triggerRef, `timer:${timer.id}:1`)
+  assert.equal(initial.source.late, false)
+  before.closeOnly()
+
+  const f = fixture({ dir: before.stateDir, startAt: Date.parse('2026-11-20T00:01:15Z') })
+  t.after(() => f.closeOnly())
+  assert.equal(f.timers.get(timer.id).createdBy, 'user:l1')
+  await f.timers.tick()
+  assert.deepEqual(f.calls[0], initial)
+  await f.timers.tick()
+  await f.timers.tick()
+  assert.equal(f.calls.length, 2)
+  assert.deepEqual(f.calls[1].source, {
+    kind: 'timer', timerId: timer.id, occurrenceId: '6', fireAt: '2026-11-20T00:01:00.000Z', late: true, origin,
+  })
+  assert.deepEqual(f.calls[1].authorization, authorization)
+  assert.equal(f.timers.get(timer.id).fireAt, '2026-11-21T00:01:00.000Z')
+})
+
+test('a crash after host admission settles the original occurrence before catching up', async t => {
+  const f = fixture({ route: async ({ source, triggerRef }) => {
+    const ticket = {
+      id: 'tsk-sent-before-stop', triggerId: triggerRef, stage: 'working',
+      background: { kind: 'timer', timerId: source.timerId },
+      workerSession: { sessionId: 'session-worker', cwd: '/tmp/repo-DSH' },
+      lastDelivery: { state: 'sent', at: '2026-11-15T00:01:00.000Z' },
+    }
+    f.store.db.prepare('INSERT INTO ticket (id, value) VALUES (?, ?)').run(ticket.id, JSON.stringify(ticket))
+    f.closeOnly()
+    return { ticketId: ticket.id, stage: ticket.stage, admitted: true }
+  } })
+  t.after(() => f.cleanup())
+  const timer = f.timers.create({
+    ownerId: 'repo-DSH', createdBy: 'user:l1', message: 'Daily follow-up',
+    schedule: { frequency: 'daily', time: '08:01' },
+  })
+  f.setNow(Date.parse('2026-11-15T00:01:00Z'))
+  await f.timers.tick()
+  const first = f.calls[0].triggerRef
+
+  const reopened = fixture({ dir: f.stateDir, startAt: Date.parse('2026-11-18T00:02:00Z') })
+  t.after(() => reopened.closeOnly())
+  assert.equal(reopened.timers.deliveryState(timer.id, first), 'closed')
+  await reopened.timers.tick()
+  assert.equal(reopened.calls.length, 0)
+  const recovered = reopened.timers.get(timer.id)
+  assert.equal(recovered.delivery.ticketId, 'tsk-sent-before-stop')
+  assert.equal(recovered.delivery.triggerRef, first)
+  assert.equal(recovered.delivery.state, 'sent')
+  assert.equal(recovered.delivery.workerSession.sessionId, 'session-worker')
+  assert.equal(recovered.fireAt, '2026-11-16T00:01:00.000Z')
+
+  await reopened.timers.tick()
+  await reopened.timers.tick()
+  assert.deepEqual(reopened.calls.map(call => call.triggerRef), [`timer:${timer.id}:4`])
+  assert.equal(reopened.calls[0].source.fireAt, '2026-11-18T00:01:00.000Z')
+  assert.equal(reopened.timers.get(timer.id).fireAt, '2026-11-19T00:01:00.000Z')
+})
+
+test('recurring cancellation during admission preserves a host receipt returned afterward', async t => {
+  const entered = Promise.withResolvers()
+  const release = Promise.withResolvers()
+  const f = fixture({ route: async request => {
+    entered.resolve(request)
+    await release.promise
+    return { ticketId: 'tsk-host-admitted', stage: 'working', admitted: true }
+  } })
+  t.after(() => f.cleanup())
+  const timer = f.timers.create({
+    ownerId: 'repo-DSH', createdBy: 'user:l1', message: 'Daily follow-up',
+    schedule: { frequency: 'daily', time: '08:01' },
+  })
+  f.setNow(Date.parse('2026-11-15T00:01:00Z'))
+  const pulse = f.timers.tick()
+  try {
+    const { triggerRef } = await entered.promise
+    assert.equal(f.timers.deliveryState(timer.id, triggerRef), 'ready')
+    assert.equal(f.timers.cancel(timer.id).changed, true)
+    assert.equal(f.timers.deliveryState(timer.id, triggerRef), 'closed')
+  } finally {
+    release.resolve()
+    await pulse
+  }
+  const saved = f.timers.get(timer.id)
+  assert.equal(saved.status, 'cancelled')
+  assert.equal(saved.delivery.state, 'sent')
+  assert.equal(saved.delivery.ticketId, 'tsk-host-admitted')
+  f.setNow(Date.parse('2026-11-17T00:01:00Z'))
+  await f.timers.tick()
+  assert.equal(f.calls.length, 1)
+})
+
+test('a later permanent scheduling error leaves an older Router receipt eligible', async t => {
+  const f = fixture({ route: async (_request, count) => {
+    if (count === 2) throw Object.assign(new Error('later route refused'), { permanent: true })
+    return { ticketId: 'tsk-queued', stage: 'queued', admitted: false }
+  } })
+  t.after(() => f.cleanup())
+  const timer = f.timers.create({
+    ownerId: 'repo-DSH', createdBy: 'user:l1', message: 'Daily follow-up',
+    schedule: { frequency: 'daily', time: '08:01' },
+  })
+  f.setNow(Date.parse('2026-11-15T00:01:00Z'))
+  await f.timers.tick()
+  f.setNow(Date.parse('2026-11-16T00:01:00Z'))
+  await f.timers.tick()
+  assert.equal(f.timers.get(timer.id).status, 'failed')
+  assert.equal(f.timers.deliveryState(timer.id, f.calls[1].triggerRef), 'closed')
+  assert.equal(f.timers.deliveryState(timer.id, f.calls[0].triggerRef), 'ready')
+})
+
+test('a terminal failed Router receipt advances a recurring timer to its next occurrence', async t => {
+  const f = fixture({ route: async (_request, count) => count === 1
+    ? { ticketId: 'tsk-failed', stage: 'failed', admitted: false }
+    : { ticketId: 'tsk-sent', stage: 'working', admitted: true },
+  })
+  t.after(() => f.cleanup())
+  const timer = f.timers.create({
+    ownerId: 'repo-DSH', createdBy: 'user:l1', message: 'Daily follow-up',
+    schedule: { frequency: 'daily', time: '08:01' },
+  })
+  f.setNow(Date.parse('2026-11-15T00:01:00Z'))
+  await f.timers.tick()
+  assert.equal(f.timers.get(timer.id).delivery.state, 'failed')
+  assert.equal(f.timers.get(timer.id).fireAt, '2026-11-16T00:01:00.000Z')
+  f.setNow(Date.parse('2026-11-16T00:01:00Z'))
+  await f.timers.tick()
+  assert.equal(f.calls.length, 2)
+  assert.equal(f.timers.get(timer.id).delivery.state, 'sent')
+})
 
 test('create stores the schedule, the owner and the creator as separate identities', t => {
   const f = fixture()
@@ -534,7 +853,7 @@ test('a queued timer occurrence records its ticket without claiming Session deli
   assert.equal(f.calls.length, 1)
 })
 
-test('only the current persisted occurrence may deliver the initial prompt', async t => {
+test('only the persisted one-shot occurrence may deliver the initial prompt', async t => {
   const entered = Promise.withResolvers()
   const release = Promise.withResolvers()
   const workerSession = { sessionId: 'session-worker', cwd: '/tmp/repo-DSH' }

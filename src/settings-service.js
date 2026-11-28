@@ -147,6 +147,23 @@ export class HubBotSettingsService extends TypertRemoteService {
     return detail
   }
 
+  async listRuns(filters) {
+    try {
+      return await this.deps.listRuns(filters ?? {})
+    } catch (error) {
+      if (error?.status === 400 || error?.statusCode === 400) throw new RemoteError('runs/invalid', error.message, {})
+      throw error
+    }
+  }
+
+  async runDetail(request) {
+    const id = request?.id
+    if (typeof id !== 'string' || !id.trim()) throw new RemoteError('runs/invalid', 'A run ID is required.', {})
+    const run = await this.deps.runDetail(id)
+    if (!run) throw new RemoteError('runs/not-found', 'This background run is no longer available.', {})
+    return run
+  }
+
   async timerAction(request) {
     try {
       return await this.deps.timerAction(request ?? {})
@@ -193,6 +210,8 @@ markRemote(HubBotSettingsService, 'discardOutbox', {})
 markRemote(HubBotSettingsService, 'selfTest', {})
 markRemote(HubBotSettingsService, 'overview', {})
 markRemote(HubBotSettingsService, 'messageDetail', {})
+markRemote(HubBotSettingsService, 'listRuns', {})
+markRemote(HubBotSettingsService, 'runDetail', {})
 markRemote(HubBotSettingsService, 'timerAction', {})
 markRemote(HubBotSettingsService, 'resolveTicket', {})
 markRemote(HubBotSettingsService, 'startFeishuRegister', {})

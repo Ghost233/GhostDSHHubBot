@@ -23,6 +23,8 @@ import { truncateWords } from './discipline.js'
 import { buildDigestText, buildAutoSummary, factLine } from './reporting.js'
 import { isWithinCwd } from './paths.js'
 import { confirmTicketFork } from './fork.js'
+import { buildOwnerFacts, formatOwnerFacts } from './owner-facts.js'
+import { RunAudit, SILENCE_REASONS } from './runs.js'
 import { DANGEROUS_INJECT_ACTION, DEFAULT_DANGEROUS_PATTERNS, findDangerousPattern, dangerousConfirmText } from './security.js'
 
 /** A routing failure with a machine-readable code for tool/API surfaces. */
@@ -70,6 +72,7 @@ export class Router {
     this.ids = ids ?? { uuid: () => randomUUID() }
     // The lifecycle guard lives in TaskBoard (#66); Router drives tickets through it, never around it.
     this.tasks = tasks ?? new TaskBoard({ store, now: this.now })
+    this.runs = new RunAudit({ store, now: this.now })
     // 回收触发段 (#70): optional terminal-ticket callback (Recycler.maybeRecycleForTicket). Assigned by the
     // plugin root after construction; invoked after every router-initiated done/failed transition. Terminal
     // transitions that bypass the Router (owner-tools report-failure, channel 终止) are the Recycler sweep's job.
@@ -135,7 +138,7 @@ export class Router {
     }
     if (row.kind !== 'inject' || !ticket?.background || row.requestId !== ticket.requestId) return false
     if (['idle', 'working'].includes(ticket.stage) && ticket.lastDelivery?.state !== 'sent') {
-      this.tasks.fail({ ticketId: ticket.id, reason })
+      this.#enqueueBackgroundReport(this.tasks.fail({ ticketId: ticket.id, reason }))
     }
     return true
   }
@@ -214,11 +217,12 @@ export class Router {
         const command = '/hub-answer ' + request.requestId
         const commands = action ? '通过 ' + command + ' approve\n拒绝 ' + command + ' reject' : command + ' answer <回复>'
         const details = ['截止 ' + request.expiresAt, request.target?.sessionId && '目标会话 ' + request.target.sessionId].filter(Boolean)
-        insertOutbox(this.store, {
+        const notification = insertOutbox(this.store, {
           id: 'out-question-' + request.requestId, ticketId, triggerId: source.triggerId, kind: 'reply', state: 'recorded',
           to: 'feishu:chat:' + source.chatId, requestId: 'hub-bot-question-' + request.requestId,
           body: [question, ...details, commands].join('\n'),
         }, () => Date.parse(this.now()))
+        if (this.#ensureRun(ticket)) this.runs.linkOutbox(ticket.id, notification.id)
       }
       return this.tasks.getTicket(ticketId)
     })
@@ -359,9 +363,7 @@ export class Router {
     } else {
       const owner = this.registry.get(request.ownerId)
       if (!owner || owner.recycled) throw permanent('The original owner is no longer available.')
-      const ensured = await (owner.role === 'chief' ? this.#ensureChiefSession() : this.#ensureSession(owner))
-      const sessionId = this.registry.get(owner.id)?.sessionId ?? ensured.sessionId
-      const delivered = await this.#promptOwner(owner.id, { sessionId }, ticket.id, row.requestId, text(), current)
+      const delivered = await this.#promptOwner(owner.id, ticket.id, row.requestId, text(), current)
       if (!delivered) return skipped()
     }
     if (this.store.closed) return
@@ -484,7 +486,7 @@ export class Router {
       catch { /* Keep the configured deployment model if selection is unavailable. */ }
     }
     const text = sources.map(feishuPrompt).join('\n\n')
-    await this.#promptOwner('chief', ensured, null, row.requestId, text)
+    await this.#promptOwner('chief', null, row.requestId, text)
     if (this.store.closed) return
     this.#persistWork(() => {
       const at = this.now()
@@ -695,34 +697,49 @@ export class Router {
 
   /** The chief's own Session (L1 统一出口): digests and replies are admitted here. */
   #ensureChiefSession() {
-    return this.#serialized('chief-session', async () => {
-      const chief = this.registry.get('chief')
-      if (!chief) throw new RouterError('chief-missing', 'the chief owner row is missing from the registry')
-      return await this.#ensureSession(chief)
-    })
+    const chief = this.registry.get('chief')
+    if (!chief) throw new RouterError('chief-missing', 'the chief owner row is missing from the registry')
+    return this.#ensureSession(chief)
   }
 
   /** Lazily binds an owner Session: create only when the registry names none. */
-  async #ensureSession(owner) {
-    if (owner.sessionId) {
-      // 归档自愈 (round 51): 已绑定会话被归档 → DSH gate 拒跑（turn blocked 无报错）。发现即解，失败只告警。
-      if (this.placer) await this.placer.ensureUnarchived(owner.sessionId, owner.id)
-      return { owner, sessionId: owner.sessionId, created: false }
-    }
-    // GUI 工作区 (#52): 出生即归位——create({ workspaceId }) 是唯一让会话进工作区的路径（cwd 自动 =
-    // 工作区 path：owner 仓库工作区 path 本就等于 owner.cwd；chief 专属工作区落在 homeRepo/.hub-bot/chief）。
-    // placer 不可用或失败 → null → 回退 cwd 创建，主链路不受展示层影响。
-    const ws = this.placer
-      ? await (owner.role === 'chief' ? this.placer.chiefWorkspace() : this.placer.ownerWorkspace(owner))
-      : null
-    const preset = owner.role === 'chief' ? 'hub-bot-router' : 'hub-bot-owner'
-    const created = await this.sessions.create(ws
-      ? { workspaceId: ws.workspaceId, agentPreset: preset }
-      : { cwd: owner.cwd, agentPreset: preset })
-    const sessionId = created.sessionId ?? created.session?.id
-    if (!sessionId) throw new RouterError('session-create-empty', 'owner Session creation returned no sessionId')
-    const bound = this.registry.bindSession(owner.id, sessionId)
-    return { owner: bound, sessionId, created: true }
+  #ensureSession(owner) {
+    return this.#serialized('owner-binding:' + owner.id, async () => {
+      const current = () => {
+        const latest = this.registry.get(owner.id)
+        if (!latest || latest.recycled) throw new RouterError('owner-unavailable', 'The registered owner is unavailable.')
+        return latest
+      }
+      const boundSession = async latest => {
+        await this.placer?.ensureUnarchived(latest.sessionId, latest.id)
+        return { owner: latest, sessionId: latest.sessionId, created: false }
+      }
+      let latest = current()
+      if (latest.sessionId) return boundSession(latest)
+      const ws = await (latest.role === 'chief' ? this.placer?.chiefWorkspace() : this.placer?.ownerWorkspace(latest))
+      latest = current()
+      if (latest.sessionId) return boundSession(latest)
+      const agentPreset = latest.role === 'chief' ? 'hub-bot-router' : 'hub-bot-owner'
+      const key = 'owner-bootstrap/' + latest.id
+      const plan = this.store.get(key)
+      const created = await this.sessions.create({
+        ...(ws ? { workspaceId: ws.workspaceId } : { cwd: latest.cwd }), agentPreset,
+        ...(plan && { sessionId: plan.sessionId }),
+      })
+      latest = current()
+      if (latest.sessionId) return boundSession(latest)
+      const sessionId = created.sessionId ?? created.session?.id
+      if (!sessionId) throw new RouterError('session-create-empty', 'owner Session creation returned no sessionId')
+      if (plan && created.agentPreset && created.agentPreset !== agentPreset) {
+        throw new RouterError('owner-preset-invalid', 'The replacement must use the registered owner role.')
+      }
+      const bound = this.#persistWork(() => {
+        const next = this.registry.bindSession(latest.id, sessionId)
+        if (plan) this.store.set(key, { ...plan, sessionId })
+        return next
+      })
+      return { owner: bound, sessionId, created: true }
+    })
   }
 
   /**
@@ -854,6 +871,7 @@ export class Router {
         ...(background && { background }),
         ...(existing?.kind === 'feishu' && { routedMessage: instruction }),
       })
+      if (background) this.#ensureRun(this.tasks.getTicket(freshTicketId), trigger)
       if (this.#holdDangerous(freshTicketId, instruction, 'route')) return true
       const text = '[hub-bot 路由 ' + freshTicketId + '] ' + instruction + '\n\n授权：' + auth.actor + ' 经 ' + auth.source + ' 于 ' + auth.at + '；任务 ' + freshTicketId
       this.runner.enqueue({
@@ -921,7 +939,16 @@ export class Router {
           .filter(t => t.stage === 'queued')
           .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
         for (const ticket of queued) {
-          if (working >= this.#slotsPerOwner()) break
+          if (!ticket.lastDelivery && ticket.background?.kind === 'timer') {
+            const state = this.#timerState(ticket)
+            if (state === 'paused') continue
+            if (state === 'closed') {
+              this.#skipTimerDelivery(ticket)
+              this.runner.releaseHeld({ ticketId: ticket.id })
+              continue
+            }
+          }
+          if (working >= this.#slotsPerOwner()) continue
           try {
             this.tasks.promote(ticket.id)
           } catch { continue } // the ticket raced to another stage meanwhile — leave it to that path
@@ -1123,18 +1150,12 @@ export class Router {
     if (ticket.background && (row.kind === 'background-recovery' || row.requestId === ticket.requestId)) {
       return this.#serialized('background-admission:' + owner.id, () => this.#deliverBackground(row, owner))
     }
-    const ensured = await this.#ensureSession(owner)
-    // S01： #ensureSession 是异步的（可能真的新建了一个 Session）。等它回来时票可能已经结案 —— 以库里
-    // 当前的票面为准再判一次，结案就安静跳过：不注入、不抛错、不改票面。
-    const latest = this.tasks.getTicket(ticket.id)
-    if (latest === undefined) throw permanent('outbox ' + row.id + ': ticket ' + row.ticketId + ' is gone')
-    if (this.#isTerminalTicket(latest)) return { recorded: true, skipped: 'ticket-terminal' }
     // 重启恢复 (same discipline as follow-ups): a row stored BEFORE a crash carries no recovery note in its
     // body — prepend it at redelivery time, and clear the flag only after the prompt actually lands (a
     // failed attempt keeps the flag so the next retry still carries the note — 恰好一次 = delivered once).
-    const needsNote = latest.recoveryPending === true
+    const needsNote = ticket.recoveryPending === true
     const body = needsNote ? RECOVERY_NOTE + '\n\n' + row.body : row.body
-    const delivered = await this.#promptOwner(owner.id, ensured, ticket.id, row.requestId, body)
+    const delivered = await this.#promptOwner(owner.id, ticket.id, row.requestId, body)
     if (!delivered) return { recorded: true, skipped: 'ticket-terminal' }
     // The host admitted the prompt even if the ticket closed while admission was pending.
     const settled = this.tasks.getTicket(ticket.id)
@@ -1205,9 +1226,18 @@ export class Router {
     return sessionId
   }
 
-  #timerMayDeliver(ticket) {
-    return ticket.background.kind !== 'timer' || !this.timerCanDeliver
-      || this.timerCanDeliver(ticket.background.timerId, ticket.triggerId)
+  #timerState(ticket) {
+    return this.timerDeliveryState?.(ticket.background.timerId, ticket.triggerId)
+  }
+
+  #deferTimerDelivery(ticket, recovering) {
+    if (recovering || ticket.background.kind !== 'timer') return null
+    const state = this.#timerState(ticket)
+    if (state === 'paused') {
+      if (ticket.stage === 'working') this.tasks.demote(ticket.id)
+      return { postponeMs: 1000 }
+    }
+    return state === 'closed' ? this.#skipTimerDelivery(ticket) : null
   }
 
   #skipTimerDelivery(ticket) {
@@ -1221,7 +1251,9 @@ export class Router {
 
   #backgroundDeliveryTicket(ticketId, recovering) {
     const ticket = this.tasks.getTicket(ticketId)
-    if (!ticket?.authorization || !['idle', 'working'].includes(ticket.stage)) return undefined
+    if (!ticket?.authorization) return undefined
+    if (ticket.stage === 'queued' && !recovering && ticket.background?.kind === 'timer' && !ticket.lastDelivery) return ticket
+    if (!['idle', 'working'].includes(ticket.stage)) return undefined
     if (recovering && (ticket.stage !== 'working' || !ticket.recoveryPending)) return undefined
     return ticket
   }
@@ -1233,8 +1265,9 @@ export class Router {
     let ticket = currentTicket()
     if (!ticket) return inactive
     if (!recovering && ticket.lastDelivery?.state === 'sent') return
-    if (!recovering && !this.#timerMayDeliver(ticket)) return this.#skipTimerDelivery(ticket)
-    if (ticket.stage === 'idle' && this.#workingCount(owner.id) >= this.#slotsPerOwner()) {
+    let deferred = this.#deferTimerDelivery(ticket, recovering)
+    if (deferred) return deferred
+    if (ticket.stage === 'queued' || (ticket.stage === 'idle' && this.#workingCount(owner.id) >= this.#slotsPerOwner())) {
       return { postponeMs: 1000 }
     }
     const timer = ticket.background.kind === 'timer'
@@ -1253,11 +1286,12 @@ export class Router {
     let sessionId = await this.#bindBackgroundWorker(ticket, owner, worker, recovering)
     const bound = currentTicket()
     if (!sessionId || !bound || bound.workerSession?.sessionId !== sessionId) return inactive
-    if (!recovering && !this.#timerMayDeliver(bound)) return this.#skipTimerDelivery(bound)
+    deferred = this.#deferTimerDelivery(bound, recovering)
+    if (deferred) return deferred
     const source = this.getTrigger(ticket.triggerId)?.source
     const timing = timer ? '[跟进提醒] ' + source?.fireAt + (source?.late === true ? ' · 已迟到' : '') + '\n' : ''
     const recovery = bound.recoveryPending ? RECOVERY_NOTE + '\n\n' : ''
-    const text = recovery + timing + row.body + '\n完成后调用 report_background，传入 ticketId=' + ticket.id + ' 及结果摘要或失败原因。需要用户输入时调用 ask_user，传入同一个 ticketId。'
+    const text = recovery + timing + row.body + '\n完成后调用 report_background，传入 ticketId=' + ticket.id + ' 及结果摘要或失败原因。没有新信息时可以用 silenceReason="no-change" 静默结束。需要用户输入时调用 ask_user，传入同一个 ticketId。'
     let rebuilt = false
     try {
       await this.sessions.prompt({ sessionId, requestId: row.requestId, text })
@@ -1266,12 +1300,14 @@ export class Router {
       const latest = currentTicket()
       if (!latest) return inactive
       if (recovering || !timer) throw Object.assign(error, { permanent: true })
-      if (!recovering && !this.#timerMayDeliver(latest)) return this.#skipTimerDelivery(latest)
+      deferred = this.#deferTimerDelivery(latest, recovering)
+      if (deferred) return deferred
       const { proposedSessionId, ...background } = latest.background
       sessionId = await this.#bindBackgroundWorker({ ...latest, background }, owner, undefined, recovering)
       const rebound = currentTicket()
       if (!sessionId || !rebound || rebound.workerSession?.sessionId !== sessionId) return inactive
-      if (!recovering && !this.#timerMayDeliver(rebound)) return this.#skipTimerDelivery(rebound)
+      deferred = this.#deferTimerDelivery(rebound, recovering)
+      if (deferred) return deferred
       await this.sessions.prompt({ sessionId, requestId: row.requestId, text })
       rebuilt = true
     }
@@ -1316,16 +1352,33 @@ export class Router {
     return this.#workerHasActiveTask(sessionId, (ticket, id) => this.#canReportBackground(ticket, id))
   }
 
-  async reportBackground({ ticketId, sessionId, summary, failure, evidence }) {
+  #ensureRun(ticket, trigger = ticket?.background ? this.getTrigger(ticket.triggerId) : undefined) {
+    if (ticket?.background && trigger?.source?.kind === ticket.background.kind) {
+      return this.runs.ensure({
+        ticketId: ticket.id, triggerRef: trigger.id, ownerId: ticket.owner, source: trigger.source, at: ticket.createdAt,
+      })
+    }
+    return undefined
+  }
+
+  async reportBackground({ ticketId, sessionId, summary, failure, evidence, silenceReason }) {
     const ticket = this.tasks.getTicket(ticketId)
     if (!this.#canReportBackground(ticket, sessionId)) {
       throw new RouterError('background-worker-mismatch', 'Only the bound worker may report for this active task')
     }
-    if ((summary === undefined) === (failure === undefined)) {
-      throw new RouterError('background-report-invalid', 'Provide exactly one of summary and failure')
+    const count = [summary, failure, silenceReason].filter(value => value !== undefined).length
+    const invalidReason = silenceReason !== undefined && (typeof silenceReason !== 'string' || !Object.hasOwn(SILENCE_REASONS, silenceReason))
+    if (count !== 1 || invalidReason) {
+      throw new RouterError('background-report-invalid', 'Provide one summary, failure, or recognized silence reason')
     }
     return this.#persistWork(() => {
       this.tasks.markDelivered(ticketId)
+      if (silenceReason !== undefined) {
+        if (!this.#ensureRun(ticket)) throw new RouterError('background-source-missing', 'The original background source is unavailable.')
+        const saved = this.tasks.finishBackgroundCheck(ticketId)
+        this.runs.recordSilent(ticketId, silenceReason)
+        return { ticketId, stage: saved.stage }
+      }
       const saved = failure === undefined ? this.tasks.report({ ticketId, summary, evidence }) : this.tasks.fail({ ticketId, reason: failure })
       this.#enqueueBackgroundReport(saved)
       return { ticketId, stage: saved.stage }
@@ -1333,50 +1386,97 @@ export class Router {
   }
 
   #enqueueBackgroundReport(ticket) {
-    this.runner.enqueue({
+    const report = this.runner.enqueue({
       kind: 'background-report', ticketId: ticket.id, triggerId: ticket.triggerId, to: 'owner:' + ticket.owner,
       body: '[hub-bot 后台结果] ' + factLine(ticket), requestId: 'hub-bot-background-result-' + ticket.id + '-' + this.ids.uuid(),
     })
+    const trigger = this.getTrigger(ticket.triggerId)
+    if (!this.#ensureRun(ticket, trigger)) return
+    const kind = ticket.stage === 'failed' ? 'failure' : ticket.stage === 'blocked' ? 'blocked' : 'result'
+    this.runs.recordResult(ticket.id, { kind, reportId: report.id })
+    this.#queueBackgroundNotification(ticket, trigger, kind)
+  }
+
+  #queueBackgroundNotification(ticket, trigger, kind) {
+    const source = trigger.source
+    let to, triggerId = trigger.id
+    if (source.kind === 'github' && typeof source.repo === 'string' && /^[a-z0-9_-]+[/][a-z0-9_.-]+$/i.test(source.repo)
+      && Number.isSafeInteger(source.issueNumber) && source.issueNumber > 0) {
+      to = 'github:' + source.repo + ':' + source.issueNumber
+    } else if (source.kind === 'timer' && this.#hasOriginalTimerAuthorization(source, ticket.authorization)) {
+      to = 'feishu:chat:' + source.origin.chatId
+      triggerId = source.origin.triggerId
+    }
+    if (!to) return
+    const status = { result: '有结果待验收', failure: '执行失败', blocked: '需要介入' }[kind]
+    const row = insertOutbox(this.store, {
+      ticketId: ticket.id, triggerId, kind: 'reply', state: 'recorded', to,
+      body: '后台任务 ' + ticket.id + ' ' + status + '。在 Hub Bot 运行记录中可查看详情。',
+      requestId: 'hub-bot-run-notice-' + this.ids.uuid(),
+    }, () => Date.parse(this.now()))
+    this.runs.linkOutbox(ticket.id, row.id)
   }
 
   async #deliverBackgroundReport(row) {
     const ticket = this.tasks.getTicket(row.ticketId)
     const owner = ticket && this.registry.get(ticket.owner)
     if (!owner || owner.recycled) return { recorded: true, skipped: 'owner-unavailable' }
-    const ensured = await (owner.role === 'chief' ? this.#ensureChiefSession() : this.#ensureSession(owner))
-    const sessionId = this.registry.get(owner.id)?.sessionId ?? ensured.sessionId
-    await this.#promptOwner(owner.id, { sessionId }, null, row.requestId, row.body)
+    await this.#promptOwner(owner.id, null, row.requestId, row.body)
   }
 
   /** Admit a prompt, retrying a missing binding only while the originating ticket is active. */
-  async #promptOwner(ownerId, ensured, ticketId, requestId, text, isCurrent) {
-    const sessionId = ensured.sessionId
-    const ticketClosed = () => {
-      if (isCurrent && !isCurrent()) return true
-      if (ticketId === null) return false
-      const latest = this.tasks.getTicket(ticketId)
-      return !latest || this.#isTerminalTicket(latest)
-    }
-    if (ticketClosed()) return null
-    try {
-      await this.sessions.prompt({ sessionId, requestId, text })
-      return { sessionId, rebuilt: false }
-    } catch (error) {
+  #promptOwner(ownerId, ticketId, requestId, text, isCurrent) {
+    return this.#serialized('owner-prompt:' + ownerId, async () => {
+      const ticketClosed = () => {
+        if (this.store.closed || (isCurrent && !isCurrent())) return true
+        if (ticketId === null) return false
+        const latest = this.tasks.getTicket(ticketId)
+        return !latest || this.#isTerminalTicket(latest)
+      }
+      const send = async sessionId => {
+        const key = 'owner-bootstrap/' + ownerId
+        const plan = this.store.get(key)
+        const initializing = plan?.sessionId === sessionId
+        const facts = initializing ? formatOwnerFacts(buildOwnerFacts({
+          store: this.store, ownerId, isArchived: id => this.sessions.isArchived?.(id) === true,
+        })) : ''
+        const message = facts ? facts + '\n\n' + text : text
+        const result = await this.sessions.prompt({ sessionId, requestId, text: message })
+        if (result?.accepted === false) throw new RouterError('owner-not-admitted', 'The owner Session did not accept the prompt.')
+        if (initializing && !this.store.closed && this.store.get(key)?.sessionId === sessionId) {
+          this.store.db.prepare('DELETE FROM kv WHERE key = ?').run(key)
+        }
+        return { sessionId, rebuilt: initializing }
+      }
       if (ticketClosed()) return null
-      if (!isMissingSession(error)) throw error
-    }
-    const current = this.registry.get(ownerId)
-    if (!current) throw new RouterError('unknown-owner', 'owner ' + ownerId + ' is no longer registered')
-    if (current.sessionId === sessionId) this.registry.markSessionMissing(ownerId)
-    const replacement = await (ownerId === 'chief' ? this.#ensureChiefSession() : this.#ensureSession(this.registry.get(ownerId)))
-    if (ticketClosed()) return null
-    try {
-      await this.sessions.prompt({ sessionId: replacement.sessionId, requestId, text })
-      return { sessionId: replacement.sessionId, rebuilt: replacement.sessionId !== sessionId }
-    } catch (error) {
+      let owner = this.registry.get(ownerId)
+      if (!owner || owner.recycled) throw new RouterError('owner-unavailable', 'The registered owner is unavailable.')
+      const ensured = await this.#ensureSession(owner)
+      const sessionId = this.registry.get(ownerId)?.sessionId ?? ensured.sessionId
       if (ticketClosed()) return null
-      throw error
-    }
+      try {
+        return await send(sessionId)
+      } catch (error) {
+        if (ticketClosed()) return null
+        if (!isMissingSession(error) && error?.code !== 'session/not-found') throw error
+      }
+      owner = this.#persistWork(() => {
+        const current = this.registry.get(ownerId)
+        if (!current || current.recycled) throw new RouterError('owner-unavailable', 'The registered owner is unavailable.')
+        if (current.sessionId !== sessionId) return current
+        this.store.set('owner-bootstrap/' + ownerId, { sessionId: 'session-' + this.ids.uuid(), missingSessionId: sessionId })
+        return this.registry.markSessionMissing(ownerId)
+      })
+      const replacement = await this.#ensureSession(owner)
+      if (ticketClosed()) return null
+      try {
+        const receipt = await send(replacement.sessionId)
+        return { ...receipt, rebuilt: replacement.sessionId !== sessionId }
+      } catch (error) {
+        if (ticketClosed()) return null
+        throw error
+      }
+    })
   }
 
   /**
@@ -1395,8 +1495,7 @@ export class Router {
     if (sessionId && this.sessions.isRunning && await this.sessions.isRunning(sessionId)) {
       return { postponeMs: 2000 } // the wake is still running — keep coalescing
     }
-    const ensured = await this.#ensureChiefSession()
-    await this.#promptOwner('chief', ensured, null, row.requestId, buildDigestText(row))
+    await this.#promptOwner('chief', null, row.requestId, buildDigestText(row))
   }
 
   /**
@@ -1405,8 +1504,7 @@ export class Router {
    */
   async #deliverReply(row) {
     if (row.to === 'dsh:session:chief') {
-      const ensured = await this.#ensureChiefSession()
-      await this.#promptOwner('chief', ensured, null, row.requestId, row.body)
+      await this.#promptOwner('chief', null, row.requestId, row.body)
       return
     }
     if (typeof row.to === 'string' && row.to.startsWith('session:')) {
