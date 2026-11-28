@@ -400,6 +400,46 @@ test('an archived timer worker answer settles from its exact Host receipt after 
   }
 })
 
+test('a timer worker retry checks its saved receipt before metadata and carries a fresh restart note', async t => {
+  for (const [label, admitted] of [['metadata unavailable after admission', true], ['verified absent before retry', false]]) {
+    await t.test(label, async () => {
+      const env = handoffFixture()
+      const { router, store, sessions, prompts, advance } = env
+      let delivering
+      try {
+        const { ticketId, requestId, sessionId } = await openOneShotTimerQuestion(env)
+        const promptId = 'hub-bot-answer-' + requestId
+        await router.resolveDeferred({ ticketId, requestId, decision: 'answer', text: 'Use the fixture manifest.', channel: 'panel' })
+        const promptNormally = sessions.prompt
+        delivering = pauseAnswerReceipt(env, promptId, admitted)
+        await delivering.entered
+        store.close()
+        sessions.prompt = promptNormally
+        if (admitted) sessions.workerInfo = async () => { throw new Error('Host worker metadata unavailable') }
+        const restarted = env.open()
+        await restarted.router.markRestart()
+        delivering.release()
+        await delivering.done
+        for (const waitMs of [0, 2000, 4000]) {
+          advance(waitMs)
+          await restarted.router.tick()
+        }
+        const delivery = restarted.deferred.get(requestId).outcome.delivery
+        assert.equal(delivery.state, 'sent')
+        assert.equal(delivery.sessionId, sessionId)
+        const received = prompts.filter(input => input.requestId === promptId)
+        assert.equal(received.length, 1)
+        assert.equal(received[0].text.includes(RECOVERY_NOTE), !admitted)
+        assert.equal(Boolean(restarted.router.getTicket(ticketId).recoveryPending), admitted)
+      } finally {
+        delivering?.release()
+        await delivering?.done
+        env.cleanup()
+      }
+    })
+  }
+})
+
 test('a deduplicated timer worker answer keeps the restart recovery note pending', async () => {
   const env = handoffFixture()
   const { router, store, prompts } = env

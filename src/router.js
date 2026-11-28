@@ -450,12 +450,20 @@ export class Router {
     const text = (carriesRecoveryNote) => (carriesRecoveryNote ? RECOVERY_NOTE + '\n\n' : '') + row.body
     const admit = (sessionId, send) => this.#admitDeferredPrompt(request, row.requestId, sessionId, send)
     const worker = request?.receiver?.kind === 'worker'
+    const attempted = request?.outcome?.delivery?.attemptedSessionId
+    const checkWorkerReceipt = worker && attempted === request.receiver.sessionId && typeof this.sessions.hasPromptReceipt === 'function'
     let delivered
+    if (checkWorkerReceipt) {
+      delivered = (await this.#reconcileDeferredPrompt(attempted, row.requestId)) ?? undefined
+      if (this.store.closed) return inactive
+    }
     let unavailable
-    if (ticket && worker) {
+    if (!delivered && ticket && worker) {
       const sessionId = request.receiver.sessionId
       const available = await this.#canReceiveWorkerAnswer(ticket, sessionId)
       if (available && current()) {
+        // A verified absence means this send, including any recovery note, is a new admission.
+        if (checkWorkerReceipt) this.deferred.noteAnswerDeliveryAttempt(requestId, null)
         try {
           delivered = await admit(sessionId, async () => {
             const carriesRecoveryNote = current()?.recoveryPending === true
@@ -468,7 +476,7 @@ export class Router {
         }
       }
       if (delivered === undefined) unavailable = 'The original execution session is no longer available.'
-    } else if (ticket) {
+    } else if (!delivered && ticket) {
       const owner = this.registry.get(request.ownerId)
       if (!owner || owner.recycled) unavailable = 'The original owner is no longer available.'
       else {
@@ -481,8 +489,7 @@ export class Router {
     if (!delivered) {
       // A ticket may advance or its original worker may disappear after admission. Reconcile historical
       // evidence before recording failure, and never prompt from this recovery path.
-      const attempted = request?.outcome?.delivery?.attemptedSessionId
-      if (attempted && (!worker || attempted === request.receiver.sessionId)) {
+      if (attempted && !checkWorkerReceipt && (!worker || attempted === request.receiver.sessionId)) {
         delivered = await this.#reconcileDeferredPrompt(attempted, row.requestId)
       }
       if (!delivered && unavailable && current()) throw Object.assign(new Error(unavailable), { permanent: true })
@@ -622,7 +629,7 @@ export class Router {
   }
 
   #requireFeishuHandoff(trigger) {
-    if (trigger.policy?.chatType !== 'p2p') throw new RouterError('handoff-private-chat-required', '请在与 Bot 的私聊中处理交接摘要。')
+    if (trigger.policy?.privateChat !== true) throw new RouterError('handoff-private-chat-required', '请在与 Bot 的私聊中处理交接摘要。')
     if (!this.handoffSummaries) throw new RouterError('handoff-summary-unavailable', '交接摘要暂不可用。')
   }
 

@@ -249,8 +249,10 @@ test('authenticated handoff summary previews the exact source and carries only t
     async page(request) {
       pages.push(request)
       return { hasMore: true, records: [
-        { event: { type: 'user/message', seq: 33, data: { content: [{ type: 'text', text: '旧讨论：选择验收范围' }] } } },
-        { event: { type: 'system/message', seq: 34, data: { message: { content: [{ type: 'text', text: '不应出现在草稿的系统文本' }] } } } },
+        { event: { type: 'user/message', seq: 33, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '旧讨论：选择验收范围' }] } } },
+        { event: { type: 'user/message', seq: 34, data: { source: { kind: 'skill-invocation', name: 'fixture', form: 'instructions' },
+          content: [{ type: 'text', text: '不应出现在草稿的内部技能文本' }] } } },
+        { event: { type: 'system/message', seq: 32, data: { message: { content: [{ type: 'text', text: '不应出现在草稿的系统文本' }] } } } },
         { event: { type: 'assistant/message', seq: 35, data: { message: { content: [{ type: 'text', text: '此前讨论了两个方案' }, { type: 'tool-call', arguments: '不应出现在草稿的工具参数' }] } } } },
       ] }
     },
@@ -289,7 +291,7 @@ test('authenticated handoff summary previews the exact source and carries only t
   assert.equal(draft.sourceThroughSeq, 35)
   assert.match(draft.text, /#33.*选择验收范围/)
   assert.match(draft.text, /#35.*此前讨论了两个方案/)
-  assert.doesNotMatch(draft.text, /系统文本|工具参数/)
+  assert.doesNotMatch(draft.text, /系统文本|工具参数|内部技能文本/)
   assert.deepEqual(pages, [{ address: { kind: 'session', sessionId: oldSession }, maxMessages: 16 }])
   const reference = value => ({ draftId: value.draftId, revision: value.revision })
   const replace = { action: 'request', mode: 'wait', ...source }
@@ -334,7 +336,7 @@ test('Feishu private-chat summary is idempotent, editable and usable only by its
     async page(input) {
       calls.read.push(input.address.sessionId)
       return { hasMore: false, records: [{ event: { type: 'user/message', seq: 22,
-        data: { content: [{ type: 'text', text: '原私聊摘要来源' + '续'.repeat(75) }] } } }] }
+        data: { source: { kind: 'user' }, content: [{ type: 'text', text: '原私聊摘要来源' + '续'.repeat(75) }] } } }] }
     },
   })
   root.provide('sessionPersistence', { async flush() {} })
@@ -358,10 +360,10 @@ test('Feishu private-chat summary is idempotent, editable and usable only by its
     assert.equal(status, 200, path)
     return payload
   }
-  async function receive(messageId, text, { sender = actor, chat = chatId } = {}) {
+  async function receive(messageId, text, { sender = actor, chat = chatId, chatType = 'p2p' } = {}) {
     const result = await post('feishu/simulate', {
       sender: { sender_type: 'user', sender_id: { open_id: sender } },
-      message: { message_id: messageId, chat_id: chat, chat_type: 'p2p', message_type: 'text', content: JSON.stringify({ text }) },
+      message: { message_id: messageId, chat_id: chat, chat_type: chatType, message_type: 'text', content: JSON.stringify({ text }) },
     })
     await post('deliver', {})
     const receipt = hub.router.listOutbox().find(row => row.id === 'out-owner-switch-control-feishu-' + messageId)
@@ -370,6 +372,9 @@ test('Feishu private-chat summary is idempotent, editable and usable only by its
     return { result, body: receipt.body }
   }
   const generate = '/hub-switch summary ' + owner.id
+  const unknownChat = await receive('om_fixture_summary_chat_type', generate, { chatType: 'unknown' })
+  assert.match(unknownChat.body, /私聊/)
+  assert.equal(calls.read.length, 0)
   const initial = await receive('om_fixture_summary_generate', generate)
   const draftId = initial.body.match(/summary-[a-f0-9-]+/)?.[0]
   assert.ok(draftId && initial.body.includes('原私聊摘要来源') && initial.body.includes('1/2'))

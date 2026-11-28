@@ -319,6 +319,7 @@ export function apply(ctx, rawConfig) {
         if (Number.isSafeInteger(event.seq) && event.seq >= 0) throughSeq = Math.max(throughSeq ?? 0, event.seq)
         if (!['user/message', 'assistant/message'].includes(event.type)) continue
         const message = event.data?.message ?? event.data
+        if (event.type === 'user/message' && message?.source?.kind !== 'user') continue
         const parts = Array.isArray(message?.content) ? message.content : []
         const text = parts.filter(part => part?.type === 'text' && typeof part.text === 'string')
           .slice(0, 3).map(part => part.text.slice(0, 320)).join(' ').replace(/\s+/gu, ' ').trim()

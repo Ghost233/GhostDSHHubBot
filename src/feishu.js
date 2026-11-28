@@ -402,7 +402,7 @@ export class FeishuSource {
     // 无 mention → 谁也没 @；有 mention 却认不出是哪个 bot（botOpenId 未配置或都不匹配）→ 'unknown-bot-id'。
     const mentionReason = addressing !== null ? null : (mentions.length > 0 ? 'unknown-bot-id' : 'no-mention')
     return {
-      messageId: message.message_id, chatId: message.chat_id, chatType,
+      messageId: message.message_id, chatId: message.chat_id, chatType, privateChat: message.chat_type === 'p2p',
       openId, senderType: sender.sender_type, msgType: message.message_type, text, addressing, mentionReason,
     }
   }
@@ -437,7 +437,7 @@ export class FeishuSource {
     const trigger = {
       id: triggerId, kind: 'feishu', message: msg.text ?? '(non-text ' + msg.msgType + ')', at,
       source: { kind: 'feishu', chatId: msg.chatId, messageId: msg.messageId, openId: msg.openId, addressing: msg.addressing ?? 'none' },
-      policy: { addressing: msg.addressing ?? 'none', chatType: msg.chatType, msgType: msg.msgType, allowed: dropReason === null, reason: dropReason },
+      policy: { addressing: msg.addressing ?? 'none', chatType: msg.chatType, privateChat: msg.privateChat, msgType: msg.msgType, allowed: dropReason === null, reason: dropReason },
     }
     if (dropReason === null) {
       trigger.authorization = { actor: msg.openId, source: 'feishu', addressing: msg.addressing, messageId: msg.messageId, at }
