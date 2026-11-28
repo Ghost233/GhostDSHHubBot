@@ -17,7 +17,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { TaskBoard, STAGE_TEXT, normalizeStage, translateTaskError, CONFIRM_TIMEOUT_MS } from './tasks.js'
-import { OutboxRunner, insertOutbox } from './outbox.js'
+import { OutboxRunner, insertOutbox, updateOutboxRow } from './outbox.js'
 import { feishuPrompt, UNSUPPORTED_MESSAGE_TYPE } from './inbox.js'
 import { truncateWords } from './discipline.js'
 import { buildDigestText, buildAutoSummary, factLine } from './reporting.js'
@@ -59,7 +59,7 @@ export class Router {
   // Owner queues protect execution slots. Trigger queues prevent duplicate tickets across owners.
   #queues = new Map()
   #currentStops = new Map()
-  #panelDecisions = new Map()
+  #applyingPanelDecisions = new Map()
 
   constructor({ store, registry, sessions, tasks, runner, config, now, ids, onSystemProblem, placer }) {
     this.store = store
@@ -237,29 +237,57 @@ export class Router {
     if (channel !== 'panel' && !(channel === 'feishu' && this.#isOriginalFeishuSender(request, actor, chatId))) {
       throw new RouterError('deferred-actor-mismatch', 'The original sender must answer in the original Feishu chat, or use the authenticated panel.')
     }
-    const trackReceipt = channel === 'panel' && this.#isTimelyDecision(request, decision, text, receipt, Date.parse(receipt))
-    if (trackReceipt) this.#panelDecisions.set(requestId, (this.#panelDecisions.get(requestId) ?? 0) + 1)
-    try {
-      return await this.#serialized('owner:' + request.ownerId, async () => {
-        const ticket = this.tasks.getTicket(request.ticketId)
-        if (!ticket?.authorization || ticket.deferred?.requestId !== requestId) {
-          throw new RouterError('stale-deferred', 'This request is no longer the active decision for its task.')
-        }
-        const workerUnavailable = decision === 'answer' && request.status === 'pending' && request.receiver.kind === 'worker'
-          && !await this.#canReceiveWorkerAnswer(ticket, request.receiver.sessionId)
-        const result = await this.deferred.resolve({
-          requestId, decision, text, actor: { actor: request.requester.actor }, workerUnavailable, receivedAt: receipt,
-        })
-        return { ticketId: ticket.id, requestId, stage: this.tasks.getTicket(ticket.id).stage,
-          outcome: result.status, duplicate: result.duplicate }
-      })
-    } finally {
-      if (trackReceipt) {
-        const count = this.#panelDecisions.get(requestId)
-        if (count === 1) this.#panelDecisions.delete(requestId)
-        else this.#panelDecisions.set(requestId, count - 1)
-      }
+    if (channel === 'panel' && this.#isTimelyDecision(request, decision, text, receipt, Date.parse(receipt))) {
+      const row = insertOutbox(this.store, {
+        kind: 'deferred-decision', state: 'queued', to: 'owner:' + request.ownerId,
+        requestId: 'hub-bot-panel-decision-' + this.ids.uuid(),
+        panelDecision: { requestId, ticketId: request.ticketId, decision, text: text ?? null, receivedAt: receipt },
+      }, () => Date.parse(receipt))
+      return this.#applyPanelDecision(row)
     }
+    return this.#applyDeferredDecision(request, { decision, text, receivedAt: receipt })
+  }
+
+  #applyDeferredDecision(request, { decision, text, receivedAt }) {
+    return this.#serialized('owner:' + request.ownerId, async () => {
+      if (this.store.closed) throw new Error('Hub Bot stopped while processing this decision.')
+      const { requestId } = request
+      const ticket = this.tasks.getTicket(request.ticketId)
+      if (!ticket?.authorization || ticket.deferred?.requestId !== requestId) {
+        throw new RouterError('stale-deferred', 'This request is no longer the active decision for its task.')
+      }
+      const workerUnavailable = decision === 'answer' && this.deferred.get(requestId)?.status === 'pending' && request.receiver.kind === 'worker'
+        && !await this.#canReceiveWorkerAnswer(ticket, request.receiver.sessionId)
+      if (this.store.closed) throw new Error('Hub Bot stopped while processing this decision.')
+      const result = await this.deferred.resolve({ requestId, decision, text, actor: { actor: request.requester.actor }, workerUnavailable, receivedAt })
+      return { ticketId: ticket.id, requestId, stage: this.tasks.getTicket(ticket.id).stage, outcome: result.status, duplicate: result.duplicate }
+    })
+  }
+
+  #applyPanelDecision(row) {
+    const active = this.#applyingPanelDecisions.get(row.id)
+    if (active) return active
+    const recorded = reason => {
+      if (this.store.closed) return
+      const current = this.#outboxRow(row.id)
+      if (current?.state === 'queued') updateOutboxRow(this.store, { ...current, state: 'recorded', recordedAt: this.now(),
+        nextRetryAt: null, ...(reason && { skipReason: reason }) })
+    }
+    const running = (async () => {
+      try {
+        const input = row.panelDecision
+        const request = this.deferred?.get(input.requestId)
+        if (!request || request.ticketId !== input.ticketId) throw new RouterError('unknown-deferred', 'This decision has no matching request.')
+        const result = await this.#applyDeferredDecision(request, input)
+        recorded()
+        return result
+      } catch (error) {
+        if (['TaskError', 'RouterError', 'DeferredError'].includes(error?.name)) recorded(error.code)
+        throw error
+      }
+    })().finally(() => this.#applyingPanelDecisions.delete(row.id))
+    this.#applyingPanelDecisions.set(row.id, running)
+    return running
   }
 
   #enqueueDeferredOutcome(request) {
@@ -499,19 +527,27 @@ export class Router {
     if (!(received <= nowMs && received >= Date.parse(request.openedAt) && received < Date.parse(request.expiresAt))) return false
     const ticket = this.tasks.getTicket(request.ticketId)
     if (!ticket?.authorization || ticket.deferred?.requestId !== request.requestId) return false
-    if (request.type === 'answer') return ticket.stage === 'person/answer' && decision === 'answer' && typeof text === 'string' && Boolean(text.trim())
-    return ticket.stage === 'person/confirm' && ['approve', 'reject'].includes(decision)
+    if (request.type === 'answer') return ticket.stage === 'person/answer' && (decision === 'cancel'
+      || (decision === 'answer' && typeof text === 'string' && Boolean(text.trim())))
+    return ticket.stage === 'person/confirm' && ['approve', 'reject', 'cancel'].includes(decision)
   }
 
   #receivedDecisions() {
-    const ids = new Set(this.#panelDecisions.keys())
+    const ids = new Set()
     const nowMs = Date.parse(this.now())
     const rows = this.store.db.prepare(`
       SELECT value FROM outbox
       WHERE json_extract(value, '$.kind') = 'deferred-decision' AND json_extract(value, '$.state') = 'queued'
     `).all()
-    for (const row of rows) {
-      const trigger = this.getTrigger(JSON.parse(String(row.value)).triggerId)
+    for (const { value } of rows) {
+      const row = JSON.parse(String(value))
+      if (row.panelDecision) {
+        const { requestId, ticketId, decision, text, receivedAt } = row.panelDecision
+        const request = this.deferred.get(requestId)
+        if (request?.ticketId === ticketId && this.#isTimelyDecision(request, decision, text, receivedAt, nowMs)) ids.add(requestId)
+        continue
+      }
+      const trigger = this.getTrigger(row.triggerId)
       const choice = trigger?.decision
       if (!choice || !trigger.authorization || trigger.dropped) continue
       const request = this.deferred.get(choice.requestId)
@@ -1039,6 +1075,15 @@ export class Router {
     if (row.kind === 'deferred-answer') return this.#deliverDeferredAnswer(row)
     if (row.kind === 'approved-owner-inject') return this.#deliverApprovedOwner(row)
     if (row.kind === 'deferred-decision') {
+      if (row.panelDecision) {
+        try {
+          await this.#applyPanelDecision(row)
+          return { recorded: true }
+        } catch (error) {
+          if (!['TaskError', 'RouterError', 'DeferredError'].includes(error?.name)) throw error
+          return { recorded: true, skipped: error.code }
+        }
+      }
       const trigger = this.getTrigger(row.triggerId)
       if (!trigger?.authorization || !trigger.decision) return { recorded: true, skipped: 'invalid-decision' }
       let message

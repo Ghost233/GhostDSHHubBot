@@ -116,7 +116,9 @@ test('bootstrap reads only the newest issue or PR and records its number', async
     const wm = JSON.parse(readFileSync(watermarkPath(f.store.stateDir), 'utf8'))
     assert.equal(wm.repos[REPO].maxNumber, 41)
     assert.equal(wm.repos[REPO].initialized, true)
-    assert.deepEqual(f.reads, [['api', issues + '?state=all&sort=created&direction=desc&per_page=1&page=1', '--hostname', 'github.com']])
+    const issueReads = f.reads.filter(args => args[1].startsWith(issues + '?'))
+    assert.deepEqual(issueReads, [['api', issues + '?state=all&sort=created&direction=desc&per_page=1&page=1', '--hostname', 'github.com']])
+    assert.equal(f.reads.filter(args => args[1].startsWith(issues + '/comments?')).length, 1)
   } finally { f.cleanup() }
 })
 
@@ -487,12 +489,39 @@ test('a POST accepted before a lost response is suppressed by poll and recovered
       triggered: 1, ids: ['github:' + REPO + ':issue:42', 'github:' + REPO + ':comment:9002'],
     })
     assert.equal(f.triggers().find(row => row.source?.commentId === 9003).dropped, 'not-allowlisted')
-    assert.equal(f.outbox().find(row => row.id === ack.id).state, 'recorded')
-    f.script[target] = [posted]
-    assert.equal((await reopened.source.deliverReplies()).delivered, 1)
-    assert.equal(f.outbox().find(row => row.id === ack.id).state, 'sent')
+    const settled = f.outbox().find(row => row.id === ack.id)
+    assert.equal(settled.state, 'sent')
+    assert.equal(settled.lastError, null)
+    assert.equal((await reopened.source.deliverReplies()).delivered, 0)
     assert.equal(f.posts.length, 1)
   } finally { reopened?.store.close(); f.cleanup() }
+})
+
+test('polling recognizes every own comment with the same marker and preserves the first receipt', async () => {
+  const issues = 'repos/' + REPO + '/issues'
+  const target = issues + '/42/comments'
+  const f = fixture()
+  try {
+    await f.source.pollWatchedRepo(REPO)
+    const routed = await f.source.handleIssueEvent(issue(), REPO_CFG)
+    const ack = f.outbox().find(row => row.ticketId === routed.ticketId && row.state === 'recorded')
+    let posted
+    f.script['POST ' + target] = args => {
+      posted = comment({ id: 9001, body: args.find(arg => arg.startsWith('body=')).slice('body='.length) })
+      return posted
+    }
+    assert.equal((await f.source.deliverReplies()).delivered, 1)
+    const duplicate = comment({ id: 9002, body: posted.body })
+    const manual = comment({ id: 9003, body: ack.body })
+    f.script[issues + '/comments'] = [posted, duplicate, manual]
+    assert.equal((await f.source.pollWatchedRepo(REPO)).triggered, 1)
+    assert.deepEqual(f.tickets().map(t => t.triggerId), [
+      'github:' + REPO + ':issue:42', 'github:' + REPO + ':comment:9003',
+    ])
+    assert.equal(f.store.get('github:reply-receipt:' + ack.id).commentId, posted.id)
+    assert.equal(f.store.get('github:posted-comment:' + REPO.toLowerCase() + ':' + duplicate.id).commentId, duplicate.id)
+    assert.deepEqual(await f.source.handleCommentEvent({ ...duplicate, body: 'edited' }, REPO_CFG), { skipped: 'self-generated' })
+  } finally { f.cleanup() }
 })
 
 test('a retry finds the exact marker on a later item page after reopening', async () => {
@@ -518,29 +547,68 @@ test('a retry finds the exact marker on a later item page after reopening', asyn
     }
     reopened = f.reopen()
     assert.equal((await reopened.source.deliverReplies()).delivered, 1)
-    assert.equal(f.outbox().find(item => item.id === row.id).state, 'sent')
+    const settled = f.outbox().find(item => item.id === row.id)
+    assert.equal(settled.state, 'sent')
+    assert.equal(settled.lastError, null)
     assert.equal(f.posts.length, 1)
     assert.equal(f.reads.filter(args => args[1].startsWith(target + '?')).length, 2)
     assert.deepEqual(await reopened.source.handleCommentEvent({ ...posted, body: 'edited' }, REPO_CFG), { skipped: 'self-generated' })
   } finally { reopened?.store.close(); f.cleanup() }
 })
 
-test('a complete empty lookup allows a retry by the original posting account with the same marker', async () => {
+test('repeated empty and failed lookups leave an ambiguous reply retryable without posting again', async () => {
   const target = 'repos/' + REPO + '/issues/42/comments'
   const f = fixture()
+  let reopened
   try {
-    const { insertOutbox } = await import('../src/outbox.js')
-    insertOutbox(f.store, { kind: 'reply', to: 'github:' + REPO + ':42', body: 'status', state: 'recorded' })
-    f.script['POST ' + target] = new Error('synthetic unavailable before write')
+    const { insertOutbox, retryOutboxRows } = await import('../src/outbox.js')
+    const row = insertOutbox(f.store, { kind: 'reply', to: 'github:' + REPO + ':42', body: 'status', state: 'recorded' })
+    const readRow = () => f.outbox().find(item => item.id === row.id)
+    let posted
+    f.script['POST ' + target] = args => {
+      posted = comment({ id: 9001, body: args.find(arg => arg.startsWith('body=')).slice('body='.length) })
+      throw new Error('synthetic timeout after remote accepted POST')
+    }
     assert.equal((await f.source.deliverReplies()).delivered, 0)
-    f.script.user = { login: 'changed-posting-account' }
-    assert.equal((await f.source.deliverReplies()).delivered, 0)
+    f.script['POST ' + target] = { id: 9002 }
+    reopened = f.reopen()
+    for (const response of [[], new Error('synthetic unavailable lookup'), [], new Error('synthetic unavailable lookup again')]) {
+      f.script[target] = response
+      assert.equal((await reopened.source.deliverReplies()).delivered, 0)
+      assert.equal(f.posts.length, 1)
+      assert.match(readRow().lastError, /outcome unknown/i)
+    }
+    assert.equal(readRow().state, 'failed')
+    assert.equal(readRow().originState, 'recorded')
+    f.script[target] = [posted]
+    assert.equal(retryOutboxRows(reopened.store, [row.id]), 1)
+    assert.equal((await reopened.source.deliverReplies()).delivered, 1)
+    assert.equal(readRow().state, 'sent')
     assert.equal(f.posts.length, 1)
-    f.script.user = { login: 'Ghost233' }
-    f.script['POST ' + target] = { id: 9001 }
-    assert.equal((await f.source.deliverReplies()).delivered, 1)
-    assert.equal(f.posts.length, 2)
-    assert.equal(f.posts[0].find(arg => arg.startsWith('body=')), f.posts[1].find(arg => arg.startsWith('body=')))
+  } finally { reopened?.store.close(); f.cleanup() }
+})
+
+test('polling settles a failed ambiguous reply when its marker becomes visible', async () => {
+  const issues = 'repos/' + REPO + '/issues'
+  const target = issues + '/42/comments'
+  const f = fixture()
+  try {
+    await f.source.pollWatchedRepo(REPO)
+    const routed = await f.source.handleIssueEvent(issue(), REPO_CFG)
+    const readAck = () => f.outbox().find(row => row.ticketId === routed.ticketId && row.kind === 'reply')
+    let posted
+    f.script['POST ' + target] = args => {
+      posted = comment({ id: 9001, body: args.find(arg => arg.startsWith('body=')).slice('body='.length) })
+      throw new Error('synthetic lost response')
+    }
+    for (let i = 0; i < 5; i++) assert.equal((await f.source.deliverReplies()).delivered, 0)
+    assert.equal(readAck().state, 'failed')
+    assert.equal(f.posts.length, 1)
+    f.script[issues + '/comments'] = [posted]
+    assert.equal((await f.source.pollWatchedRepo(REPO)).triggered, 0)
+    assert.equal(readAck().state, 'sent')
+    assert.equal(readAck().lastError, null)
+    assert.equal(f.posts.length, 1)
   } finally { f.cleanup() }
 })
 
@@ -702,7 +770,7 @@ test('issue pagination crosses number gaps, deduplicates overlap and stops at th
     const issueReads = f.reads.filter(args => args[1].startsWith(issues + '?'))
     assert.deepEqual(issueReads.map(args => new URLSearchParams(args[1].split('?')[1]).get('page')), ['1', '1', '2'])
     const commentReads = f.reads.filter(args => args[1].startsWith(issues + '/comments?'))
-    assert.deepEqual(commentReads.map(args => args.slice(2)), [['--hostname', 'github.com']])
+    assert.deepEqual(commentReads.map(args => args.slice(2)), [['--hostname', 'github.com'], ['--hostname', 'github.com']])
     assert.equal((await f.source.status()).repos[REPO].maxCommentId, 5002)
     assert.equal((await f.source.status()).repos[REPO].maxNumber, 250)
   } finally { f.cleanup() }
@@ -762,6 +830,64 @@ test('a partial comment-page fetch keeps the old checkpoint and a reopened poll 
     assert.deepEqual(f.tickets().map(row => row.triggerId), [
       'github:' + REPO + ':comment:5001', 'github:' + REPO + ':comment:5002',
     ])
+  } finally { reopened?.store.close(); f.cleanup() }
+})
+
+test('a deletion between comment pages exposes a moved boundary and a fresh poll recovers the skipped comment', async () => {
+  const comments = 'repos/' + REPO + '/issues/comments'
+  const f = fixture()
+  let reopened
+  try {
+    await f.source.pollWatchedRepo(REPO)
+    const checkpoint = () => readFileSync(watermarkPath(f.store.stateDir), 'utf8')
+    const before = checkpoint()
+    f.setNow('2026-11-15T02:00:00.000Z')
+    const createdAt = '2026-11-15T01:05:00Z'
+    const records = Array.from({ length: 32 }, (_, i) => comment({ id: 5001 + i, createdAt, login: 'stranger' }))
+    records[30] = comment({ id: 5031, createdAt, body: '@hub-bot recover the skipped comment' })
+    let deleted = false
+    f.script[comments] = args => {
+      const query = new URLSearchParams(args[1].split('?')[1])
+      const page = Number(query.get('page'))
+      const size = Number(query.get('per_page'))
+      if (page === 2 && !deleted) { records.shift(); deleted = true }
+      return records.slice((page - 1) * size, page * size)
+    }
+    await assert.rejects(f.source.pollWatchedRepo(REPO), /comment page boundary changed/i)
+    assert.equal(checkpoint(), before)
+    assert.equal(f.calls.prompt.length, 0)
+    assert.match((await f.source.status()).repos[REPO].lastError, /comment page boundary changed/i)
+    reopened = f.reopen()
+    assert.equal((await reopened.source.pollWatchedRepo(REPO)).triggered, 1)
+    assert.deepEqual(f.tickets().map(t => t.triggerId), ['github:' + REPO + ':comment:5031'])
+    assert.equal((await reopened.source.status()).repos[REPO].maxCommentId, 5032)
+  } finally { reopened?.store.close(); f.cleanup() }
+})
+
+test('bootstrap skips observed comments and admits a new comment in the same GitHub second', async () => {
+  const comments = 'repos/' + REPO + '/issues/comments'
+  const f = fixture()
+  let reopened
+  try {
+    f.setNow('2026-11-15T00:00:00.800Z')
+    const historical = comment({ id: 5001, body: '@hub-bot already present at startup' })
+    const earlier = comment({ id: 4999, body: '@hub-bot older backlog', createdAt: '2026-11-14T23:59:58Z' })
+    let records = [earlier, historical]
+    f.script[comments] = args => {
+      const since = new URLSearchParams(args[1].split('?')[1]).get('since')
+      return records.filter(item => Date.parse(item.updated_at) > Date.parse(since))
+    }
+    assert.equal((await f.source.pollWatchedRepo(REPO)).triggered, 0)
+    assert.equal(f.tickets().length, 0)
+    const newcomer = comment({ id: 5002, body: '@hub-bot arrived after the bootstrap' })
+    records = [...records, newcomer]
+    f.setNow('2026-11-15T00:00:01.200Z')
+    reopened = f.reopen()
+    assert.equal((await reopened.source.pollWatchedRepo(REPO)).triggered, 1)
+    assert.deepEqual(f.tickets().map(item => item.triggerId), ['github:' + REPO + ':comment:5002'])
+    records = [{ ...historical, updated_at: '2026-11-15T00:00:02Z' }, newcomer]
+    f.setNow('2026-11-15T00:00:03Z')
+    assert.equal((await reopened.source.pollWatchedRepo(REPO)).triggered, 0)
   } finally { reopened?.store.close(); f.cleanup() }
 })
 
@@ -831,6 +957,7 @@ test('manual and scheduled polling share the active repo cycle', async () => {
   const f = fixture()
   try {
     await f.source.pollAll()
+    f.reads.length = 0
     const entered = Promise.withResolvers()
     const release = Promise.withResolvers()
     const secondResolution = Promise.withResolvers()
@@ -870,14 +997,15 @@ test('manual poll resolves current registry origins, returns null for absent rep
     const initialized = await f.source.pollWatchedRepo(added.repo)
     assert.equal(initialized.initialized, true)
     assert.equal((await f.source.status()).repos[added.repo].ownerId, owner.id)
-    assert.equal(f.reads.length, 1)
+    assert.equal(f.reads.length, 2)
     assert.ok(f.reads[0][1].startsWith('repos/' + added.repo + '/issues?'))
+    assert.ok(f.reads[1][1].startsWith('repos/' + added.repo + '/issues/comments?'))
     f.source.config.enabled = false
     assert.equal((await f.source.pollWatchedRepo(added.repo)).disabled, true)
     f.source.config.enabled = true
     f.registry.markRecycled(owner.id)
     assert.equal(await f.source.pollWatchedRepo(added.repo), null)
-    assert.equal(f.reads.length, 1)
+    assert.equal(f.reads.length, 2)
   } finally { f.cleanup() }
 })
 

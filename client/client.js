@@ -2245,6 +2245,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           }
           function renderTimers() {
             if (!Array.isArray(overview.timers)) return null;
+            var timerActionsStyle = { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '6px 8px' };
             async function act(timer, action) {
               if (action === 'cancel' && !window.confirm(t('timerCancel') + ' — ' + timer.message + '?')) return;
               setTimerBusy(true);
@@ -2270,9 +2271,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                   h('div', { style: settingsHintStyle }, [ownerNames.get(timer.ownerId) || timer.ownerId, time, statusKey ? t(statusKey) : timer.status, deliveryKey ? t(deliveryKey) : null, timer.late ? t('timerLate') : null].filter(Boolean).join(' · ')),
                   timer.lastError?.message || timer.delivery?.lastError
                     ? h('p', { role: 'alert', style: settingsHintStyle }, timer.lastError?.message ?? timer.delivery.lastError) : null,
-                  h('div', { style: wrappingRow }, actions.map(action => h('button', { key: action, type: 'button', style: actionStyle, disabled: timerBusy, onClick: () => void act(timer, action) },
+                  h('div', { style: timerActionsStyle }, actions.map(action => h('button', { key: action, type: 'button', style: settingsButtonStyle, disabled: timerBusy, onClick: () => void act(timer, action) },
                     t(({ pause: 'timerPause', resume: 'timerResume', cancel: 'timerCancel' })[action]))),
-                    timer.delivery?.ticketId ? h('button', { type: 'button', style: actionStyle, onClick: () => openStream({ ticketId: timer.delivery.ticketId }) }, t('timerRun')) : null,
+                    timer.delivery?.ticketId ? h('button', { type: 'button', style: settingsButtonStyle, onClick: () => openStream({ ticketId: timer.delivery.ticketId }) }, t('timerRun')) : null,
                     worker?.sessionId && canOpenOwnerSession ? h('button', { type: 'button', style: actionStyle, onClick: async () => {
                       try { await scoped.get('uiWorkspace').openSession(worker.sessionId); }
                       catch (error) { setTimerError(error?.message ?? String(error)); }

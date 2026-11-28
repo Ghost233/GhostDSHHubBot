@@ -980,6 +980,45 @@ test('an exhausted approval cannot restart the original work at a changed target
   } finally { cleanup() }
 })
 
+test('a timely authenticated panel answer survives a restart during the original worker check', async () => {
+  const { router, registry, store, calls, advance, cleanup } = fixture()
+  let reopened
+  const release = Promise.withResolvers()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Panel restart', cwd: '/repos/fixture' })
+    const install = (target, database) => target.installDeferred(new DeferredRegistry({ store: database, tasks: target.tasks, now: target.now,
+      owners: { currentBinding: id => target.registry.get(id), isOwnerSession: id => target.registry.isOwnerSession(id) }, ttlMs: 1000 }))
+    install(router, store)
+    const { ticketId } = await router.routeToOwner({ ownerId: owner.id, message: 'fixture work' })
+    const worker = 'panel-restart-worker'
+    router.tasks.bindWorkerSession(ticketId, { sessionId: worker, cwd: owner.cwd })
+    router.askWorker({ ticketId, sessionId: worker, question: 'Which fixture?' })
+    const { requestId } = router.getTicket(ticketId).deferred
+    const entered = Promise.withResolvers()
+    router.sessions.workerInfo = async () => { entered.resolve(); return release.promise }
+    advance(900)
+    const receiptAt = router.now()
+    const answer = router.resolveDeferred({ ticketId, requestId, decision: 'answer', text: 'durable panel reply', channel: 'panel' }).catch(error => error)
+    await entered.promise
+    store.close()
+    advance(200)
+    reopened = new Store(store.stateDir)
+    const restarted = new Router({ store: reopened, registry: new OwnerRegistry(reopened, { scratchRoot: join(reopened.stateDir, 'scratch') }), now: router.now,
+      sessions: { ...router.sessions, workerInfo: async () => ({ cwd: owner.cwd }) } })
+    install(restarted, reopened)
+    await restarted.markRestart()
+    await restarted.tick()
+    release.resolve({ cwd: owner.cwd })
+    await answer
+    const decided = restarted.deferred.get(requestId)
+    assert.equal(decided.status, 'answered')
+    assert.equal(decided.receivedAt, receiptAt)
+    assert.equal(decided.outcome.text, 'durable panel reply')
+    assert.equal(decided.outcome.delivery.state, 'sent')
+    assert.deepEqual(calls.prompt.filter(prompt => prompt.requestId === 'hub-bot-answer-' + requestId).map(prompt => prompt.sessionId), [worker])
+  } finally { release.resolve(); reopened?.close(); cleanup() }
+})
+
 test('a pending panel answer keeps the receipt time during host lookup and sweeping', async () => {
   const { router, registry, store, calls, advance, cleanup } = fixture()
   try {
