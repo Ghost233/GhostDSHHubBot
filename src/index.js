@@ -63,10 +63,12 @@ export const Config = z.object({
   }).description('GUI 工作区归位 (#52)：负责人会话出生即落进工作区。'),
   feishu: z.object({
     enabled: z.boolean().description('飞书入口开关。'),
-    appId: z.string().description('飞书应用 App ID（一般用面板绑定流程自动写入，此为人工降级通道）。'),
-    appSecret: z.string().description('飞书应用 App Secret（同上，人工降级通道）。'),
+    // Keep the retired keys recognizable so resolveConfig can give a migration error.
+    appId: z.string().description('已停用。请将飞书应用绑定移入 DSH 宿主凭据库。'),
+    appSecret: z.string().description('已停用。请将飞书应用绑定移入 DSH 宿主凭据库。'),
     botOpenId: z.string().description('机器人自身 open_id（回环防护用，通常自动解析）。'),
-  }).description('飞书渠道（设备流绑定见面板）。'),
+    credentialRef: z.string().description('DSH 凭据记录引用，默认 hub-bot/feishu。'),
+  }).description('飞书渠道（设备流绑定见面板；配置只留引用，不落明文凭据）。'),
   github: z.object({
     enabled: z.boolean().description('GitHub 监听开关（新 Issue/@mention → 自动建票）。'),
     intervalMs: z.number().description('轮询间隔毫秒，最小 30000（30s）。'),
@@ -228,10 +230,15 @@ export function apply(ctx, rawConfig) {
   setHub(hub)
   // 飞书入口 (#68): OFF unless config.feishu.enabled. With credentials present the WSClient long connection
   // starts at boot; the same source scans recorded feishu reply intents on the 1s tick (阶段 2 留的通道).
-  const feishu = new FeishuSource({ store, registry: hub.registry, sessions, config: config.feishu, chiefConfig: config.chief, logger: ctx.logger, placer })
+  const feishu = new FeishuSource({
+    store, registry: hub.registry, sessions, config: config.feishu, chiefConfig: config.chief, logger: ctx.logger, placer,
+    credentials: safeGetService(ctx, 'credentials'),
+  })
   const updateFeishuConnection = () => {
     if (!config.feishu.enabled) { feishu.disconnect(); return }
-    if (feishu.credentialState === 'ok') void feishu.connect().catch(error => ctx.logger.warn('hub-bot feishu connect failed: %s', error?.message ?? error))
+    void feishu.credentialsReady.then(() => {
+      if (config.feishu.enabled && !store.closed && feishu.credentialState === 'ok') return feishu.connect()
+    }).catch(error => ctx.logger.warn('hub-bot feishu connect failed: %s', error?.message ?? error))
   }
   updateFeishuConnection()
   // GitHub 自动处理闭环 (#71): OFF unless config.github.enabled. loginAllowlist 空时经 gh api user 解析为本人；

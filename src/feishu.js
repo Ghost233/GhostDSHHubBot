@@ -3,8 +3,8 @@
  *
  * 扫码一键建应用: register() drives @larksuiteoapi/node-sdk's lark.registerApp() (OAuth 2.0 Device
  * Authorization Grant, RFC 8628): the QR url surfaces via status()/devApi for the panel; once the user
- * confirms on the phone, client_id/client_secret persist to <stateDir>/feishu-credentials.json (mode 0600)
- * and the WSClient long connection starts. The event-subscription MODE (long-connection vs webhook) is a
+ * confirms on the phone, the application binding is saved in DSH credentials before the long connection
+ * starts. The event-subscription MODE (long-connection vs webhook) is a
  * sensitive setting addons cannot carry, so after credentials land the plugin calls the application-config
  * patch OpenAPI once — 未对真实 API 验证: on failure the plugin logs a manual-fallback warning and continues
  * (the WSClient simply receives nothing until the mode is set by hand).
@@ -21,10 +21,8 @@
  * and only then marks them sent. Failures keep the row recorded with feishuAttempts++; five consecutive
  * failures fail the row and report a system problem (same discipline as the OutboxRunner).
  */
-import { writeFileSync, readFileSync, existsSync, chmodSync } from 'node:fs'
-import { join } from 'node:path'
-import { randomUUID } from 'node:crypto'
 import { insertOutbox, deliverRecordedReplies } from './outbox.js'
+import { CredentialsError, MISSING, UNAVAILABLE, createFeishuCredentialsPort } from './feishu-credentials.js'
 
 /** The reply never pretends: this exact sentence answers every non-text message (spec「非文本」). */
 export const UNSUPPORTED_MESSAGE_TYPE = '暂不支持该消息类型'
@@ -46,9 +44,10 @@ export const DECLARED_PERMISSIONS = [
   { key: 'im.message.receive_v1', label: '订阅「收到消息」事件（长连接实时推送，无需轮询）' },
 ]
 
-/** Where the registerApp device flow persists the app credentials (owner-read-only). */
-export function credentialPath(stateDir) {
-  return join(stateDir, 'feishu-credentials.json')
+function feishuErrorText(error, ...secrets) {
+  let text = String(error?.message ?? error)
+  for (const secret of secrets) if (secret) text = text.split(secret).join('[redacted]')
+  return text
 }
 
 /** Consecutive feishu send failures before a recorded intent fails out and reports a system problem. */
@@ -59,10 +58,9 @@ export class FeishuSource {
   /**
    * @param {{ store: import('./store.js').Store, registry: import('./registry.js').OwnerRegistry,
    *   sessions: { create: Function, prompt: Function }, config: object, logger: { info: Function, warn: Function },
-   *   lark?: object, now?: () => string }} deps - lark is the SDK surface ({ registerApp, Client, WSClient,
-   *   EventDispatcher }) or a test fake; when absent, connect()/register() load the real SDK lazily.
+   *   lark?: object, now?: () => string, credentials?: object }} deps - optional Lark SDK and DSH credentials services.
    */
-  constructor({ store, registry, sessions, config, chiefConfig, logger, lark, now, placer }) {
+  constructor({ store, registry, sessions, config, chiefConfig, logger, lark, now, placer, credentials }) {
     this.store = store
     this.registry = registry
     this.sessions = sessions
@@ -82,7 +80,10 @@ export class FeishuSource {
     this.connectionAttempt = null
     this.registrationAttempt = null
     this.registrationError = null
-    this.#reloadCredentials()
+    this.credentials = null
+    this.credentialError = null
+    this.credentialsPort = createFeishuCredentialsPort(credentials, this.config.credentialRef)
+    this.credentialsReady = this.#loadCredentials()
   }
 
   /** Lazily loads the real SDK so the plugin starts (and unit-tests) without the dependency installed. */
@@ -92,48 +93,34 @@ export class FeishuSource {
     return this.lark
   }
 
-  #reloadCredentials() {
-    const file = credentialPath(this.store.stateDir)
-    if (existsSync(file)) {
-      try {
-        const parsed = JSON.parse(readFileSync(file, 'utf8'))
-        if (parsed && typeof parsed.appId === 'string' && typeof parsed.appSecret === 'string') {
-          this.credentials = parsed
-          this.credentialState = 'ok'
-          return
-        }
-      } catch { /* fall through to invalid */ }
-      this.credentials = null
+  async #loadCredentials() {
+    try {
+      this.credentials = (await this.credentialsPort.read()) ?? null
+      this.credentialState = this.credentials ? 'ok' : 'missing'
+    } catch (error) {
       this.credentialState = 'invalid'
-      return
+      this.credentialError = error instanceof CredentialsError ? error.reason : UNAVAILABLE
     }
-    // Manual fallback: config-provided credentials (凭据失效人工降级 — the file written by registerApp wins).
-    if (typeof this.config.appId === 'string' && typeof this.config.appSecret === 'string') {
-      this.credentials = { appId: this.config.appId, appSecret: this.config.appSecret }
-      this.credentialState = 'ok'
-      return
-    }
-    this.credentials = null
-    this.credentialState = 'missing'
   }
 
-  /** Persists credentials owner-read-only (0600) and refreshes the in-memory state. */
-  saveCredentials({ appId, appSecret }) {
-    const file = credentialPath(this.store.stateDir)
-    writeFileSync(file, JSON.stringify({ appId, appSecret, boundAt: this.now() }, null, 2) + '\n', { mode: 0o600 })
-    chmodSync(file, 0o600) // an existing file keeps its wider mode on rewrite without this
-    this.#reloadCredentials()
+  /** Expose a new binding only after the host confirms its persistent record. */
+  async saveCredentials({ appId, appSecret }, signal) {
+    await this.credentialsReady
+    const saved = await this.credentialsPort.write({ appId, appSecret, boundAt: this.now() }, signal)
+    this.credentials = saved
+    this.credentialState = 'ok'
+    this.credentialError = null
     this.client = null
+  }
+
+  #saveWsMetrics() {
+    try { this.store.set('feishu.wsMetrics', this.wsMetrics) } catch { /* 指标丢了不致命 */ }
   }
 
   /**
    * The panel-facing bot-management view: one bot only (唯一总 bot). credentialState drives the three states —
    * missing (预告将创建的 bot + 权限清单 + 二维码), ok (bot 名片 + 连接, 二维码收起), invalid (提示重新扫码).
    */
-  #saveWsMetrics() {
-    try { this.store.set('feishu.wsMetrics', this.wsMetrics) } catch { /* 指标丢了不致命 */ }
-  }
-
   status() {
     const bound = this.credentialState === 'ok' && this.credentials
     const appId = bound ? this.credentials.appId : null
@@ -142,6 +129,11 @@ export class FeishuSource {
     return {
       enabled,
       credentialState: this.credentialState,
+      // 「记录坏了」与「还没有记录」要能分开说清（前者提示重新扫码，后者提示去绑定）——只给稳定标签，
+      // 不带任何密钥，也不带端口抛出的原始报错文本。
+      credentialReason: this.credentialState === 'ok'
+        ? undefined
+        : this.credentialState === 'invalid' ? this.credentialError ?? UNAVAILABLE : MISSING,
       wsState,
       registration: enabled && this.registering ? 'pending' : undefined,
       registrationError: enabled ? this.registrationError ?? undefined : undefined,
@@ -173,7 +165,13 @@ export class FeishuSource {
     this.registrationAttempt = registration
     this.registrationError = null
     this.lastQr = null
+    let previousSecret
+    let issuedSecret
     try {
+      this.credentialsPort.requireService()
+      await this.credentialsReady
+      registration.signal.throwIfAborted()
+      previousSecret = this.credentials?.appSecret
       const lark = await this.#sdk()
       registration.signal.throwIfAborted()
       const result = await lark.registerApp({
@@ -190,8 +188,10 @@ export class FeishuSource {
         },
       })
       registration.signal.throwIfAborted()
+      issuedSecret = result.client_secret
+      await this.saveCredentials({ appId: result.client_id, appSecret: issuedSecret }, registration.signal)
+      registration.signal.throwIfAborted()
       this.#closeSocket()
-      this.saveCredentials({ appId: result.client_id, appSecret: result.client_secret })
       await this.#configureEventMode()
       registration.signal.throwIfAborted()
       await this.connect()
@@ -199,8 +199,9 @@ export class FeishuSource {
       return { appId: result.client_id }
     } catch (error) {
       if (registration.signal.aborted) return { cancelled: true }
-      this.registrationError = String(error?.message ?? error).slice(0, 300)
-      throw error
+      this.registrationError = feishuErrorText(error, previousSecret, issuedSecret).slice(0, 300)
+      if (error instanceof CredentialsError) throw error
+      throw new Error(this.registrationError)
     } finally {
       if (this.registrationAttempt === registration) {
         this.registrationAttempt = null
@@ -225,30 +226,36 @@ export class FeishuSource {
       this.logger.info('hub-bot feishu: event-subscription mode set to long_connection (未对真实 API 验证)')
     } catch (error) {
       // 实测（2026-11-16）: 设备流权限包不含 application:application:patch → 404。手工降级为正式路径。
-      this.logger.warn('hub-bot feishu: event-mode auto-config failed (%s) — 请手工配置（一次性）: open.feishu.cn/app →「DSH 中转 Bot」→ 事件与回调 → 订阅方式 → 使用长连接接收事件/回调', error?.message ?? error)
+      this.logger.warn('hub-bot feishu: event-mode auto-config failed (%s) — 请手工配置（一次性）: open.feishu.cn/app →「DSH 中转 Bot」→ 事件与回调 → 订阅方式 → 使用长连接接收事件/回调', feishuErrorText(error, this.credentials?.appSecret))
     }
   }
 
   /** The authenticated REST client (created once credentials exist). */
   async #client() {
+    await this.credentialsReady
     if (this.client) return this.client
     const lark = await this.#sdk()
     // A pre-built client wins (tests, or a caller that already constructed one) — no credentials needed then.
     const prebuilt = this.config.client ?? lark.client ?? null
     if (prebuilt) { this.client = prebuilt; return this.client }
     if (!this.credentials) throw new Error('hub-bot feishu: no credentials — run register() first')
-    this.client = new lark.Client({ appId: this.credentials.appId, appSecret: this.credentials.appSecret })
+    try {
+      this.client = new lark.Client({ appId: this.credentials.appId, appSecret: this.credentials.appSecret })
+    } catch (error) {
+      throw new Error(feishuErrorText(error, this.credentials.appSecret))
+    }
     return this.client
   }
 
   #recordWsError(error) {
-    const message = String(error?.message ?? error)
+    const message = feishuErrorText(error, this.credentials?.appSecret)
     this.wsState = 'failed'
     this.wsMetrics.lastErrorAt = this.now()
     this.wsMetrics.lastError = message.slice(0, 200)
     this.#saveWsMetrics()
     if (/401|99991663|99991664|invalid.*credential|app.*ticket/i.test(message)) this.credentialState = 'invalid'
     this.logger.warn('hub-bot feishu: ws error: %s', message)
+    return message
   }
 
   /** Starts one long connection. The SDK reports actual readiness through its callbacks. */
@@ -260,9 +267,11 @@ export class FeishuSource {
     this.wsState = 'connecting'
     const current = () => this.connectionAttempt === attempt && this.config.enabled === true
     try {
+      await this.credentialsReady
+      if (!current()) return { started: false, reason: 'superseded' }
+      if (!this.credentials) throw new Error('hub-bot feishu: no credentials — check the DSH credential reference')
       const { WSClient, EventDispatcher } = await this.#sdk()
       if (!current()) return { started: false, reason: 'superseded' }
-      if (!this.credentials) throw new Error('hub-bot feishu: no credentials — run register() first')
       if (typeof WSClient !== 'function' || typeof EventDispatcher !== 'function') {
         throw new Error('hub-bot feishu: the SDK does not provide a long connection client')
       }
@@ -293,8 +302,7 @@ export class FeishuSource {
     } catch (error) {
       if (!current()) return { started: false, reason: 'superseded' }
       this.#closeSocket()
-      this.#recordWsError(error)
-      throw error
+      throw new Error(this.#recordWsError(error))
     }
   }
 
@@ -303,7 +311,7 @@ export class FeishuSource {
     const socket = this.ws
     this.ws = null
     this.wsState = 'off'
-    try { socket?.close?.({ force: true }) } catch (error) { this.logger.warn('hub-bot feishu: could not close socket: %s', error?.message ?? error) }
+    try { socket?.close?.({ force: true }) } catch { this.logger.warn('hub-bot feishu: could not close socket') }
   }
 
   /** Pausing preserves saved credentials and cancels outstanding registration and socket work. */
@@ -445,7 +453,8 @@ export class FeishuSource {
    */
   async deliverReplies() {
     // 双轴审查 P1-2: 通道无关驱动在 outbox.js（顺序扫描/统一 attempts/失败阶梯一处维护）；这里只留通道差异。
-    if (this.config.enabled !== true) return { delivered: 0 }
+    await this.credentialsReady
+    if (this.config.enabled !== true || this.store.closed) return { delivered: 0 }
     const credentials = this.credentials
     const client = await this.#client()
     return deliverRecordedReplies({
@@ -454,11 +463,15 @@ export class FeishuSource {
       canContinue: () => !this.store.closed && this.config.enabled === true && this.credentials === credentials,
       parseTarget: to => to.startsWith('feishu:chat:') ? to.slice('feishu:chat:'.length) : to.slice('feishu:'.length),
       send: async (chatId, body) => {
-        const resp = await client.im.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text: body }) },
-        })
-        if (resp && typeof resp.code === 'number' && resp.code !== 0) throw new Error('feishu api code ' + resp.code + ': ' + (resp.msg ?? ''))
+        try {
+          const resp = await client.im.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text: body }) },
+          })
+          if (resp && typeof resp.code === 'number' && resp.code !== 0) throw new Error('feishu api code ' + resp.code + ': ' + (resp.msg ?? ''))
+        } catch (error) {
+          throw new Error(feishuErrorText(error, credentials?.appSecret))
+        }
       },
     })
   }

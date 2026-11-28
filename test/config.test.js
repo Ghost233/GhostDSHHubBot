@@ -97,3 +97,75 @@ test('workspaces section: custom chiefPath/chiefTitle, strict validation', () =>
   assert.throws(() => resolveConfig({ ...valid(), workspaces: { chiefTitle: '' } }), ConfigError)
   assert.throws(() => resolveConfig({ ...valid(), workspaces: { nope: 1 } }), ConfigError)
 })
+
+// 凭据只该由扫码绑定（registerApp）写进 stateDir/feishu-credentials.json；配置里的明文 appSecret 是 v1 遗留
+// 人工降级通道，v2 必须拒绝并给出迁移提示——且报错文本绝不能回显密钥本身（凭据不进日志/报错）。
+test('S04 regression: resolveConfig rejects a legacy plaintext feishu appSecret without echoing it', () => {
+  const fakeSecret = 'fake-secret-do-not-echo-4f2a'
+  assert.throws(
+    () => resolveConfig({ ...valid(), feishu: { enabled: true, appId: 'cli_fake_app', appSecret: fakeSecret } }),
+    error => {
+      assert.ok(error instanceof ConfigError, '遗留明文 feishu.appSecret 必须抛 ConfigError')
+      const message = String(error.message)
+      assert.match(message, /feishu\.appSecret/, '报错必须点名 feishu.appSecret 这个键')
+      assert.match(message, /migrat|migration|credential|registerApp|凭据|扫码/i, '报错必须带迁移/凭据库提示（如改用 credential store / registerApp 落盘）')
+      assert.ok(!message.includes(fakeSecret), '报错绝不能回显明文 appSecret')
+      return true
+    },
+  )
+  // 纯引用式配置（只写 enabled/botOpenId，不含 appId/appSecret）必须继续正常解析——迁移只拒绝明文密钥。
+  const referenced = resolveConfig({ ...valid(), feishu: { enabled: true, botOpenId: 'ou_fake_bot' } })
+  assert.equal(referenced.feishu.enabled, true, '纯引用式飞书配置必须照常启用')
+  assert.equal(referenced.feishu.appSecret, undefined, '解析结果里不应出现 appSecret')
+})
+
+// 只写 appId（没有 appSecret）同样是遗留明文通道的残留：必须一样拒绝，不能因为「半个密钥」就放过。
+test('S04 regression: resolveConfig rejects a legacy plaintext feishu appId on its own', () => {
+  assert.throws(
+    () => resolveConfig({ ...valid(), feishu: { enabled: true, appId: 'cli_fake_app_only' } }),
+    error => {
+      assert.ok(error instanceof ConfigError, '遗留明文 feishu.appId 也必须抛 ConfigError')
+      const message = String(error.message)
+      assert.match(message, /feishu\.appId/, '报错必须点名 feishu.appId 这个键')
+      // 提示要「只说该删的那个键」：只写了 appId 时，删除清单里不该冒出一个用户没写的 appSecret。
+      assert.match(message, /请删掉 config\.feishu\.appId，/, '只写了 appId 时删除清单只列 appId')
+      return true
+    },
+  )
+  // appId + appSecret 同时出现时，报错要把两个键都点出来（一次说清要删什么）。
+  assert.throws(
+    () => resolveConfig({ ...valid(), feishu: { enabled: true, appId: 'cli_fake_app', appSecret: 'fake-secret-both-1d7' } }),
+    error => {
+      const message = String(error.message)
+      assert.match(message, /请删掉 config\.feishu\.appId \/ config\.feishu\.appSecret，/, '两个遗留键都要进删除清单')
+      assert.ok(!message.includes('fake-secret-both-1d7'), '报错绝不能回显明文 appSecret')
+      return true
+    },
+  )
+})
+
+// 不写 feishu 段时默认仍是纯引用式的关闭状态；解析结果里绝不该凭空出现明文凭据字段（无静默降级）。
+test('S04 regression: the resolved feishu section never carries plaintext credentials', () => {
+  const omitted = resolveConfig({ ...valid() })
+  assert.deepEqual(omitted.feishu, { enabled: false }, '默认飞书段只有开关，没有凭据字段')
+  const disabled = resolveConfig({ ...valid(), feishu: { enabled: false, botOpenId: 'ou_fake_bot' } })
+  assert.deepEqual(disabled.feishu, { enabled: false, botOpenId: 'ou_fake_bot' }, '纯引用式字段原样保留')
+  assert.equal(Object.hasOwn(disabled.feishu, 'appId'), false, '解析结果不含 appId')
+  assert.equal(Object.hasOwn(disabled.feishu, 'appSecret'), false, '解析结果不含 appSecret')
+  // 形状不对的 feishu 段仍然按老规矩拒绝（这条边界没被凭据迁移放松）。
+  assert.throws(() => resolveConfig({ ...valid(), feishu: 'nope' }), ConfigError)
+  assert.throws(() => resolveConfig({ ...valid(), feishu: { nope: 1 } }), ConfigError)
+})
+
+test('S04 regression: credentialRef addresses only Hub Bot grant records', () => {
+  const credentialRef = 'hub-bot/old-assistant'
+  const resolved = resolveConfig({ ...valid(), feishu: { enabled: true, credentialRef } })
+  assert.equal(resolved.feishu.credentialRef, credentialRef)
+  for (const ref of ['other-plugin/feishu', 'hub-bot/a/b', 'plaintext-fixture-secret']) {
+    assert.throws(() => resolveConfig({ ...valid(), feishu: { credentialRef: ref } }), error => {
+      assert.match(error.message, /feishu[.]credentialRef/)
+      assert.ok(!error.message.includes(ref))
+      return true
+    })
+  }
+})
