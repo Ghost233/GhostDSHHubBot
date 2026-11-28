@@ -2274,7 +2274,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                   h('div', { style: timerActionsStyle }, actions.map(action => h('button', { key: action, type: 'button', style: settingsButtonStyle, disabled: timerBusy, onClick: () => void act(timer, action) },
                     t(({ pause: 'timerPause', resume: 'timerResume', cancel: 'timerCancel' })[action]))),
                     timer.delivery?.ticketId ? h('button', { type: 'button', style: settingsButtonStyle, onClick: () => openStream({ ticketId: timer.delivery.ticketId }) }, t('timerRun')) : null,
-                    worker?.sessionId && canOpenOwnerSession ? h('button', { type: 'button', style: actionStyle, onClick: async () => {
+                    worker?.sessionId && canOpenOwnerSession ? h('button', { type: 'button', style: settingsButtonStyle, onClick: async () => {
                       try { await scoped.get('uiWorkspace').openSession(worker.sessionId); }
                       catch (error) { setTimerError(error?.message ?? String(error)); }
                     } }, t('timerWorker')) : null));

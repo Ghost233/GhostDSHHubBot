@@ -556,6 +556,77 @@ test('a retry finds the exact marker on a later item page after reopening', asyn
   } finally { reopened?.store.close(); f.cleanup() }
 })
 
+test('a confirmed HTTP 429 retries with its original marker and posting account after reopen', async () => {
+  const target = 'repos/' + REPO + '/issues/42/comments'
+  const f = fixture()
+  let reopened
+  try {
+    const { outboxId } = await f.router.replySource({ to: 'github:' + REPO + ':42', text: 'status' })
+    const readRow = () => f.outbox().find(row => row.id === outboxId)
+    f.script['POST ' + target] = Object.assign(new Error('gh exited'), {
+      code: 1, stderr: 'gh: API rate limit exceeded (HTTP 429)\n',
+    })
+    assert.equal((await f.source.deliverReplies()).delivered, 0)
+    assert.match(readRow().lastError, /rejected.*HTTP 429/i)
+    f.script['POST ' + target] = { id: 9001 }
+    reopened = f.reopen()
+    f.script.user = { login: 'different-account' }
+    assert.equal((await reopened.source.deliverReplies()).delivered, 0)
+    assert.match(readRow().lastError, /posting account changed/i)
+    assert.equal(f.posts.length, 1)
+    f.script.user = { login: 'Ghost233' }
+    assert.equal((await reopened.source.deliverReplies()).delivered, 1)
+    assert.equal(readRow().state, 'sent')
+    assert.equal(readRow().lastError, null)
+    assert.equal(f.posts.length, 2)
+    assert.equal(f.posts[0].find(arg => arg.startsWith('body=')), f.posts[1].find(arg => arg.startsWith('body=')))
+  } finally { reopened?.store.close(); f.cleanup() }
+})
+
+test('an ambiguous response after a confirmed rejection consumes the safe retry', async () => {
+  const endpoint = 'repos/' + REPO + '/issues/42/comments'
+  const post = 'POST ' + endpoint
+  const f = fixture()
+  try {
+    const { outboxId } = await f.router.replySource({ to: 'github:' + REPO + ':42', text: 'status' })
+    f.script[post] = Object.assign(new Error('validation failed'), { status: 422 })
+    assert.equal((await f.source.deliverReplies()).delivered, 0)
+    f.script[post] = Object.assign(new Error('bad gateway'), { status: 502 })
+    assert.equal((await f.source.deliverReplies()).delivered, 0)
+    assert.equal(f.posts.length, 2)
+    f.script[post] = { id: 9001 }
+    f.script[endpoint] = Object.assign(new Error('lookup rate limited'), { status: 429 })
+    assert.equal((await f.source.deliverReplies()).delivered, 0)
+    assert.match(f.outbox().find(row => row.id === outboxId).lastError, /outcome unknown.*lookup/i)
+    f.script[endpoint] = []
+    assert.equal((await f.source.deliverReplies()).delivered, 0)
+    assert.equal(f.posts.length, 2)
+  } finally { f.cleanup() }
+})
+
+test('HTTP 408, killed gh, and malformed success never enable another POST', async () => {
+  const target = 'repos/' + REPO + '/issues/42/comments'
+  const ambiguousResponses = [
+    Object.assign(new Error('request timeout'), { status: 408 }),
+    Object.assign(new Error('gh timed out'), { code: 1, killed: true, stderr: 'gh: HTTP 429: Too Many Requests' }),
+    new Error('connection failed while reporting HTTP 429'),
+    { unexpected: 'missing comment id' },
+  ]
+  for (const response of ambiguousResponses) {
+    const f = fixture()
+    try {
+      const { outboxId } = await f.router.replySource({ to: 'github:' + REPO + ':42', text: 'status' })
+      f.script['POST ' + target] = response
+      assert.equal((await f.source.deliverReplies()).delivered, 0)
+      assert.match(f.outbox().find(row => row.id === outboxId).lastError, /outcome unknown/i)
+      f.script[target] = []
+      f.script['POST ' + target] = { id: 9001 }
+      assert.equal((await f.source.deliverReplies()).delivered, 0)
+      assert.equal(f.posts.length, 1)
+    } finally { f.cleanup() }
+  }
+})
+
 test('repeated empty and failed lookups leave an ambiguous reply retryable without posting again', async () => {
   const target = 'repos/' + REPO + '/issues/42/comments'
   const f = fixture()

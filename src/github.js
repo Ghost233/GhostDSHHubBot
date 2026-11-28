@@ -86,12 +86,31 @@ export async function realGit(args) {
   })
 }
 
+function githubHttpStatus(error, stderr = error?.stderr) {
+  if (error?.killed || error?.signal) return undefined
+  if (Number.isInteger(error?.status)) return error.status
+  if (!Number.isInteger(error?.code)) return undefined
+  // gh reports REST status on stderr. Arbitrary error text and process timeouts
+  // do not establish whether the API accepted a POST.
+  const line = String(stderr ?? '').trim().split(/\r?\n/, 1)[0]
+  const match = /^gh: .+ \(HTTP ([45]\d{2})\)$/.exec(line) ?? /^gh: HTTP ([45]\d{2})(?::.*)?$/.exec(line)
+  return match ? Number(match[1]) : undefined
+}
+
+function isConfirmedReplyRejection(status) {
+  return Number.isInteger(status) && status >= 400 && status < 500 && status !== 408
+}
+
 /** The real gh runner: REST through the local CLI, 30s cap per call. */
 export async function realGh(args) {
   return new Promise((resolve, reject) => {
     execFile('gh', args, { timeout: 30000, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
-      if (error) reject(new Error('gh ' + args.slice(0, 3).join(' ') + ' failed: ' + (stderr || error.message).toString().trim()))
-      else resolve(String(stdout))
+      if (error) {
+        const failure = new Error('gh ' + args.slice(0, 3).join(' ') + ' failed: ' + (stderr || error.message).toString().trim(), { cause: error })
+        const status = githubHttpStatus(error, stderr)
+        if (status !== undefined) failure.status = status
+        reject(failure)
+      } else resolve(String(stdout))
     })
   })
 }
@@ -803,25 +822,35 @@ export class GitHubSource {
     const attemptKey = replyAttemptKey(outboxId)
     const endpoint = 'repos/' + repo + '/issues/' + number + '/comments'
     const recovery = { repo, number, endpoint, outboxId, receiptKey }
-    let attempt = this.store.get(attemptKey)
-    if (attempt) return this.#reconcileReply(recovery, attempt)
+    const previous = this.store.get(attemptKey)
+    if (previous && !isConfirmedReplyRejection(previous.rejectedStatus)) return this.#reconcileReply(recovery, previous)
 
     const login = (await this.#authenticatedLogin()).toLowerCase()
     if (this.store.closed) return
-    const marker = this.#writeFacts(() => {
+    let reconcile
+    const attempt = this.#writeFacts(() => {
       if (this.store.get(receiptKey)) return null
-      attempt = this.store.get(attemptKey)
-      if (attempt) return null
-      const marker = randomUUID()
-      this.store.set(attemptKey, { marker, repo: repo.toLowerCase(), number, login })
-      this.store.set(replyMarkerKey(marker), outboxId)
-      return marker
+      const latest = this.store.get(attemptKey)
+      if (latest) {
+        if (latest.repo !== repo.toLowerCase() || latest.number !== number) throw new Error('GitHub reply target changed after its first attempt')
+        if (!isConfirmedReplyRejection(latest.rejectedStatus)) {
+          reconcile = latest
+          return null
+        }
+        if (latest.login !== login) throw new Error('GitHub posting account changed after the first attempt')
+      }
+      // A crash or lost response after this write must leave reconciliation as the only option.
+      const next = { marker: latest?.marker ?? randomUUID(), repo: repo.toLowerCase(), number, login,
+        transmission: (latest?.transmission ?? 0) + 1 }
+      this.store.set(attemptKey, next)
+      if (!latest) this.store.set(replyMarkerKey(next.marker), outboxId)
+      return next
     })
-    if (attempt) return this.#reconcileReply(recovery, attempt)
-    if (!marker) return
+    if (reconcile) return this.#reconcileReply(recovery, reconcile)
+    if (!attempt) return
 
     // The Router caps the visible body before this transport-only prefix is attached.
-    const markedBody = '<!-- hub-bot-github-reply:' + marker + ' -->\n\n' + body
+    const markedBody = '<!-- hub-bot-github-reply:' + attempt.marker + ' -->\n\n' + body
     let sent
     try {
       const raw = await this.#githubApi(['-X', 'POST', endpoint, '-f', 'body=' + markedBody])
@@ -829,9 +858,28 @@ export class GitHubSource {
       if (!isPositiveInteger(sent?.id)) throw new Error('GitHub reply response is missing a comment ID')
     } catch (cause) {
       if (!this.store.closed && this.store.get(receiptKey)) return
+      const status = githubHttpStatus(cause)
+      if (isConfirmedReplyRejection(status)) {
+        this.#recordReplyRejection(attemptKey, receiptKey, attempt, status)
+        throw new Error('GitHub rejected reply (HTTP ' + status + '): ' + String(cause?.message ?? cause), { cause })
+      }
       throw new Error('GitHub reply outcome unknown: POST did not return a receipt: ' + String(cause?.message ?? cause), { cause })
     }
     this.#saveReplyReceipt(repo, outboxId, sent)
+  }
+
+  #recordReplyRejection(attemptKey, receiptKey, attempt, rejectedStatus) {
+    const store = this.store.closed ? new Store(this.store.stateDir) : this.store
+    try {
+      this.#writeFacts(() => {
+        const latest = store.get(attemptKey)
+        if (latest?.marker === attempt.marker && latest.transmission === attempt.transmission && !store.get(receiptKey)) {
+          store.set(attemptKey, { ...latest, rejectedStatus })
+        }
+      }, store)
+    } finally {
+      if (store !== this.store) store.close()
+    }
   }
 
   /** Posts recorded reply intents and saves the returned comment identity before marking them sent. */
