@@ -44,7 +44,9 @@ import { Recycler } from './recycle.js'
 import { WorkspacePlacer } from './workspaces.js'
 import { HubBotSettingsService } from './settings-service.js'
 import { TimerService } from './timers.js'
+import { buildOwnerFacts, formatOwnerFacts, listOwnerFactIndex, readOwnerFactDetail } from './owner-facts.js'
 import { DeferredRegistry } from './deferred.js'
+import { SILENCE_REASONS } from './runs.js'
 
 export const name = 'hub-bot'
 export const inject = ['sessionController', 'sessionPersistence', 'webServer']
@@ -259,7 +261,7 @@ export function apply(ctx, rawConfig) {
   setHub(hub)
   const timers = new TimerService({ store, getOwner: id => hub.registry.get(id), getTicket: id => hub.router.getTicket(id),
     routeBackground: request => hub.router.routeBackground(request) })
-  hub.router.timerCanDeliver = (id, ref) => timers.canDeliver(id, ref)
+  hub.router.timerDeliveryState = (id, ref) => timers.deliveryState(id, ref)
   const timerAction = ({ id, action } = {}) => {
     if (!['pause', 'resume', 'cancel'].includes(action) || typeof id !== 'string' || !id) {
       throw new HttpError(400, 'A timer ID and pause, resume, or cancel are required.')
@@ -271,6 +273,21 @@ export function apply(ctx, rawConfig) {
       throw error
     }
   }
+  const listRuns = (filters = {}) => {
+    let { limit = 30, offset = 0 } = filters
+    if (typeof limit === 'string' && /^[0-9]+$/.test(limit)) limit = Number(limit)
+    if (typeof offset === 'string' && /^[0-9]+$/.test(offset)) offset = Number(offset)
+    try {
+      if (!Number.isSafeInteger(limit) || limit < 1) throw new TypeError('Run list limit must be a positive integer.')
+      limit = Math.min(limit, 100)
+      const rows = hub.router.runs.list({ ...filters, limit: limit + 1, offset })
+      return { runs: rows.slice(0, limit), nextOffset: rows.length > limit ? offset + limit : null }
+    } catch (error) {
+      if (error instanceof TypeError) throw new HttpError(400, error.message)
+      throw error
+    }
+  }
+
   const overview = async () => ({
     ...buildOverview({ store, registry: hub.registry, health: await buildHealth() }),
     timers: timers.list(),
@@ -278,10 +295,13 @@ export function apply(ctx, rawConfig) {
   ctx.inject(['tools'], scope => {
     scope.tools.register({
       name: 'report_background',
-      description: '记录当前后台任务的结果或失败原因，交给对应负责人。',
+      description: '记录后台任务的结果、失败或静默原因。progress-only 仅记录进展，任务保持进行中。',
       parameters: {
         type: 'object', required: ['ticketId'], additionalProperties: false,
-        properties: { ticketId: { type: 'string' }, summary: { type: 'string' }, failure: { type: 'string' }, evidence: { type: 'string' } },
+        properties: {
+          ticketId: { type: 'string' }, summary: { type: 'string' }, failure: { type: 'string' }, evidence: { type: 'string' },
+          silenceReason: { type: 'string', enum: Object.keys(SILENCE_REASONS) },
+        },
       },
       output: {
         schema: { type: 'object', required: ['ticketId', 'stage'], additionalProperties: false,
@@ -299,9 +319,9 @@ export function apply(ctx, rawConfig) {
         render: (_args, value) => [{ type: 'text', text: '任务 ' + value.ticketId + ' 正等待用户回复。' }] },
       execute: async (args, exec) => hub.router.askWorker({ ...args, sessionId: exec.agent?.id }),
     }, { when: ({ agent }) => hub.router.isManagedWorker(agent.id) })
+    const getBoundOwner = sessionId => store.closed ? undefined : hub.registry.findByCurrentSession(sessionId)
     const getManager = sessionId => {
-      if (store.closed) return undefined
-      const owner = hub.registry.findByCurrentSession(sessionId)
+      const owner = getBoundOwner(sessionId)
       return owner && !owner.transient ? owner : undefined
     }
     const managerFor = (exec, ownerId) => {
@@ -319,12 +339,58 @@ export function apply(ctx, rawConfig) {
       render: (_args, value) => [{ type: 'text', text: value.timer.id + ' · ' + value.timer.status + ' · ' + value.timer.fireAt }],
     }
     scope.tools.register({
+      name: 'read_owner_fact', description: '查看当前负责人的冷启动事实。按 section 分页读索引，再用 kind 和 id 查看单条工单或汇报记录。',
+      parameters: {
+        type: 'object', additionalProperties: false, properties: {
+          section: { type: 'string', enum: ['tickets', 'activeTasks', 'workers', 'pending', 'reports', 'reportRecords'] },
+          offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 50 },
+          kind: { type: 'string', enum: ['ticket', 'outbox'] }, id: textProperty,
+        },
+      },
+      output: {
+        schema: { type: 'object', required: ['text'], additionalProperties: false, properties: { text: textProperty } },
+        render: (_args, value) => [{ type: 'text', text: value.text }],
+      },
+      async execute({ section, offset, limit, kind, id }, exec) {
+        const owner = getBoundOwner(exec.agent?.id)
+        if (!owner) throw new Error('Only the current owner session can read these facts.')
+        const input = { store, ownerId: owner.id, isArchived: sid => sessions.isArchived(sid) }
+        if (kind !== undefined || id !== undefined) {
+          if (!['ticket', 'outbox'].includes(kind) || typeof id !== 'string' || !id.trim() || section !== undefined || offset !== undefined || limit !== undefined) {
+            throw new Error('Provide kind and id to read one record.')
+          }
+          const detail = readOwnerFactDetail({ ...input, kind, id })
+          if (!detail) throw new Error('No matching record for this owner.')
+          return { text: JSON.stringify(detail) }
+        }
+        if (section !== undefined || offset !== undefined || limit !== undefined) {
+          const page = listOwnerFactIndex({ ...input, section, offset, limit })
+          if (!page) throw new Error('Invalid owner fact section or page.')
+          return { text: JSON.stringify(page) }
+        }
+        return { text: formatOwnerFacts(buildOwnerFacts(input)) }
+      },
+    }, { when: ({ agent }) => Boolean(getBoundOwner(agent.id)) })
+    scope.tools.register({
       name: 'timer_create',
-      description: '安排一次性后台跟进。fireAt 使用带时区的绝对时间。飞书交代的提醒可带原消息 triggerRef，以便后续问答回原处。',
-      parameters: { type: 'object', properties: { ownerId: textProperty, fireAt: textProperty, message: textProperty, triggerRef: textProperty },
-        required: ['fireAt', 'message'], additionalProperties: false },
+      description: '安排后台跟进。一次性使用带时区的 fireAt，每日或每周使用上海时间 schedule。飞书交代的提醒可带原消息 triggerRef，以便后续问答回原处。',
+      parameters: {
+        type: 'object', required: ['message'], additionalProperties: false,
+        oneOf: [{ required: ['fireAt'] }, { required: ['schedule'] }],
+        properties: {
+          ownerId: textProperty, fireAt: textProperty, message: textProperty, triggerRef: textProperty,
+          schedule: {
+            type: 'object', required: ['frequency', 'time'], additionalProperties: false,
+            properties: {
+              frequency: { type: 'string', enum: ['daily', 'weekly'] },
+              time: { type: 'string', description: '上海时间，24 小时制 HH:mm' },
+              weekday: { type: 'integer', minimum: 1, maximum: 7, description: '每周使用，周一为 1，缺省为创建时的上海星期' },
+            },
+          },
+        },
+      },
       output: timerResult,
-      async execute({ ownerId, fireAt, message, triggerRef }, exec) {
+      async execute({ ownerId, fireAt, schedule, message, triggerRef }, exec) {
         const manager = managerFor(exec, ownerId)
         let origin, authorization
         if (triggerRef) {
@@ -337,7 +403,7 @@ export function apply(ctx, rawConfig) {
           if (!isFeishu || !withinOwner) throw new Error('The Feishu source for this reminder cannot be verified.')
           origin = { kind: 'feishu', triggerId: trigger.id, chatId: trigger.source.chatId, actor: sender }
         }
-        return { timer: timers.create({ ownerId: ownerId ?? manager.id, createdBy: exec.agent.id, fireAt, message, origin, authorization }) }
+        return { timer: timers.create({ ownerId: ownerId ?? manager.id, createdBy: exec.agent.id, fireAt, schedule, message, origin, authorization }) }
       },
     }, managerTool)
     scope.tools.register({
@@ -574,6 +640,8 @@ export function apply(ctx, rawConfig) {
     modelCatalog: forwardDep('modelCatalog'),
     overview: forwardDep('overview'),
     messageDetail: forwardDep('messageDetail'),
+    listRuns: forwardDep('listRuns'),
+    runDetail: forwardDep('runDetail'),
     timerAction,
     resolveTicket: forwardDep('resolveTicket'),
     startFeishuRegister: forwardDep('startFeishuRegister'),
@@ -615,6 +683,8 @@ export function apply(ctx, rawConfig) {
     },
     overview,
     messageDetail: triggerId => readMessageDetail(store, triggerId),
+    listRuns,
+    runDetail: id => hub.router.runs.get(id),
     resolveTicket: request => resolveTicket(request),
     startFeishuRegister,
   })
@@ -926,6 +996,13 @@ export function apply(ctx, rawConfig) {
           const cfg = { repo: body.repo, workspace: body.workspace ?? basename(config.homeRepo), cwd: config.homeRepo, enabled: true }
           if (body.kind === 'comment') json(res, 200, await github.handleCommentEvent(body.item ?? body.comment, cfg))
           else json(res, 200, await github.handleIssueEvent(body.item, cfg))
+        } else if (route === 'runs' && method === 'GET') {
+          json(res, 200, listRuns(Object.fromEntries(url.searchParams)))
+        } else if (route === 'runs/detail' && method === 'GET') {
+          const id = requireString({ id: url.searchParams.get('id') }, 'id')
+          const run = hub.router.runs.get(id)
+          if (!run) throw new HttpError(404, 'This background run is no longer available.')
+          json(res, 200, run)
         } else if (route === 'overview' && method === 'GET') {
           // 三问视图数据 (#73): 票面 + 注册表 + 健康快照, 一次取齐
           json(res, 200, await overview())

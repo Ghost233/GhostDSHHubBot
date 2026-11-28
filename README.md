@@ -75,7 +75,7 @@ patch 结构测试复用仓内先例 `scripts/test-runtime.mjs` 的解析链：`
 
 ## 等待状态模型与可靠性硬化（#66）
 
-- **九态一票**（src/tasks.js）：待触发 idle、排队中 queued、进行中 working、等您回复 person/answer、等您确认 person/confirm、等您验收 person/review、被卡住 blocked、失败 failed、完成 done。任何时刻恰处一个阶段；全部迁移经 TRANSITIONS 守卫并记 transitions 审计（含 by/at）。等您验收是挡板：done 只能由 person/review（验收）或 person/confirm（取消）到达；人的追问把 person/*、blocked、failed 释放回 working（spec：人的消息直接释放）。#65 旧票 stage 'review' 读出时归一为 person/review，不做迁移。
+- **九态一票**（src/tasks.js）：待触发 idle、排队中 queued、进行中 working、等您回复 person/answer、等您确认 person/confirm、等您验收 person/review、被卡住 blocked、失败 failed、完成 done。任何时刻恰处一个阶段；全部迁移经 TRANSITIONS 守卫并记 transitions 审计（含 by/at）。等您验收是挡板：正常结果到等您验收，再由用户验收结束。明确的待投递取消和无新结果的后台终结各有独立的状态守卫。人的追问把 person/*、blocked、failed 释放回 working（spec：人的消息直接释放）。#65 旧票 stage 'review' 读出时归一为 person/review，不做迁移。
 - **状态摘要 = 状态朗读**：STAGE_TEXT 逐字文案（进行中/等您验收/被卡住/…），query_tasks 每行带 stageText，summarize 只回 朗读 + 票面既有事实（report 摘要/escalation 原因等），LLM 不即兴总结。
 - **先存后做（src/outbox.js OutboxRunner）**：建票先存 idle（待触发），注入先落 outbox 行再投递；投递成功才转 working。失败 2 秒首次重试、指数退避、上限注入 5 分钟/回复 1 分钟；同一任务的注入严格保序（前一条未送达后一条等待）；连续失败 3 次才记 system-problem 行并绕过（一次性错误不惊动人）；重试沿用行内稳定 requestId。permanent 失败（如票面授权缺失）立即终判不重试。插件启动时 markRestart（working/idle/queued 票的 running assignment 以 "host restarted" 结束、打 recoveryPending）并自动恢复投递，另有 1 秒 tick 定时器；devApi 增 POST /deliver 手动驱动（实证用）。
 - **触发与授权不可变（票面权威）**：追问不绑定新 Trigger；追问带 authorization 参数直接拒绝（authorization-immutable）；票面授权缺失的票拒绝执行——路由侧转 blocked 并拒注入，投递侧 permanent fail 转 failed；会话叙事声称的授权不扩展权限（owner persona 明文 + L2 工具硬约束）。
@@ -124,10 +124,12 @@ patch 结构测试复用仓内先例 `scripts/test-runtime.mjs` 的解析链：`
 - **dsh-badge**：bot 在 GitHub 的一切产出结尾带 powered-by-dsh 徽标（ack/回复由代码强制；PR 描述等 L2/L3 自然产出由注入文本与 persona 约束）。
 - dev 实证探针：`GET github/status`（跟随清单/水位线/解析失败留痕）、`POST github/poll {repo?}`（立即一轮）、`POST github/simulate {kind, repo, item}`（mock 事件走真实归一化/Policy/路由）。
 
-## 一次性跟进和结构化答复
+## 提醒、结构化答复与后台记录
 
-- 对负责人说清跟进内容和时间，由当前 L1/L2 调用 `timer_create`。`fireAt` 使用带时区的绝对时间。飞书交代的提醒可关联原消息，执行时沿用这条消息的授权。
-- 在飞书对话中请负责人查看、暂停、恢复或取消提醒，也可在面板直接管理。停机错过的提醒补火一次并标记迟到。取消停止后续点火，已接管的执行会话继续运行。
+- 对负责人说清跟进内容和时间，由当前 L1/L2 调用 `timer_create`。一次性提醒用带时区的 `fireAt`。周期提醒用 `schedule`，可选 `daily` 或 `weekly`，时间按 `Asia/Shanghai` 的 `HH:mm`。每周的 `weekday` 从周一 `1` 到周日 `7`，省略时采用创建当天的上海星期。
+- 飞书交代的提醒可关联原消息，执行时沿用该消息的授权。飞书对话和面板都能查看、暂停、恢复和取消。停机后一次性提醒补火一次，周期提醒只补最近一次。同一提醒后续继续用已有执行会话，取消后已经接管的工作照常完成。
+- 负责人会话确实丢失时，系统保留原投递请求号，在新实例的首条消息中加载当前任务、原待答期限、执行会话和汇报索引。当前负责人可用 `read_owner_fact` 按页浏览和按 ID 查详情。
+- 后台执行会话用 `report_background` 记录结果、失败或明确的静默原因。面板的后台运行记录可按来源、通知状态筛选并进入关联工单。发送成功表示通道已经接受消息。
 - 绑定任务的执行会话可通过 `ask_user` 提问。面板按请求编号接受回复或确认，飞书从原聊天和原发送者接收 `/hub-answer <requestId> answer <回复>`，确认用 `approve` 或 `reject`。问题默认有效 24 小时，宿主可配置 `deferred.ttlMs` 及 `deferred.ttlByAction`。
 - 负责人提问由其当前实例接续，执行会话提问由原会话接续。危险动作使用确认时保存的目标，目标失效时须重新发起确认。面板显示答复待投递、已接管或失败。
 

@@ -186,7 +186,11 @@ function renderBoard(overview) {
     const text0 = list[0].stageText ?? stage
     const group = el('section', { class: 'stage-group' })
     group.append(el('h3', {}, text(text0 + ' '), el('span', { class: 'count' }, text(String(list.length)))))
-    for (const t of list) group.append(ticketRow(t, { actions: t.stage === 'person/confirm' ? confirmActions(t) : undefined }))
+    for (const t of list) {
+      const row = ticketRow(t, { actions: t.stage === 'person/confirm' ? confirmActions(t) : undefined })
+      row.id = 'ticket-' + t.id
+      group.append(row)
+    }
     groups.append(group)
   }
   if (!groups.children.length) groups.append(el('p', { class: 'quiet' }, text('还没有任务。')))
@@ -278,9 +282,13 @@ function renderTimers(timers, owners) {
   for (const timer of timers) {
     const label = owners.find(owner => owner.id === timer.ownerId)?.workspace ?? timer.ownerId
     const actions = timer.status === 'pending' ? [['pause', '暂停'], ['cancel', '取消提醒']]
-      : timer.status === 'paused' ? [['resume', '恢复'], ['cancel', '取消提醒']] : timer.status === 'firing' || (timer.status === 'fired' && timer.delivery?.state === 'queued') ? [['cancel', '取消提醒']] : []
+      : timer.status === 'paused' ? [['resume', '恢复'], ['cancel', '取消提醒']] : timer.status === 'firing' || (timer.status === 'fired' && timer.delivery?.state === 'queued') || (timer.schedule && timer.status === 'failed') ? [['cancel', '取消提醒']] : []
+    const schedule = timer.schedule
+    const repeat = schedule && (schedule.frequency === 'daily' ? '每日' : '每周' + ('一二三四五六日'[schedule.weekday - 1] ?? ''))
+    const cadence = repeat ? repeat + ' ' + schedule.time + '（上海时间）' : null
+    const time = schedule ? (timer.status === 'cancelled' ? null : '下次计划 ' + new Date(timer.fireAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })) : fmtTime(timer.fireAt)
     const row = el('div', { class: 'ticket-row' }, el('strong', {}, text(timer.message)),
-      el('p', { class: 'quiet small' }, text([label, fmtTime(timer.fireAt), states[timer.status], timer.late ? '已迟到' : null].filter(Boolean).join(' · '))))
+      el('p', { class: 'quiet small' }, text([label, cadence, time, states[timer.status], timer.late ? '已迟到' : null].filter(Boolean).join(' · '))))
     if (timer.delivery?.ticketId) row.append(el('p', { class: 'quiet small' }, text('任务 ' + timer.delivery.ticketId)))
     const delivery = ({ queued: '待投递', sent: '已接管', failed: '投递失败' })[timer.delivery?.state]
     if (delivery) row.append(el('p', { class: 'quiet small' }, text(delivery)))
@@ -301,6 +309,63 @@ function renderTimers(timers, owners) {
       row.append(button)
     }
     box.append(row)
+  }
+}
+
+const RUN_STATUS = { silent: '未通知', waiting: '待发送或汇总', sent: '通道已接受', failed: '发送失败', 'in-progress': '无发送记录' }
+const RUN_RESULT = { result: '有结果', failure: '执行失败', blocked: '需要介入' }
+let runQueryVersion = 0
+
+function renderRun(run) {
+  const name = run.source.kind === 'github' ? [run.source.repo, run.source.issueNumber && '#' + run.source.issueNumber].filter(Boolean).join(' ') || 'GitHub'
+    : '提醒 ' + (run.source.timerId ?? '')
+  const summary = el('summary', {}, text([fmtTime(run.createdAt), name, RUN_STATUS[run.status], RUN_RESULT[run.result?.kind]].filter(Boolean).join(' · ')))
+  const task = el('a', { href: '#ticket-' + encodeURIComponent(run.ticketId) }, text('查看工单 ' + shortId(run.ticketId)))
+  const facts = el('div', { class: 'ticket-details' }, task)
+  if (run.source.url) facts.append(el('p', {}, el('a', { href: run.source.url, target: '_blank', rel: 'noreferrer' }, text('GitHub 来源'))))
+  if (run.source.fireAt) facts.append(detailRow('计划时间', fmtTime(run.source.fireAt)))
+  if (run.workerSession?.sessionId) facts.append(detailRow('执行会话', run.workerSession.sessionId))
+  if (run.reason) facts.append(detailRow('未通知原因', run.reason))
+  const history = el('div', { class: 'ticket-details' })
+  const row = el('details', { class: 'ticket-row' }, summary, facts, history)
+  row.addEventListener('toggle', async () => {
+    if (!row.open) return
+    history.replaceChildren(el('p', { class: 'quiet' }, text('正在读取明细…')))
+    try {
+      const detail = await api('runs/detail?id=' + encodeURIComponent(run.id))
+      history.replaceChildren(
+        ...(detail.lastProgressAt ? [detailRow('上次记录进展', fmtTime(detail.lastProgressAt))] : []),
+        ...(detail.results ?? []).map(result => detailRow(RUN_RESULT[result.kind] ?? result.kind, fmtTime(result.at))),
+        ...(detail.notifications ?? []).map(notice => {
+          const state = notice.channelAccepted ? '通道已接受' : (QUEUE_TEXT[notice.state] ?? '无发送记录')
+          return detailRow(notice.channel ?? '通知', [state, notice.acceptedAt && fmtTime(notice.acceptedAt), notice.id].filter(Boolean).join(' · '))
+        }),
+      )
+    } catch (error) {
+      history.replaceChildren(el('p', { role: 'alert' }, text(error.message)))
+    }
+  })
+  return row
+}
+
+async function loadRuns(offset = 0) {
+  const version = ++runQueryVersion
+  const list = $('#run-list')
+  const filters = new URLSearchParams({ offset, limit: 20 })
+  for (const name of ['status', 'source']) {
+    const value = $('#run-' + name).value
+    if (value) filters.set(name, value)
+  }
+  list.replaceChildren(el('p', { class: 'quiet' }, text('正在读取运行记录…')))
+  try {
+    const page = await api('runs?' + filters)
+    if (version !== runQueryVersion) return
+    list.replaceChildren(...page.runs.map(renderRun))
+    if (!page.runs.length) list.append(el('p', { class: 'quiet' }, text('暂无符合条件的运行。')))
+    if (offset) list.append(el('button', { class: 'btn', type: 'button', onclick: () => void loadRuns(Math.max(0, offset - 20)) }, text('上一页')))
+    if (page.nextOffset !== null) list.append(el('button', { class: 'btn', type: 'button', onclick: () => void loadRuns(page.nextOffset) }, text('下一页')))
+  } catch (error) {
+    if (version === runQueryVersion) list.replaceChildren(el('p', { role: 'alert' }, text(error.message)))
   }
 }
 
@@ -589,6 +654,10 @@ function renderSettings(view) {
   watchDirty(rBar, rAuto, rInterval)
   page.append(rSection)
 }
+
+$('#run-history').addEventListener('toggle', () => { if ($('#run-history').open) void loadRuns() })
+for (const id of ['run-status', 'run-source']) $('#' + id).addEventListener('change', () => void loadRuns())
+$('#run-refresh').addEventListener('click', () => void loadRuns())
 
 /* ---------- boot ---------- */
 function showError(error) {

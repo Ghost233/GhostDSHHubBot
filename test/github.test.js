@@ -10,6 +10,7 @@ import { DeferredRegistry } from '../src/deferred.js'
 import { Router } from '../src/router.js'
 import { GitHubSource, watermarkPath, DSH_BADGE } from '../src/github.js'
 import { resolveConfig } from '../src/config.js'
+import { discardOutboxRows } from '../src/outbox.js'
 
 const REPO = 'Ghost233/DSH-Workflow'
 const REPO_CFG = { repo: REPO, workspace: 'DSH-Workflow', cwd: '/Volumes/home/DSH-Workflow', enabled: true }
@@ -96,6 +97,74 @@ function fixture({ allowlist = ['Ghost233'], script = {}, repos = [REPO_CFG], ro
     cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }) },
   }
 }
+
+test('background GitHub checks leave silent, accepted and failed notification evidence', async () => {
+  const f = fixture()
+  let reopened
+  try {
+    const silent = await f.source.handleIssueEvent(issue({ number: 100 }), REPO_CFG)
+    await f.source.deliverReplies() // the existing intake acknowledgement is separate from the run decision
+    const postedBefore = f.posts.length
+    const worker = f.router.getTicket(silent.ticketId).workerSession.sessionId
+    assert.throws(() => f.router.tasks.accept(silent.ticketId), { code: 'illegal-transition' })
+    await assert.rejects(f.router.reportBackground({ ticketId: silent.ticketId, sessionId: 'different-worker', silenceReason: 'no-change' }), /bound worker/)
+    assert.equal((await f.router.reportBackground({ ticketId: silent.ticketId, sessionId: worker, silenceReason: 'no-change' })).stage, 'done')
+    await f.router.tick()
+    await f.source.deliverReplies()
+    assert.equal(f.posts.length, postedBefore)
+    const quiet = f.router.runs.get('run-' + silent.ticketId)
+    assert.equal(quiet.status, 'silent')
+    assert.equal(quiet.decisions.at(-1).reasonCode, 'no-change')
+    assert.equal(f.router.getTicket(silent.ticketId).transitions.at(-1).reason, 'background-no-result')
+    assert.equal(quiet.notification, null)
+
+    const result = await f.source.handleIssueEvent(issue({ number: 101 }), REPO_CFG)
+    const failed = await f.source.handleIssueEvent(issue({ number: 102 }), REPO_CFG)
+    await f.source.deliverReplies()
+    const replyPost = number => 'POST repos/' + REPO + '/issues/' + number + '/comments'
+    f.script[replyPost(101)] = { id: 9101 }
+    f.script[replyPost(102)] = Object.assign(new Error('fixture rate limit'), { status: 429 })
+    const sessionOf = id => f.router.getTicket(id).workerSession.sessionId
+    await f.router.reportBackground({ ticketId: result.ticketId, sessionId: sessionOf(result.ticketId), summary: 'Fixture outcome' })
+    await f.router.reportBackground({ ticketId: failed.ticketId, sessionId: sessionOf(failed.ticketId), failure: 'Fixture execution error' })
+    assert.equal(f.router.runs.list({ status: 'waiting', source: 'github' }).length, 2)
+    for (let attempt = 0; attempt < 5; attempt++) await f.source.deliverReplies()
+    const accepted = f.router.runs.get('run-' + result.ticketId)
+    const error = f.router.runs.get('run-' + failed.ticketId)
+    assert.equal(accepted.stage, 'person/review')
+    assert.equal(accepted.status, 'sent')
+    assert.equal(accepted.notification.channelAccepted, true)
+    assert.equal(accepted.result.kind, 'result')
+    assert.equal(error.stage, 'failed')
+    assert.equal(error.status, 'failed')
+    assert.equal(error.notification.channelAccepted, false)
+    assert.equal(error.result.kind, 'failure')
+    assert.equal(discardOutboxRows(f.store, [error.notification.id]), 1)
+    reopened = f.reopen()
+    assert.equal(reopened.source.router.runs.get(error.id).notification.discarded, true)
+    assert.deepEqual(reopened.source.router.runs.list({ status: 'silent' }).map(row => row.id), [quiet.id])
+  } finally { reopened?.store.close(); f.cleanup() }
+})
+
+test('an explicit GitHub comment receives a reply and progress keeps its ticket active', async () => {
+  const f = fixture()
+  try {
+    const direct = await f.source.handleCommentEvent(comment({ body: '@hub-bot 请检查有没有新情况？' }), REPO_CFG)
+    const { ticketId } = direct
+    const sessionId = f.router.getTicket(ticketId).workerSession.sessionId
+    const progress = await f.router.reportBackground({ ticketId, sessionId, silenceReason: 'progress-only' })
+    assert.equal(progress.stage, 'working')
+    assert.equal(f.router.runs.get('run-' + ticketId).lastProgressAt, f.router.now())
+    assert.equal(f.outbox().filter(row => row.kind === 'reply').length, 0)
+    const answer = await f.router.reportBackground({ ticketId, sessionId, silenceReason: 'no-change' })
+    assert.equal(answer.stage, 'done')
+    assert.equal(f.router.runs.get('run-' + ticketId).status, 'waiting')
+    await f.source.deliverReplies()
+    assert.equal(f.posts.length, 1)
+    assert.match(f.posts[0].find(arg => arg.startsWith('body=')), /本次检查没有变化/)
+    assert.equal(f.router.runs.get('run-' + ticketId).status, 'sent')
+  } finally { f.cleanup() }
+})
 
 test('config: the github section validates and defaults disabled with 5min polling', () => {
   assert.throws(() => resolveConfig({ stateDir: '/tmp/x', homeRepo: '/tmp/y', github: 'x' }), /config\.github must be an object/)

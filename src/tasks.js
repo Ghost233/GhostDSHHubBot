@@ -103,8 +103,12 @@ export function translateTaskError(error, wrap) {
 }
 
 /** True when a stage transition is legal in the lifecycle. */
-export function canTransition(from, to) {
-  return (TRANSITIONS[from] ?? []).includes(to)
+const BACKGROUND_NO_RESULT = 'background-no-result'
+
+export function canTransition(from, to, { background, reason } = {}) {
+  const stage = normalizeStage(from)
+  if (reason === BACKGROUND_NO_RESULT) return Boolean(background && stage === 'working' && to === 'done')
+  return (TRANSITIONS[stage] ?? []).includes(to)
 }
 
 /** Legacy rows from the minimal loop (#65) read as their full-model stage. */
@@ -141,13 +145,13 @@ export class TaskBoard {
   }
 
   /** Applies one guarded transition, recording it on the ticket's audit trail. */
-  #transition(ticketId, to, by) {
+  #transition(ticketId, to, by, reason) {
     const ticket = this.#mustGet(ticketId)
-    if (!canTransition(ticket.stage, to)) {
+    if (!canTransition(ticket.stage, to, { background: ticket.background, reason })) {
       throw new TaskError('illegal-transition', 'ticket ' + ticketId + ': cannot move ' + ticket.stage + ' → ' + to)
     }
     const at = this.now()
-    const transitions = [...(ticket.transitions ?? []), { from: ticket.stage, to, by, at }]
+    const transitions = [...(ticket.transitions ?? []), { from: ticket.stage, to, by, at, ...(reason && { reason }) }]
     return this.#updateTicket({ ...ticket, stage: to, transitions, updatedAt: at })
   }
 
@@ -251,6 +255,11 @@ export class TaskBoard {
       throw new TaskError('illegal-transition', 'ticket ' + ticketId + ': cannot resume from ' + ticket.stage)
     }
     return this.#transition(ticketId, 'working', by ?? 'route')
+  }
+
+  /** A background check without a new result has nothing for the user to accept. */
+  finishBackgroundCheck(ticketId) {
+    return this.#transition(ticketId, 'done', 'system', BACKGROUND_NO_RESULT)
   }
 
   /** The user accepts the reported result (person/review → done; 等用户验收是挡板）. */

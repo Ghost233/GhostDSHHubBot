@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { registerHooks } from 'node:module'
 import { setImmediate } from 'node:timers/promises'
 import { test } from 'node:test'
+import { Readable } from 'node:stream'
 import { Context as PackageContext } from '@deepseek-ai/cordis'
 import { runtimeRequire } from '../scripts/test-runtime.mjs'
 import * as plugin from '../src/index.js'
@@ -134,6 +135,62 @@ test('Feishu registration acknowledgement and asynchronous write failure are sep
   assert.deepEqual(JSON.parse(JSON.stringify((await settings.read()).feishu.status)), failed)
 })
 
+test('both authenticated run timeline endpoints expose the same exact persisted result', async t => {
+  const homeRepo = await mkdtemp(join(tmpdir(), 'hub-bot-run-host-'))
+  const Context = contexts.at(-1)[1]
+  const root = new Context()
+  let handle
+  const prompts = []
+  root.provide('sessionController', {
+    async create({ sessionId }) { return { sessionId } },
+    async prompt(request) { prompts.push(request); return { accepted: true } },
+  })
+  root.provide('sessionPersistence', { async flush() {} })
+  root.provide('webServer', { host: '127.0.0.1', port: 3199, register(entry) {
+    handle = entry.handler
+    return () => { handle = undefined }
+  } })
+  const token = 'fixture-run-host-token'
+  const mounted = root.plugin(plugin, { homeRepo, stateDir: join(homeRepo, 'state'),
+    workspaces: { enabled: false }, devApi: { token } })
+  t.after(async () => { await mounted.dispose(); await rm(homeRepo, { recursive: true, force: true }) })
+  await mounted
+  await setImmediate()
+  const hub = root.reflect.get('hubBot', false)
+  const manager = hub.registry.create({ kind: 'repo', workspace: 'Run fixture 仓库', cwd: homeRepo })
+  hub.registry.bindSession(manager.id, 'owner-run-fixture')
+  const settings = root.reflect.get('hubBotSettings', false)
+  const source = { kind: 'github', repo: 'fixture/example', issueNumber: 16, event: 'issue' }
+  const authorization = { actor: 'fixture', source: 'github', at: hub.router.now() }
+  const launch = await hub.router.routeBackground({ ownerId: manager.id, message: 'inspect test data', triggerRef: 'github:fixture/example:issue:16', source, authorization })
+  await hub.router.reportBackground({ ticketId: launch.ticketId, sessionId: launch.workerSession.sessionId, summary: 'Fixture run finished.' })
+  const id = 'run-' + launch.ticketId
+  async function request(route, authenticated = true) {
+    const req = Readable.from([])
+    Object.assign(req, { url: '/hub-bot/api/' + route, method: 'GET',
+      headers: { host: '127.0.0.1:3199', ...(authenticated && { 'x-hub-bot-token': token }) } })
+    let status, body
+    await handle(req, { writeHead(code) { status = code }, end(value) { body = JSON.parse(value) } })
+    return { status, body }
+  }
+  assert.equal((await request('runs', false)).status, 401)
+  assert.equal((await request('runs/detail?id=' + id, false)).status, 401)
+  assert.equal((await request('runs?status=bogus')).status, 400)
+  await assert.rejects(settings.listRuns({ status: 'bogus' }), error => error.code === 'runs/invalid')
+  assert.equal((await request('runs/detail?id=run-no-fixture')).status, 404)
+  const list = await request('runs?status=waiting&source=github&limit=1')
+  assert.equal(list.status, 200)
+  assert.equal(list.body.nextOffset, null)
+  assert.deepEqual(list.body.runs.map(run => run.id), [id])
+  const detail = await request('runs/detail?id=' + id)
+  assert.equal(detail.status, 200)
+  assert.deepEqual(detail.body, await settings.runDetail({ id }))
+  assert.equal(detail.body.workerSession.sessionId, launch.workerSession.sessionId)
+  assert.equal(detail.body.result.kind, 'result')
+  assert.equal(detail.body.notification.channelAccepted, false)
+  assert.equal(detail.body.source.url, 'https://github.com/fixture/example/issues/16')
+})
+
 test('timer creation is bound to current owners and the panel only manages existing reminders', async t => {
   const homeRepo = await mkdtemp(join(tmpdir(), 'hub-bot-timer-host-'))
   const root = new PackageContext()
@@ -169,6 +226,14 @@ test('timer creation is bound to current owners and the panel only manages exist
   assert.equal(timer.ownerId, repo.id)
   assert.equal(timer.createdBy, 'fixture-timer-chief')
   assert.equal((await settings.overview()).timers[0].id, timer.id)
+  assert.equal(creator.tool.parameters.properties.schedule?.type, 'object')
+  const schedule = { frequency: 'weekly', time: '09:30', weekday: 2 }
+  const { timer: recurring } = await creator.tool.execute({ ownerId: repo.id, message: 'fixture schedule', schedule }, { agent: { id: 'fixture-timer-owner' } })
+  assert.deepEqual(recurring.schedule, { ...schedule, timeZone: 'Asia/Shanghai' })
+  assert.equal(recurring.fireAt.slice(11, 16), '01:30')
+  assert.ok(Date.parse(recurring.fireAt) > Date.now())
+  assert.deepEqual((await settings.overview()).timers.find(row => row.id === recurring.id).schedule, recurring.schedule)
+  await assert.rejects(creator.tool.execute({ ...input, schedule }, { agent: { id: 'fixture-timer-chief' } }))
   const pause = await settings.timerAction({ id: timer.id, action: 'pause' })
   assert.equal(pause.timer.status, 'paused')
   assert.equal((await settings.timerAction({ id: timer.id, action: 'resume' })).timer.status, 'pending')
@@ -179,5 +244,12 @@ test('timer creation is bound to current owners and the panel only manages exist
   assert.equal(status, 401)
   hub.registry.bindSession(repo.id, 'fixture-rebound-owner')
   assert.equal(creator.options.when({ agent: { id: 'fixture-timer-owner' } }), false)
+  const facts = registered.get('read_owner_fact')
+  assert.equal(facts.options.when({ agent: { id: 'fixture-rebound-owner' } }), true)
+  assert.equal(facts.options.when({ agent: { id: 'fixture-timer-owner' } }), false)
+  await assert.rejects(facts.tool.execute({}, { agent: { id: 'fixture-timer-owner' } }), /current owner/)
+  assert.match((await facts.tool.execute({}, { agent: { id: 'fixture-rebound-owner' } })).text, new RegExp(repo.id))
+  const empty = await facts.tool.execute({ section: 'tickets', offset: 0 }, { agent: { id: 'fixture-rebound-owner' } })
+  assert.deepEqual(JSON.parse(empty.text), { entries: [], total: 0, nextOffset: null })
   assert.equal((await settings.timerAction({ id: timer.id, action: 'cancel' })).timer.status, 'cancelled')
 })

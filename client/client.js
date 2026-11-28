@@ -117,6 +117,18 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             codec: anyCodec('dsh-hub-bot#json-request'), strictCodec: anyCodec('dsh-hub-bot#json-request') }],
           result: anyCodec('dsh-hub-bot#json-result'),
         },
+        'hubBotSettings/listRuns': {
+          service: 'hubBotSettings', description: 'List background runs by source and notification state.', invocation: { kind: 'direct' },
+          parameters: [{ name: 'request', source: 'json', description: 'Run filters and page offset',
+            codec: anyCodec('dsh-hub-bot#json-request'), strictCodec: anyCodec('dsh-hub-bot#json-request') }],
+          result: anyCodec('dsh-hub-bot#json-result'),
+        },
+        'hubBotSettings/runDetail': {
+          service: 'hubBotSettings', description: 'Read one background run and its delivery evidence.', invocation: { kind: 'direct' },
+          parameters: [{ name: 'request', source: 'json', description: '{ id }',
+            codec: anyCodec('dsh-hub-bot#json-request'), strictCodec: anyCodec('dsh-hub-bot#json-request') }],
+          result: anyCodec('dsh-hub-bot#json-result'),
+        },
         'hubBotSettings/messageDetail': {
           service: 'hubBotSettings',
           description: 'Read original text and the reply attributed to one message.',
@@ -357,12 +369,19 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       intakeFailed: '投递失败',
       intakeDiscarded: '已丢弃投递',
       timersSection: '提醒',
+      runSection: '后台运行记录', runStateFilter: '通知状态', runSourceFilter: '运行来源', runAll: '全部',
+      runSilent: '未通知', runWaiting: '待发送或汇总', runSent: '通道已接受', runFailed: '发送失败', runUnsent: '无发送记录',
+      runTimer: '提醒', runResult: '有结果', runExecutionFailed: '执行失败', runBlocked: '需要介入', runTask: '查看关联任务',
+      runSourceLink: '打开来源', runEmpty: '暂无符合条件的运行。', runRefresh: '刷新运行记录', runPrevious: '上一页', runNext: '下一页',
+      runLoading: '正在读取运行记录…', runOpenWorker: '打开原执行会话', runLastProgress: '上次记录进展',
       timersEmpty: '暂无提醒。',
       timerPause: '暂停',
       timerResume: '恢复',
       timerCancel: '取消提醒',
       timerLate: '已迟到',
       timerRun: '查看任务',
+      timerDaily: '每日 {time}（上海时间）', timerWeekly: '每周{weekday} {time}（上海时间）', timerNext: '下次计划 {time}',
+      timerWeekday1: '一', timerWeekday2: '二', timerWeekday3: '三', timerWeekday4: '四', timerWeekday5: '五', timerWeekday6: '六', timerWeekday7: '日',
       timerPending: '待触发', timerPaused: '已暂停', timerFiring: '正在提交', timerFired: '已建任务',
       timerCancelled: '已取消', timerFailed: '失败',
       timerWorker: '打开执行会话', timerDeliverySent: '已接管', timerDeliveryQueued: '待投递', timerDeliveryFailed: '投递失败',
@@ -738,12 +757,19 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       intakeFailed: 'delivery failed',
       intakeDiscarded: 'delivery discarded',
       timersSection: 'Follow-ups',
+      runSection: 'Background runs', runStateFilter: 'Notification status', runSourceFilter: 'Run source', runAll: 'All',
+      runSilent: 'Silent', runWaiting: 'Awaiting send or summary', runSent: 'Accepted by channel', runFailed: 'Delivery failed', runUnsent: 'No delivery record',
+      runTimer: 'Reminder', runResult: 'Result available', runExecutionFailed: 'Work failed', runBlocked: 'Needs attention', runTask: 'Open linked task',
+      runSourceLink: 'Open source', runEmpty: 'No matching runs.', runRefresh: 'Refresh runs', runPrevious: 'Previous page', runNext: 'Next page',
+      runLoading: 'Loading runs…', runOpenWorker: 'Open original worker session', runLastProgress: 'Last progress recorded',
       timersEmpty: 'No follow-ups scheduled.',
       timerPause: 'Pause',
       timerResume: 'Resume',
       timerCancel: 'Cancel reminder',
       timerLate: 'Late',
       timerRun: 'Open task',
+      timerDaily: 'Daily at {time} (Shanghai time)', timerWeekly: '{weekday} at {time} (Shanghai time)', timerNext: 'Next scheduled {time}',
+      timerWeekday1: 'Mon', timerWeekday2: 'Tue', timerWeekday3: 'Wed', timerWeekday4: 'Thu', timerWeekday5: 'Fri', timerWeekday6: 'Sat', timerWeekday7: 'Sun',
       timerPending: 'Scheduled', timerPaused: 'Paused', timerFiring: 'Submitting', timerFired: 'Task created',
       timerCancelled: 'Cancelled', timerFailed: 'Failed',
       timerWorker: 'Open worker session', timerDeliverySent: 'Admitted', timerDeliveryQueued: 'Pending delivery', timerDeliveryFailed: 'Delivery failed',
@@ -1788,9 +1814,86 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 fontFamily: 'monospace' }), tabIndex: 0 }, evidence)) : null);
         }
 
+        var runStateLabels = { silent: 'runSilent', waiting: 'runWaiting', sent: 'runSent', failed: 'runFailed', 'in-progress': 'runUnsent' };
+        var runResultLabels = { result: 'runResult', failure: 'runExecutionFailed', blocked: 'runBlocked' };
+
+        function RunHistoryRow({ run, onTask, onWorker, t }) {
+          var [open, setOpen] = React.useState(false);
+          var [detail, setDetail] = React.useState(null);
+          var [error, setError] = React.useState(null);
+          React.useEffect(function () {
+            if (!open) return;
+            var current = true;
+            setDetail(null);
+            setError(null);
+            void scoped.remote.hubBotSettings.runDetail({ id: run.id }).then(unwrap).then(value => {
+              if (current) setDetail(value);
+            }).catch(error => { if (current) setError(error?.message ?? String(error)); });
+            return () => { current = false; };
+          }, [open, run.id]);
+          var date = instant => instant ? new Date(instant).toLocaleString() : '';
+          var source = run.source.kind === 'github' ? [run.source.repo ?? 'GitHub', run.source.issueNumber && '#' + run.source.issueNumber].filter(Boolean).join(' ')
+            : [t('runTimer'), run.source.timerId].filter(Boolean).join(' ');
+          return h('details', { style: { marginBottom: '8px' }, onToggle: event => {
+            if (event.target === event.currentTarget) setOpen(event.currentTarget.open);
+          } },
+            h('summary', { style: { cursor: 'pointer', padding: '4px 0', overflowWrap: 'anywhere' } },
+              [date(run.createdAt), source, t(runStateLabels[run.status] ?? 'runUnsent'), run.result && t(runResultLabels[run.result.kind])].filter(Boolean).join(' · ')),
+            open ? h('div', { style: Object.assign({}, settingsHintStyle, { overflowWrap: 'anywhere' }) },
+              h('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '6px 8px' } },
+                h('button', { type: 'button', style: settingsButtonStyle, onClick: () => onTask(run.ticketId) }, t('runTask')),
+                run.source.url ? h('a', { href: run.source.url, target: '_blank', rel: 'noreferrer' }, t('runSourceLink')) : null,
+                run.workerSession?.sessionId && onWorker ? h('button', { type: 'button', style: settingsButtonStyle,
+                  onClick: () => void onWorker(run.workerSession.sessionId).catch(error => setError(error?.message ?? String(error))) }, t('runOpenWorker')) : null),
+              run.reason ? h('p', null, run.reason) : null,
+              run.source.fireAt ? h('p', null, date(run.source.fireAt)) : null,
+              error ? h('p', { role: 'alert' }, error) : !detail ? h('p', null, t('runLoading')) : null,
+              detail?.lastProgressAt ? h('p', null, t('runLastProgress') + ' · ' + date(detail.lastProgressAt)) : null,
+              ...(detail?.results ?? []).map((result, index) => h('p', { key: 'result-' + index },
+                [t(runResultLabels[result.kind]), date(result.at)].filter(Boolean).join(' · '))),
+              ...(detail?.notifications ?? []).map((notice, index) => h('p', { key: 'notice-' + index },
+                [notice.channel, notice.channelAccepted ? t('runSent') : t(runStateLabels[notice.state] ?? (['held', 'queued', 'recorded'].includes(notice.state) ? 'runWaiting' : 'runUnsent')), date(notice.acceptedAt)].filter(Boolean).join(' · ')))) : null);
+        }
+
+        function RunHistory({ onTask, onWorker }) {
+          var t = scoped.locale.bind(NS);
+          var [status, setStatus] = React.useState('');
+          var [source, setSource] = React.useState('');
+          var [offset, setOffset] = React.useState(0);
+          var [refresh, setRefresh] = React.useState(0);
+          var [page, setPage] = React.useState(null);
+          var [error, setError] = React.useState(null);
+          React.useEffect(function () {
+            var current = true;
+            setPage(null);
+            setError(null);
+            var request = { limit: 20, offset, ...(status && { status }), ...(source && { source }) };
+            void scoped.remote.hubBotSettings.listRuns(request).then(unwrap).then(value => {
+              if (current) setPage(value);
+            }).catch(error => { if (current) setError(error?.message ?? String(error)); });
+            return () => { current = false; };
+          }, [source, status, offset, refresh]);
+          function select(label, value, options, setValue) {
+            return h('label', null, t(label), ' ', h('select', { style: settingsButtonStyle, value, onChange: event => {
+              setOffset(0); setValue(event.target.value);
+            } }, options.map(([key, label]) => h('option', { key, value: key }, t(label)))));
+          }
+          return h('section', { id: 'hub-bot-runs', style: sectionStyle, 'aria-labelledby': 'hub-bot-runs-title' },
+            h('h3', { id: 'hub-bot-runs-title', tabIndex: -1, className: 'hb-scroll-target', style: sectionTitleStyle }, t('runSection')),
+            h('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '6px 10px' } },
+              select('runStateFilter', status, [['', 'runAll'], ...Object.entries(runStateLabels)], setStatus),
+              select('runSourceFilter', source, [['', 'runAll'], ['github', 'kindGitHub'], ['timer', 'runTimer']], setSource),
+              h('button', { type: 'button', style: settingsButtonStyle, onClick: () => setRefresh(value => value + 1) }, t('runRefresh'))),
+            error ? h('p', { role: 'alert' }, error) : !page ? h('p', { style: settingsHintStyle }, t('runLoading')) : null,
+            page && page.runs.length === 0 ? h('p', { style: settingsHintStyle }, t('runEmpty')) : null,
+            ...(page?.runs ?? []).map(run => h(RunHistoryRow, { key: run.id, run, onTask, onWorker, t })),
+            page && offset > 0 ? h('button', { type: 'button', style: settingsButtonStyle, onClick: () => setOffset(Math.max(0, offset - 20)) }, t('runPrevious')) : null,
+            page?.nextOffset != null ? h('button', { type: 'button', style: settingsButtonStyle, onClick: () => setOffset(page.nextOffset) }, t('runNext')) : null);
+        }
+
         var boardSections = [
           ['hub-bot-overview-title', 'statusSection'], ['hub-bot-needs-title', 'needsCard'],
-          ['hub-bot-stream-title', 'ticketsSection'], ['hub-bot-timers-title', 'timersSection'], ['hub-bot-intake-title', 'intakeSection'],
+          ['hub-bot-stream-title', 'ticketsSection'], ['hub-bot-timers-title', 'timersSection'], ['hub-bot-runs-title', 'runSection'], ['hub-bot-intake-title', 'intakeSection'],
           ['hub-bot-recent-title', 'recentSection'],
           ['hub-bot-owners-title', 'ownersSection'], ['hub-bot-settings', 'settingsDivider'],
         ];
@@ -2260,15 +2363,19 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               h('h3', { id: 'hub-bot-timers-title', tabIndex: -1, className: 'hb-scroll-target', style: sectionTitleStyle }, t('timersSection')),
               timerError ? h('p', { role: 'alert', style: settingsHintStyle }, timerError) : null,
               overview.timers.length ? overview.timers.map(function (timer) {
-                var stoppable = timer.status === 'firing' || (timer.status === 'fired' && timer.delivery?.state === 'queued');
+                var stoppable = timer.status === 'firing' || (timer.status === 'fired' && timer.delivery?.state === 'queued') || (timer.schedule && timer.status === 'failed');
                 var actions = timer.status === 'pending' ? ['pause', 'cancel'] : timer.status === 'paused' ? ['resume', 'cancel'] : stoppable ? ['cancel'] : [];
                 var statusKey = ({ pending: 'timerPending', paused: 'timerPaused', firing: 'timerFiring', fired: 'timerFired', cancelled: 'timerCancelled', failed: 'timerFailed' })[timer.status];
                 var deliveryKey = ({ sent: 'timerDeliverySent', queued: 'timerDeliveryQueued', failed: 'timerDeliveryFailed' })[timer.delivery?.state];
                 var worker = timer.delivery?.workerSession;
-                var time = timer.fireAt ? new Date(timer.fireAt).toLocaleString() : '—';
+                var schedule = timer.schedule;
+                var cadence = schedule?.frequency === 'daily' ? t('timerDaily').replace('{time}', schedule.time)
+                  : schedule?.frequency === 'weekly' ? t('timerWeekly').replace('{weekday}', t('timerWeekday' + schedule.weekday)).replace('{time}', schedule.time) : null;
+                var time = timer.fireAt ? new Date(timer.fireAt).toLocaleString(undefined, schedule ? { timeZone: 'Asia/Shanghai' } : {}) : '—';
+                if (schedule) time = timer.status === 'cancelled' ? null : t('timerNext').replace('{time}', time);
                 return h('div', { key: timer.id, style: { margin: '8px 0' } },
                   h('strong', null, timer.message),
-                  h('div', { style: settingsHintStyle }, [ownerNames.get(timer.ownerId) || timer.ownerId, time, statusKey ? t(statusKey) : timer.status, deliveryKey ? t(deliveryKey) : null, timer.late ? t('timerLate') : null].filter(Boolean).join(' · ')),
+                  h('div', { style: settingsHintStyle }, [ownerNames.get(timer.ownerId) || timer.ownerId, cadence, time, statusKey ? t(statusKey) : timer.status, deliveryKey ? t(deliveryKey) : null, timer.late ? t('timerLate') : null].filter(Boolean).join(' · ')),
                   timer.lastError?.message || timer.delivery?.lastError
                     ? h('p', { role: 'alert', style: settingsHintStyle }, timer.lastError?.message ?? timer.delivery.lastError) : null,
                   h('div', { style: timerActionsStyle }, actions.map(action => h('button', { key: action, type: 'button', style: settingsButtonStyle, disabled: timerBusy, onClick: () => void act(timer, action) },
@@ -3004,6 +3111,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                       h('div', { style: { marginTop: '8px' } }, rows));
                   })),
             renderTimers(),
+            h(RunHistory, { onTask: ticketId => openStream({ ticketId }),
+              onWorker: canOpenOwnerSession ? async sessionId => await scoped.get('uiWorkspace').openSession(sessionId) : undefined }),
             renderIntake(),
             renderRecentMessages(),
             h('section', { style: sectionStyle, id: 'hub-bot-owners', 'aria-labelledby': 'hub-bot-owners-title' },

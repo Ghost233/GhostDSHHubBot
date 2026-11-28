@@ -38,6 +38,18 @@
     <div id="owners" class="cards"></div>
     <h2 class="q" id="timers-title" hidden>提醒</h2>
     <div id="timers" class="cards"></div>
+    <details id="run-history">
+      <summary class="q">后台运行记录</summary>
+      <label>通知状态 <select id="run-status">
+        <option value="">全部</option><option value="silent">未通知</option><option value="waiting">待发送或汇总</option>
+        <option value="sent">发送成功</option><option value="failed">发送失败</option><option value="in-progress">无发送记录</option>
+      </select></label>
+      <label>来源 <select id="run-source">
+        <option value="">全部</option><option value="github">GitHub</option><option value="timer">提醒</option>
+      </select></label>
+      <button id="run-refresh" class="btn" type="button">刷新运行记录</button>
+      <div id="run-list" class="cards" aria-live="polite"></div>
+    </details>
     <h2 class="q" id="intake-title" hidden>投喂口径（只读）</h2>
     <div id="intake" class="cards"></div>
     <h2 class="q">最近听到了什么？</h2>

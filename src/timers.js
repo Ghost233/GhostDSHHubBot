@@ -1,27 +1,16 @@
 /**
- * TimerService — persistent ONE-SHOT follow-up timers (S09 / issue #40).
+ * Persistent one-shot follow-ups and Asia/Shanghai daily or weekly reminders.
  *
- * A timer is a durable schedule document: 谁创建（createdBy）、替谁跟进（ownerId）、何时到点（fireAt）、
- * 到点说什么（message）、现在什么状态（status）. It survives host restarts because it lives in the SQLite
- * `timer` table (schema 1→2, appended migration in src/store.js).
+ * Timers survive restart in the SQLite `timer` table. Before calling `routeBackground`, persist the stable
+ * `triggerRef` (`timer:<timer-id>:<occurrence>`), due instant and lateness. The Router dedupes by triggerRef
+ * when a retry or a restart replays the intent.
  *
- * 先存后做 discipline (the same one the outbox and Router obey): before a due timer is handed to the Router
- * we PERSIST the due intent — the stable `triggerRef` (`timer:<timer-id>:<occurrence>`), the occurrence id,
- * the due instant and the lateness verdict. Only then do we call `routeBackground`. A crash between the two
- * leaves a 'firing' row whose next `tick()` retries with the SAME triggerRef, and the Router dedupes by
- * triggerRef, so one occurrence can never produce two tasks. Repeated ticks, concurrent ticks and reopen
- * all converge on "exactly one injection per occurrence".
+ * For recurring work, `fireAt` and `occurrenceId` track the next occurrence to submit. A Router receipt
+ * advances that schedule. `delivery` tracks the latest intent or receipt, and `queuedDeliveries` retains
+ * any older receipts whose worker prompt still awaits admission.
  *
- * The service never prompts a Session itself: it hands the follow-up to the normal Router background port
- * (`routeBackground`), which owns admission, slots, the dedicated worker Session, authorization storage and
- * delivery. That is why this module has no host dependencies and is testable with a fake clock and a fake
- * Router port.
- *
- * Scope boundary (deliberate):
- *   - one-shot only. There is no repeat schedule until S10; `occurrenceId` is the hook S10 extends.
- *   - `cancel()` stops future wakes and preserves the timer's history. The Router owns Session stops.
- *   - creating timers is a caller-authorized tool action (L1/L2 only). This module validates identity and
- *     owner state; the tool/permission layer decides who may call it (optional `authorizeCreate` seam).
+ * The Router owns worker delivery and execution. This service validates the owner and the creator from the
+ * authorized L1/L2 tool. Cancellation stops future wakes and preserves admitted work.
  */
 import { randomUUID } from 'node:crypto'
 
@@ -61,6 +50,10 @@ export const LATE_GRACE_MS = 60_000
 
 /** An absolute timestamp MUST carry an explicit timezone: `Z` or `±HH:MM`. A bare local time is ambiguous. */
 const ABSOLUTE_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/
+const LOCAL_TIME = /^(?:[01]\d|2[0-3]):[0-5]\d$/
+const TIME_ZONE = 'Asia/Shanghai'
+const DAY_MS = 86_400_000
+const shanghaiOffset = new Intl.DateTimeFormat('en', { timeZone: TIME_ZONE, timeZoneName: 'longOffset' })
 
 /** A timer operation was refused. `code` is the stable machine-readable reason the tools/panel render. */
 export class TimerError extends Error {
@@ -88,6 +81,83 @@ function toIso(ms) {
   return new Date(ms).toISOString()
 }
 
+function shanghaiOffsetMs(ms) {
+  const { value } = shanghaiOffset.formatToParts(ms).find(part => part.type === 'timeZoneName')
+  const [hours, minutes, seconds = 0] = value.slice(4).split(':').map(Number)
+  return ((hours * 60 + minutes) * 60 + seconds) * 1_000
+}
+
+// Shanghai calendar days represented as UTC midnights so date arithmetic is independent of the host zone.
+function shanghaiDay(ms) {
+  return Math.floor((ms + shanghaiOffsetMs(ms)) / DAY_MS) * DAY_MS
+}
+
+function shanghaiWeekday(day) {
+  return new Date(day).getUTCDay() || 7
+}
+
+function periodMs(schedule) {
+  return schedule.frequency === 'daily' ? DAY_MS : 7 * DAY_MS
+}
+
+function fireOnDay(schedule, day) {
+  const [hours, minutes] = schedule.time.split(':').map(Number)
+  const wallTime = day + (hours * 60 + minutes) * 60_000
+  const priorOffset = shanghaiOffsetMs(wallTime - DAY_MS)
+  const first = wallTime - priorOffset
+  const actualOffset = shanghaiOffsetMs(first)
+  if (actualOffset === priorOffset) return first
+  // Prefer the first instant of an overlap and move forward through a gap in historical offset rules.
+  const adjusted = wallTime - actualOffset
+  return adjusted + shanghaiOffsetMs(adjusted) === wallTime ? adjusted : Math.max(first, adjusted)
+}
+
+function parseSchedule(input, nowMs) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)
+    || Object.keys(input).some(key => !['frequency', 'time', 'weekday'].includes(key))) {
+    throw new TimerError('timer-schedule-invalid', 'timer_create: schedule must specify frequency, time and optional weekday.')
+  }
+  const { frequency, time, weekday } = input
+  if (frequency !== 'daily' && frequency !== 'weekly') {
+    throw new TimerError('timer-schedule-frequency', 'timer_create: schedule frequency must be daily or weekly.')
+  }
+  if (typeof time !== 'string' || !LOCAL_TIME.test(time)) {
+    throw new TimerError('timer-schedule-time', 'timer_create: schedule time must be HH:mm in Asia/Shanghai.')
+  }
+  if (weekday !== undefined && (frequency !== 'weekly' || !Number.isInteger(weekday) || weekday < 1 || weekday > 7)) {
+    throw new TimerError('timer-schedule-weekday', 'timer_create: weekday is only for weekly schedules and must be 1 (Monday) through 7 (Sunday).')
+  }
+  return { frequency, time, timeZone: TIME_ZONE,
+    ...(frequency === 'weekly' && { weekday: weekday ?? shanghaiWeekday(shanghaiDay(nowMs)) }),
+  }
+}
+
+function firstScheduledFire(schedule, nowMs) {
+  const today = shanghaiDay(nowMs)
+  const daysUntilFire = schedule.frequency === 'weekly' ? (schedule.weekday - shanghaiWeekday(today) + 7) % 7 : 0
+  const day = today + daysUntilFire * DAY_MS
+  const fireAt = fireOnDay(schedule, day)
+  return fireAt > nowMs ? fireAt : fireOnDay(schedule, day + periodMs(schedule))
+}
+
+function latestScheduledOccurrence(timer, nowMs) {
+  const period = periodMs(timer.schedule)
+  const firstDay = shanghaiDay(Date.parse(timer.fireAt))
+  let skipped = Math.floor((shanghaiDay(nowMs) - firstDay) / period)
+  if (skipped <= 0) return timer
+  let fireAt = fireOnDay(timer.schedule, firstDay + skipped * period)
+  if (fireAt > nowMs) {
+    skipped--
+    if (skipped === 0) return timer
+    fireAt = fireOnDay(timer.schedule, firstDay + skipped * period)
+  }
+  return {
+    ...timer,
+    fireAt: toIso(fireAt),
+    occurrenceId: String(Number(timer.occurrenceId) + skipped),
+  }
+}
+
 /** Keeps just the identity of a Feishu origin resolved by the caller. */
 function feishuOrigin(origin) {
   if (origin === undefined) return undefined
@@ -113,7 +183,7 @@ function feishuAuthorization(authorization, origin) {
 }
 
 /**
- * Persistent one-shot follow-up timers.
+ * Persistent follow-up and recurring timers.
  *
  * @param {{ store: import('./store.js').Store,
  *   getOwner: (ownerId: string) => (object | undefined),
@@ -164,17 +234,19 @@ export class TimerService {
   }
 
   /**
-   * Creates one pending one-shot follow-up.
+   * Creates a pending follow-up with an absolute `fireAt` or a daily or weekly `schedule`.
+   * Weekly schedules without a weekday use the Shanghai weekday at creation.
    *
    * `createdBy` identifies who set the reminder. `ownerId` identifies who owns the follow-up.
    * A verified Feishu event supplies the original ticket authorization. Direct reminders use the creator.
    *
-   * @param {{ ownerId: string, createdBy: string, fireAt: string, message: string,
+   * @param {{ ownerId: string, createdBy: string, message: string, fireAt?: string,
+   *   schedule?: { frequency: 'daily' | 'weekly', time: string, weekday?: number },
    *   origin?: { kind: 'feishu', triggerId: string, chatId: string, actor: string },
    *   authorization?: { actor: string, source: 'feishu', at: string, messageId?: string, addressing?: string } }} request
    * @returns {object} the stored timer document.
    */
-  create({ ownerId, createdBy, fireAt, message, origin, authorization } = {}) {
+  create({ ownerId, createdBy, fireAt, schedule, message, origin, authorization } = {}) {
     if (typeof ownerId !== 'string' || !ownerId.trim()) {
       throw new TimerError('owner-required', 'timer_create: ownerId must be a non-empty string — a follow-up always belongs to one owner')
     }
@@ -184,8 +256,12 @@ export class TimerService {
     if (typeof message !== 'string' || !message.trim()) {
       throw new TimerError('message-required', 'timer_create: message must be a non-empty string — that is what fires at fireAt')
     }
-    const fireAtMs = this.#parseAbsoluteFireAt(fireAt)
+    if (fireAt !== undefined && schedule !== undefined) {
+      throw new TimerError('timer-schedule-conflict', 'timer_create: provide either fireAt or schedule.')
+    }
     const nowMs = this.#nowMs()
+    const recurrence = schedule === undefined ? undefined : parseSchedule(schedule, nowMs)
+    const fireAtMs = recurrence ? firstScheduledFire(recurrence, nowMs) : this.#parseAbsoluteFireAt(fireAt)
     if (fireAtMs <= nowMs) {
       throw new TimerError('fire-at-past',
         'timer_create: fireAt ' + fireAt + ' is not in the future (now ' + toIso(nowMs) + ') — a one-shot follow-up must be scheduled ahead')
@@ -216,13 +292,13 @@ export class TimerService {
       message: message.trim(),
       ...(sourceOrigin && { origin: sourceOrigin }),
       ...(sourceAuthorization && { authorization: sourceAuthorization }),
-      // Canonical UTC instant for comparison/delivery + the exact string the human gave, kept for display.
+      // Canonical UTC instant for comparison and delivery. Preserve the input for one-shot display.
       fireAt: toIso(fireAtMs),
-      fireAtInput: fireAt,
+      ...(recurrence ? { schedule: recurrence } : { fireAtInput: fireAt }),
       createdAt: at,
       updatedAt: at,
       status: 'pending',
-      // One-shot: the single occurrence identity. S10 turns this into a counter for repeating schedules.
+      // Scheduled slots are numbered from creation, including any later misses that are coalesced.
       occurrenceId: '1',
       attempts: 0,
       nextAttemptAt: null,
@@ -239,8 +315,7 @@ export class TimerService {
 
   /**
    * Lists timers in creation order (oldest first), optionally scoped to one owner. `remainingMs` is a computed
-   * view field (never persisted): how long until the next fire for a pending timer, or the frozen remainder for
-   * a paused one.
+   * view field (never persisted): time until the stored `fireAt` for a pending or paused timer.
    *
    * The SQL `ORDER BY at` only pre-sorts the scan; `at` is the NEVER_DUE sentinel for paused/terminal rows, so
    * it is NOT a display order. The authoritative order is applied below: `createdAt`, then `rowid` (insertion
@@ -268,13 +343,22 @@ export class TimerService {
     return timer === undefined ? undefined : this.#view(timer, this.#nowMs())
   }
 
-  /** Whether the current persisted occurrence may still deliver its initial worker prompt. */
+  /** Whether a persisted occurrence may deliver its initial worker prompt. */
   canDeliver(timerId, triggerRef) {
-    if (this.#store.closed || typeof triggerRef !== 'string' || !triggerRef) return false
+    return this.deliveryState(timerId, triggerRef) === 'ready'
+  }
+
+  /** @returns {'ready' | 'paused' | 'closed'} Admission state of an exact persisted occurrence. */
+  deliveryState(timerId, triggerRef) {
+    if (this.#store.closed || typeof triggerRef !== 'string' || !triggerRef) return 'closed'
     const timer = this.#read(timerId)
-    return Boolean(timer && (FIREABLE.has(timer.status) || timer.status === 'fired')
-      && timer.delivery?.triggerRef === triggerRef && timer.delivery.occurrenceId === timer.occurrenceId
-      && this.#delivery(timer.delivery).state === 'queued')
+    if (!timer || timer.status === 'cancelled') return 'closed'
+    const { delivery, occurrenceId, queuedDeliveries, schedule } = timer
+    const earlier = queuedDeliveries?.find(candidate => candidate.triggerRef === triggerRef)
+    const latest = delivery?.triggerRef === triggerRef && (schedule || delivery.occurrenceId === occurrenceId)
+    const receipt = earlier ?? (latest && timer.status !== 'failed' ? delivery : null)
+    if (this.#delivery(receipt)?.state !== 'queued') return 'closed'
+    return timer.status === 'paused' ? 'paused' : 'ready'
   }
 
   /**
@@ -300,7 +384,7 @@ export class TimerService {
   }
 
   /**
-   * Resumes the same occurrence. The next scan catches up once if its absolute fireAt has passed.
+   * Resumes scanning and allows the Router to admit already-queued occurrences.
    *
    * @returns {{ timer: object, changed: boolean }}
    */
@@ -323,8 +407,8 @@ export class TimerService {
   }
 
   /**
-   * Cancels a pending or queued occurrence and keeps its timer record.
-   * Once the initial prompt is sent, cancel reports `alreadyFired`.
+   * Cancels future recurring occurrences and outstanding queued receipts, including after a scheduling failure.
+   * A one-shot with an admitted or failed prompt returns its existing terminal result.
    *
    * @returns {{ timer: object, changed: boolean, alreadyFired?: boolean, alreadyFailed?: boolean }}
    */
@@ -333,10 +417,13 @@ export class TimerService {
     const nowMs = this.#nowMs()
     const view = this.#view(timer, nowMs)
     if (timer.status === 'cancelled') return { timer: view, changed: false }
-    if (timer.status === 'failed' || view.delivery?.state === 'failed') return { timer: view, changed: false, alreadyFailed: true }
-    if (view.delivery?.state === 'sent' || (timer.status === 'fired' && view.delivery?.state !== 'queued')) {
+    if (!timer.schedule && (timer.status === 'failed' || view.delivery?.state === 'failed')) {
+      return { timer: view, changed: false, alreadyFailed: true }
+    }
+    if (!timer.schedule && (view.delivery?.state === 'sent' || (timer.status === 'fired' && view.delivery?.state !== 'queued'))) {
       return { timer: view, changed: false, alreadyFired: true }
     }
+    const cancelQueued = delivery => delivery?.state === 'queued' ? { ...delivery, state: 'cancelled' } : delivery
     const nowIso = toIso(nowMs)
     const next = this.#write({
       ...timer,
@@ -344,7 +431,8 @@ export class TimerService {
       cancelledAt: nowIso,
       cancelRequestedDuringFire: timer.status === 'firing',
       nextAttemptAt: null,
-      delivery: view.delivery && { ...view.delivery, state: 'cancelled' },
+      delivery: cancelQueued(view.delivery),
+      ...(view.queuedDeliveries && { queuedDeliveries: view.queuedDeliveries.map(cancelQueued) }),
       updatedAt: nowIso,
     })
     return { timer: this.#view(next, nowMs), changed: true }
@@ -354,8 +442,8 @@ export class TimerService {
    * Drives every due timer once. Called from the existing 1-second host tick.
    *
    * Deterministic under repetition: the due intent (stable triggerRef) is persisted before delivery, so a
-   * second tick, a concurrent tick, or a reopen after a crash all retry the SAME occurrence identity and the
-   * Router returns the ticket it already created. A timer therefore fires exactly once.
+   * second tick, a concurrent tick, or a reopen after a crash all retry the same occurrence identity and the
+   * Router returns the ticket it already created.
    *
    * @returns {Promise<{ due: number, fired: number, retried: number, failed: number, skipped: number }>}
    */
@@ -377,11 +465,13 @@ export class TimerService {
       if (this.#store.closed) break
       const timer = this.#read(row.id)
       if (!timer || !FIREABLE.has(timer.status) || timer.fireAt > nowIso) { result.skipped++; continue }
-      // Already delivered (the row is kept for the human): never a second injection.
-      if (timer.delivery?.state === 'sent') { result.skipped++; continue }
+      if (!timer.schedule && timer.delivery?.state === 'sent') { result.skipped++; continue }
       // Backoff gate: a transient failure must not hot-spin the 1s tick.
       if (timer.nextAttemptAt && Date.parse(timer.nextAttemptAt) > nowMs) { result.skipped++; continue }
-      const outcome = await this.#fire(timer, nowMs)
+      // An existing intent owns its slot through retries. Coalesce only slots without an intent.
+      const occurrence = timer.schedule && timer.delivery?.occurrenceId !== timer.occurrenceId
+        ? latestScheduledOccurrence(timer, nowMs) : timer
+      const outcome = await this.#fire(occurrence, nowMs)
       if (outcome === 'fired') result.fired++
       else if (outcome === 'retried') result.retried++
       else if (outcome === 'failed') result.failed++
@@ -411,9 +501,15 @@ export class TimerService {
       kind: 'timer', timerId: timer.id, occurrenceId, fireAt, late,
       ...(timer.origin && { origin: timer.origin }),
     }
+    // Keep older Router tickets eligible while advancing to a new occurrence.
+    const queuedDeliveries = timer.schedule && [
+      ...(timer.queuedDeliveries ?? []),
+      ...(timer.delivery && !previous ? [timer.delivery] : []),
+    ].map(delivery => this.#delivery(delivery)).filter(delivery => delivery.state === 'queued')
     // 先存后做: the due intent is durable BEFORE anything is delivered.
     const intent = this.#write({
       ...timer,
+      ...(queuedDeliveries && { queuedDeliveries }),
       status: 'firing',
       attempts: (timer.attempts ?? 0) + 1,
       late,
@@ -481,9 +577,15 @@ export class TimerService {
   #settle(timer, delivery, at) {
     const cancelled = timer.status === 'cancelled'
     const sent = delivery.state === 'sent'
+    const next = timer.schedule && !cancelled ? {
+      status: 'pending',
+      fireAt: toIso(fireOnDay(timer.schedule, shanghaiDay(Date.parse(delivery.fireAt)) + periodMs(timer.schedule))),
+      occurrenceId: String(Number(delivery.occurrenceId) + 1),
+      attempts: 0,
+    } : { status: cancelled ? 'cancelled' : 'fired' }
     this.#write({
       ...timer,
-      status: cancelled ? 'cancelled' : 'fired',
+      ...next,
       firedAt: cancelled && !sent ? timer.firedAt : delivery.at,
       nextAttemptAt: null,
       lastError: null,
@@ -519,7 +621,12 @@ export class TimerService {
   #view(timer, nowMs) {
     let remainingMs = null
     if (['pending', 'paused'].includes(timer.status)) remainingMs = Math.max(0, Date.parse(timer.fireAt) - nowMs)
-    return { ...timer, remainingMs, delivery: this.#delivery(timer.delivery) }
+    return {
+      ...timer,
+      remainingMs,
+      delivery: this.#delivery(timer.delivery),
+      ...(timer.queuedDeliveries && { queuedDeliveries: timer.queuedDeliveries.map(delivery => this.#delivery(delivery)) }),
+    }
   }
 
   /** Projects the ticket's current evidence onto the durable occurrence receipt. */
@@ -537,7 +644,7 @@ export class TimerService {
       return { ...current, state: 'sent', sentAt: ticket.lastDelivery.at }
     }
     if (delivery.state !== 'queued') return current
-    if (current.stage === 'failed') return { ...current, state: 'failed', lastError: ticket.failed?.reason ?? delivery.lastError ?? null }
+    if (current.stage === 'failed') return { ...current, state: 'failed', lastError: ticket?.failed?.reason ?? delivery.lastError ?? null }
     if (current.stage === 'done') return { ...current, state: 'cancelled' }
     return current
   }
