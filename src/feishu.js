@@ -135,7 +135,7 @@ export class FeishuSource {
         ? undefined
         : this.credentialState === 'invalid' ? this.credentialError ?? UNAVAILABLE : MISSING,
       wsState,
-      registration: enabled && this.registering ? 'pending' : undefined,
+      registration: enabled ? (this.registering ? 'pending' : this.registrationError ? 'failed' : undefined) : undefined,
       registrationError: enabled ? this.registrationError ?? undefined : undefined,
       qr: enabled ? this.lastQr ?? undefined : undefined,
       preset: BOT_PRESET,

@@ -316,7 +316,13 @@ function renderSettings(view) {
       card.append(el('div', { class: 'small ' + (fs.bot.connected ? 'ok-text' : 'warn-text') }, text('● ' + conn)))
     }
     fSection.append(card)
-    if (invalid) fSection.append(el('p', { class: 'warn-text small' }, text('凭据无效——请重新扫码绑定。')))
+    if (invalid) {
+      const hint = fs.credentialReason === 'credentials-unavailable' ? '宿主凭据服务不可用，请检查 DSH 的凭据服务和存储状态。'
+        : fs.credentialReason === 'credentials-malformed' ? '凭据记录格式无效，请检查现有 Bot 的引用和绑定。' : '凭据失效，请检查现有 Bot 的凭据记录。'
+      fSection.append(el('p', { class: 'warn-text small' }, text(hint)))
+    }
+    if (fs.registration === 'pending') fSection.append(el('p', { role: 'status', class: 'small' }, text('绑定请求已受理，等待授权和凭据保存。')))
+    if (fs.registration === 'failed') fSection.append(el('p', { role: 'alert', class: 'warn-text small' }, text('绑定失败 · ' + fs.registrationError)))
     // 权限申明（明文）：绑定前告知将申请什么，绑定后展示已授权什么
     const permTitle = bound ? '已申明权限' : '将申明的权限（扫码时一次确认）'
     const permList = el('ul', { class: 'perm-list' })

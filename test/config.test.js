@@ -98,7 +98,7 @@ test('workspaces section: custom chiefPath/chiefTitle, strict validation', () =>
   assert.throws(() => resolveConfig({ ...valid(), workspaces: { nope: 1 } }), ConfigError)
 })
 
-// 凭据只该由扫码绑定（registerApp）写进 stateDir/feishu-credentials.json；配置里的明文 appSecret 是 v1 遗留
+// 凭据由 DSH 宿主凭据库保存。配置里的明文 appSecret 是 v1 遗留
 // 人工降级通道，v2 必须拒绝并给出迁移提示——且报错文本绝不能回显密钥本身（凭据不进日志/报错）。
 test('S04 regression: resolveConfig rejects a legacy plaintext feishu appSecret without echoing it', () => {
   const fakeSecret = 'fake-secret-do-not-echo-4f2a'

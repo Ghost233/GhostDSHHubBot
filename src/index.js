@@ -63,11 +63,11 @@ export const Config = z.object({
   }).description('GUI 工作区归位 (#52)：负责人会话出生即落进工作区。'),
   feishu: z.object({
     enabled: z.boolean().description('飞书入口开关。'),
-    // Keep the retired keys recognizable so resolveConfig can give a migration error.
-    appId: z.string().description('已停用。请将飞书应用绑定移入 DSH 宿主凭据库。'),
-    appSecret: z.string().description('已停用。请将飞书应用绑定移入 DSH 宿主凭据库。'),
-    botOpenId: z.string().description('机器人自身 open_id（回环防护用，通常自动解析）。'),
-    credentialRef: z.string().description('DSH 凭据记录引用，默认 hub-bot/feishu。'),
+    // Accept the retired keys at the schema boundary so resolveConfig can report how to migrate.
+    appId: z.string().hidden(),
+    appSecret: z.string().hidden(),
+    botOpenId: z.string().description('机器人自身 open_id（群聊定向使用）。'),
+    credentialRef: z.string().description('DSH 凭据记录引用，默认 hub-bot/feishu。保存后重新加载插件。'),
   }).description('飞书渠道（设备流绑定见面板；配置只留引用，不落明文凭据）。'),
   github: z.object({
     enabled: z.boolean().description('GitHub 监听开关（新 Issue/@mention → 自动建票）。'),
@@ -421,7 +421,9 @@ export function apply(ctx, rawConfig) {
     if (!config.feishu.enabled) throw new HttpError(400, '请先启用飞书，再扫码绑定。')
     if (feishu.registering) return { started: false, registration: 'pending', qr: feishu.lastQr }
     void feishu.register().catch(error => ctx.logger.warn('hub-bot feishu register failed: %s', error?.message ?? error))
-    return { started: true }
+    const status = feishu.status()
+    if (status.registration === 'failed') throw new HttpError(400, status.registrationError)
+    return { started: true, registration: 'pending' }
   }
 
   const serviceDeps = {}
@@ -741,8 +743,7 @@ export function apply(ctx, rawConfig) {
           // 面板健康视图: credentialState 'invalid'/'missing' = 提示重新扫码.
           json(res, 200, feishu.status())
         } else if (route === 'feishu/register' && method === 'POST') {
-          // 扫码建应用: starts the device flow in the background; poll feishu/status for the QR url, then
-          // for credentialState 'ok' once the user confirmed on the phone.
+          // Acknowledges the scan request. Poll feishu/status for the QR and the binding outcome.
           const reply = startFeishuRegister()
           json(res, reply.started ? 202 : 200, reply)
         } else if (route === 'feishu/simulate' && method === 'POST') {

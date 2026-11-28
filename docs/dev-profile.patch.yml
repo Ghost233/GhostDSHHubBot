@@ -51,7 +51,7 @@
     devApi:
       token: bede31152c2d4b35a4598d3b91f144e7
     # 飞书入口（#68）样本：enabled 打开入口与 recorded 回投扫描；授权边界在飞书侧（应用可用范围），插件无白名单。
-    # 凭证不进 profile——registerApp 扫码流程写入 stateDir/feishu-credentials.json（0600）；appId/appSecret 仅作人工降级。
+    # 沿用旧 Bot 时，将其绑定存入 DSH 宿主凭据库的 grant 记录。默认记录名为 hub-bot/feishu。
     feishu:
       enabled: true
       # botOpenId: 'ou_bot_open_id'  # 群聊 @bot 判定用；缺省时任何 @ 即算（MVP 宽松）

@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { registerHooks } from 'node:module'
+import { setImmediate } from 'node:timers/promises'
 import { test } from 'node:test'
 import { Context as PackageContext } from '@deepseek-ai/cordis'
 import { runtimeRequire } from '../scripts/test-runtime.mjs'
@@ -55,3 +57,70 @@ for (const [label, Context] of contexts) {
     })
   }
 }
+
+test('Feishu registration acknowledgement and asynchronous write failure are separately observable', { timeout: 3000 }, async t => {
+  const homeRepo = await mkdtemp(join(tmpdir(), 'hub-bot-registration-'))
+  const controller = new PackageContext()
+  const writing = Promise.withResolvers()
+  const releaseWrite = Promise.withResolvers()
+  const fixtureSecret = 'synthetic-only-s04-sdk-secret'
+  const source = new URL('../src/feishu.js', import.meta.url).href
+  const sdk = 'data:text/javascript,' + encodeURIComponent('export const registerApp = async () => (' + JSON.stringify({ client_id: 'fixture-bot', client_secret: fixtureSecret }) + ')')
+  const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
+    if (specifier === '@larksuiteoapi/node-sdk' && context.parentURL === source) return { url: sdk, shortCircuit: true }
+    return nextResolve(specifier, context)
+  } })
+  let route
+  let installed
+  t.after(async () => {
+    releaseWrite.resolve()
+    await installed?.dispose()
+    hooks.deregister()
+    await rm(homeRepo, { recursive: true, force: true })
+  })
+  controller.provide('sessionController', {})
+  controller.provide('sessionPersistence', {})
+  controller.provide('credentials', {
+    async readRecord() { return undefined },
+    async modifyRecord(key) {
+      assert.equal(key, 'hub-bot/feishu')
+      writing.resolve()
+      await releaseWrite.promise
+      throw new Error('mock provider rejected ' + fixtureSecret)
+    },
+  })
+  controller.provide('webServer', { host: '127.0.0.1', port: 3199, register(entry) {
+    route = entry.handler
+    return () => { route = undefined }
+  } })
+  installed = controller.plugin(plugin, {
+    homeRepo, stateDir: join(homeRepo, 'state'), workspaces: { enabled: false },
+    feishu: { enabled: true }, devApi: { token: 'fixture-registration-token' },
+  })
+  await installed
+  const settings = controller.reflect.get('hubBotSettings', false)
+  async function request(path, method) {
+    let code, body
+    await route({ url: '/hub-bot/api/feishu/' + path, method, headers: { host: '127.0.0.1:3199', 'x-hub-bot-token': 'fixture-registration-token' } }, {
+      writeHead(status) { code = status },
+      end(value) { body = JSON.parse(value) },
+    })
+    return { code, body }
+  }
+  const acknowledgement = await request('register', 'POST')
+  assert.equal(acknowledgement.code, 202)
+  assert.equal(acknowledgement.body.registration, 'pending')
+  await writing.promise
+  const pending = (await request('status', 'GET')).body
+  assert.equal(pending.registration, 'pending')
+  assert.equal(pending.credentialState, 'missing')
+  releaseWrite.resolve()
+  await setImmediate()
+  const failed = (await request('status', 'GET')).body
+  assert.equal(failed.registration, 'failed')
+  assert.equal(failed.credentialState, 'missing')
+  assert.equal(failed.bot, undefined)
+  assert.match(failed.registrationError, /无法保存宿主凭据记录/)
+  assert.doesNotMatch(JSON.stringify(failed), new RegExp(fixtureSecret))
+  assert.deepEqual(JSON.parse(JSON.stringify((await settings.read()).feishu.status)), failed)
+})
