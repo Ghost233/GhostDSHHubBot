@@ -84,7 +84,7 @@ function transcriptPage() {
  * `searchItems` 让内容搜索路径也返回命中项（与清单同样经 sessionCwd 复核责任边界）。
  * `agentId` 是调用方身份（dsh-agent 的 agent.id 即 SessionId）；`undefined` 表示 agent 上下文里没有 id。
  */
-function ownerToolsHarness(f, { agentId = f.ownerSessionId, extraSessions = [], searchItems = [] } = {}) {
+function ownerToolsHarness(f, { agentId = f.ownerSessionId, extraSessions = [], searchItems = [], presets = {} } = {}) {
   const tools = new Map()
   const pageRequests = []
   const prompts = []
@@ -94,6 +94,7 @@ function ownerToolsHarness(f, { agentId = f.ownerSessionId, extraSessions = [], 
     systemPrompt: { section() {} },
     tools: { register: def => tools.set(def.name, def) },
     workingDirectory: { ensure: async () => f.owner.cwd },
+    sessionPersistence: { stat: async id => presets[id] ? { header: { agentPreset: presets[id] } } : undefined },
     sessionController: {
       // 目标会话在负责人 cwd 子树内 → 越界拒执不拦；责任边界判定是真实代码路径。
       list: async () => ({ items: [
@@ -352,5 +353,27 @@ test('S03 regression: search_sessions tags current and displaced owner Sessions 
     const searchRoles = new Map(searched.sessions.map(s => [s.sessionId, s.role]))
     assert.equal(searchRoles.get(currentSessionId), 'owner', '内容搜索路径同样把当前负责人会话标 role=owner')
     assert.equal(searchRoles.get(displacedSessionId), 'owner', '内容搜索路径同样把历史负责人会话标 role=owner')
+  } finally { f.cleanup() }
+})
+
+test('legacy owner presets are not exposed as workers when old bindings were never stored', async () => {
+  const f = fixture()
+  try {
+    const sessionId = 'session-v1-displaced-owner'
+    assert.equal(f.registry.isOwnerSession(sessionId), false)
+    const h = ownerToolsHarness(f, {
+      extraSessions: [{ sessionId, cwd: f.owner.cwd, running: false }],
+      searchItems: [{ sessionId, snippet: 'old owner' }],
+      presets: { [sessionId]: 'hub-bot-owner' },
+    })
+    for (const args of [{}, { query: 'old owner' }]) {
+      const { sessions } = await h.tools.get('search_sessions').execute(args, h.exec)
+      assert.equal(sessions.find(item => item.sessionId === sessionId).role, 'owner')
+    }
+    await assert.rejects(h.tools.get('read_session').execute({ sessionId }, h.exec), /is an owner session/)
+    await assert.rejects(h.tools.get('inject_session').execute({ sessionId, text: 'fixture' }, h.exec), /is an owner session/)
+    await assert.rejects(h.tools.get('fork_session').execute({ sessionId, ticketId: 'fixture', reason: 'fixture' }, h.exec), /is an owner session/)
+    assert.equal(h.pageRequests.length, 0)
+    assert.equal(h.prompts.length, 0)
   } finally { f.cleanup() }
 })

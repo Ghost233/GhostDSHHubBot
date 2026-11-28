@@ -187,6 +187,7 @@ async function ownerToolsHarness(f) {
     systemPrompt: { section() {} },
     tools: { register: def => tools.set(def.name, def) },
     workingDirectory: { ensure: async () => f.owner.cwd },
+    sessionPersistence: { stat: async () => undefined },
     sessionController: {
       list: async () => ({ items: [{ sessionId: 'session-w1', cwd: join(f.owner.cwd, 'worker') }] }),
       prompt: async request => { prompts.push(request); return { accepted: true } },

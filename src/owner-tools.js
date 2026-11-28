@@ -69,30 +69,31 @@ async function callerOwner(ctx, api, exec) {
   return owner
 }
 
-/**
- * Guard: an owner instance is never an L3 execution target. A current binding, an id displaced by a rebuild, and a
- * recycled owner's Session all count: injecting into one talks to another owner, or to the orphan a rebuild left
- * alive. read/inject/fork refuse such a target by name — never a silent no-op.
- */
-function mustNotBeOwnerSession(api, sessionId, tool) {
-  if (!api.registry.isOwnerSession(sessionId)) return
-  throw new Error(tool + ': session ' + sessionId + ' is an owner session (负责人实例), not an L3 execution session — read/inject/fork refuse it; if you need a decision from that owner, call escalate with the reason')
+const OWNER_PRESETS = new Set(['hub-bot-owner', 'hub-bot-router'])
+
+/** Current bindings, remembered bindings, and v1 owner sessions recorded only by DSH. */
+async function isOwnerSession(ctx, api, item, signal) {
+  const { sessionId } = item
+  if (api.registry.isOwnerSession(sessionId) || OWNER_PRESETS.has(item.projections?.values?.agentPreset)) return true
+  const stored = await ctx.sessionPersistence.stat(sessionId, { signal })
+  return api.registry.isOwnerSession(sessionId) || OWNER_PRESETS.has(stored?.header?.agentPreset)
 }
 
-/** The session's recorded cwd, looked up in the controller inventory; undefined when unknown. */
-async function sessionCwd(ctx, sessionId, signal) {
+function refuseOwnerTarget(sessionId, tool) {
+  throw new Error(tool + ': session ' + sessionId + ' is an owner session (负责人实例)')
+}
+
+async function workerCwd(ctx, api, owner, sessionId, tool, signal) {
+  if (api.registry.isOwnerSession(sessionId)) refuseOwnerTarget(sessionId, tool)
   const listed = await ctx.sessionController.list({}, signal)
-  const item = (listed.items ?? []).find(s => s.sessionId === sessionId)
-  return item?.cwd === undefined ? undefined : norm(item.cwd)
-}
-
-/** Guard: refuse targets outside the owner's responsibility subtree (越界拒执 — escalate instead). */
-async function mustBeInside(ctx, owner, sessionId, signal) {
-  const cwd = await sessionCwd(ctx, sessionId, signal)
-  if (cwd === undefined) throw new Error('unknown session "' + sessionId + '" in the controller inventory')
+  const item = (listed.items ?? []).find(session => session.sessionId === sessionId)
+  if (item?.cwd === undefined) throw new Error('unknown session "' + sessionId + '" in the controller inventory')
+  const cwd = norm(item.cwd)
   if (!isWithinCwd(norm(owner.cwd), cwd)) {
-    throw new Error('session ' + sessionId + ' (cwd ' + cwd + ') is outside this owner\'s subtree ' + owner.cwd + ' — do NOT act across repos; call escalate with the reason instead')
+    throw new Error('session ' + sessionId + ' (cwd ' + cwd + ') is outside this owner’s subtree ' + owner.cwd)
   }
+  if (await isOwnerSession(ctx, api, item, signal)) refuseOwnerTarget(sessionId, tool)
+  if (api.registry.findByCurrentSession(owner.sessionId)?.id !== owner.id) throw new Error('the calling session is no longer the current owner binding')
   return cwd
 }
 
@@ -169,26 +170,20 @@ export function apply(ctx) {
       const owner = await callerOwner(ctx, api, exec)
       const signal = exec?.signal ?? AbortSignal.timeout(30000)
       const limit = args.limit ?? 20
-      if (args.query) {
-        const found = await ctx.sessionController.search({ query: args.query }, signal)
-        const items = []
-        for (const hit of found.items ?? []) {
-          const cwd = await sessionCwd(ctx, hit.sessionId, signal)
-          if (cwd !== undefined && isWithinCwd(norm(owner.cwd), cwd)) items.push({ sessionId: hit.sessionId, cwd, snippet: hit.snippet })
-          if (items.length >= limit) break
-        }
-        // Same classification as the list path: an owner instance is tagged, never offered as an L3 candidate.
-        return { sessions: items.map(s => ({ ...s, role: api.registry.isOwnerSession(s.sessionId) ? 'owner' : 'session' })) }
-      }
       const listed = await ctx.sessionController.list({}, signal)
-      // Tag EVERY owner instance, not just current bindings: a Session displaced by an owner rebuild (or left behind
-      // by a recycle) keeps its owner preset but is no longer the row's sessionId — isOwnerSession() also matches
-      // previousSessionIds, so such an orphan is still never mistaken for an L3 worker (issue #34).
-      const sessions = (listed.items ?? [])
-        .filter(s => s.cwd !== undefined && isWithinCwd(norm(owner.cwd), norm(s.cwd)))
-        .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
-        .slice(0, limit)
-        .map(s => ({ sessionId: s.sessionId, cwd: norm(s.cwd), running: Boolean(s.running), role: api.registry.isOwnerSession(s.sessionId) ? 'owner' : 'session' }))
+      const visible = (listed.items ?? []).filter(item => item.cwd !== undefined && isWithinCwd(norm(owner.cwd), norm(item.cwd)))
+      const matching = args.query ? await ctx.sessionController.search({ query: args.query }, signal) : null
+      const byId = new Map(visible.map(item => [item.sessionId, item]))
+      const hits = matching ? (matching.items ?? []).flatMap(hit => {
+        const item = byId.get(hit.sessionId)
+        return item ? [{ item, snippet: hit.snippet }] : []
+      }) : visible.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)).map(item => ({ item }))
+      const sessions = []
+      for (const { item, snippet } of hits.slice(0, limit)) {
+        const role = await isOwnerSession(ctx, api, item, signal) ? 'owner' : 'session'
+        sessions.push({ sessionId: item.sessionId, cwd: norm(item.cwd), running: Boolean(item.running), role, ...(snippet !== undefined && { snippet }) })
+      }
+      if (api.registry.findByCurrentSession(owner.sessionId)?.id !== owner.id) throw new Error('the calling session is no longer the current owner binding')
       return { sessions }
     },
   })
@@ -223,8 +218,7 @@ export function apply(ctx) {
     execute: async (args, exec) => {
       const owner = await callerOwner(ctx, api, exec)
       const signal = exec?.signal ?? AbortSignal.timeout(30000)
-      mustNotBeOwnerSession(api, args.sessionId, 'read_session')
-      await mustBeInside(ctx, owner, args.sessionId, signal)
+      await workerCwd(ctx, api, owner, args.sessionId, 'read_session', signal)
       const page = await ctx.sessionController.page({ address: { kind: 'session', sessionId: args.sessionId }, maxMessages: 200 }, signal)
       return { lines: compactTranscript(page, args.maxMessages ?? 30), seqs: transcriptSeqs(page) }
     },
@@ -285,8 +279,7 @@ export function apply(ctx) {
       if (typeof args.text !== 'string' || !args.text.trim()) throw new Error('inject_session: text must be a non-empty string')
       const owner = await callerOwner(ctx, api, exec)
       const signal = exec?.signal ?? AbortSignal.timeout(60000)
-      mustNotBeOwnerSession(api, args.sessionId, 'inject_session')
-      await mustBeInside(ctx, owner, args.sessionId, signal)
+      await workerCwd(ctx, api, owner, args.sessionId, 'inject_session', signal)
       let text
       if (args.ticketId !== undefined) {
         const ticket = mustOwnTicket(api, owner, args.ticketId)
@@ -393,8 +386,7 @@ export function apply(ctx) {
     execute: async (args, exec) => {
       const owner = await callerOwner(ctx, api, exec)
       const signal = exec?.signal ?? AbortSignal.timeout(30000)
-      mustNotBeOwnerSession(api, args.sessionId, 'fork_session')
-      const cwd = await mustBeInside(ctx, owner, args.sessionId, signal)
+      const cwd = await workerCwd(ctx, api, owner, args.sessionId, 'fork_session', signal)
       mustOwnTicket(api, owner, args.ticketId)
       try {
         const action = buildForkAction({ sessionId: args.sessionId, cwd, atSeq: args.atSeq, reason: args.reason })
