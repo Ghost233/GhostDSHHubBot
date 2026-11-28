@@ -348,6 +348,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       intakeDropped: '已丢弃',
       intakeInjected: '已注入',
       intakePending: '待注入',
+      intakeFailed: '投递失败',
       intakeInterrupt: '停止请求',
       intakeInterruptRequested: '已请求停止',
       intakeTriggers: '触发',
@@ -714,6 +715,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       intakeDropped: 'dropped',
       intakeInjected: 'injected',
       intakePending: 'awaiting injection',
+      intakeFailed: 'delivery failed',
       intakeInterrupt: 'Stop request',
       intakeInterruptRequested: 'Stop requested',
       intakeTriggers: 'triggers',
@@ -1697,6 +1699,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     reply.sentAt ? h('time', { dateTime: reply.sentAt, title: reply.sentAt }, t('replySent') + ' · ' + new Date(reply.sentAt).toLocaleString()) : null,
                     reply.attempts > 0 && reply.state !== 'sent' ? fill(t('messageAttempts'), reply.attempts) : null,
                     reply.lastError && reply.state !== 'sent' ? h('div', null, reply.lastError) : null)) : null) : null,
+              detail?.result?.intake ? h('p', { key: 'intake', style: settingsHintStyle },
+                t('intakeDisposition') + ' · ' + t(({
+                  dropped: 'intakeDropped', injected: 'intakeInjected', pending: 'intakePending', failed: 'intakeFailed',
+                  interrupt: 'intakeInterrupt', 'interrupt-requested': 'intakeInterruptRequested',
+                })[detail.result.intake.disposition] || 'intakePending'),
+                detail.result.intake.lastError ? h('span', null, ' · ' + detail.result.intake.lastError) : null) : null,
               detail?.result?.replyUnlinked ? h('p', { key: 'unlinked', style: settingsHintStyle }, t('replyUnlinkedHint')) : null,
             ] : null));
         }

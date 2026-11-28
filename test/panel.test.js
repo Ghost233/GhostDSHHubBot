@@ -627,3 +627,19 @@ test('settings view merges the effective config with live source status', () => 
   assert.deepEqual(view.github.followed, [{ repo: 'o/r', ownerId: 'repo-w' }], '监听清单跟随注册表（只读）')
   assert.equal(view.github.status.lastPollError, null)
 })
+
+test('message detail distinguishes pending, failed, and admitted intake for the same event', () => {
+  const { store, cleanup } = fixture()
+  try {
+    const trigger = { id: 'feishu-fixture-detail', kind: 'feishu', at: '2026-11-15T00:00:00.000Z', message: 'fixture', policy: { mode: 'queue' }, injectedAt: null }
+    store.db.prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)').run(trigger.id, JSON.stringify(trigger), trigger.at)
+    const intent = insertOutbox(store, { kind: 'inbox', to: 'owner:chief', state: 'queued', triggerId: trigger.id })
+    assert.equal(readMessageDetail(store, trigger.id).intake.disposition, 'pending')
+    const save = store.db.prepare('UPDATE outbox SET value = ? WHERE id = ?')
+    save.run(JSON.stringify({ ...intent, state: 'failed', lastError: 'fixture timeout' }), intent.id)
+    assert.deepEqual(readMessageDetail(store, trigger.id).intake, { disposition: 'failed', queueState: 'failed', lastError: 'fixture timeout' })
+    save.run(JSON.stringify({ ...intent, state: 'sent' }), intent.id)
+    store.db.prepare('UPDATE trigger SET value = ? WHERE id = ?').run(JSON.stringify({ ...trigger, injectedAt: trigger.at }), trigger.id)
+    assert.equal(readMessageDetail(store, trigger.id).intake.disposition, 'injected')
+  } finally { cleanup() }
+})

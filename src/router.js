@@ -89,6 +89,19 @@ export class Router {
     })
   }
 
+  #persistWork(write) {
+    const db = this.store.db
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      const result = write()
+      db.exec('COMMIT')
+      return result
+    } catch (error) {
+      if (db.isTransaction) db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
   #insertTrigger(row) {
     this.store.db.prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)').run(row.id, JSON.stringify(row), row.at)
     return row
@@ -130,9 +143,7 @@ export class Router {
       injectedAt: null,
       policy: previous?.policy ?? { ...incoming.policy, mode: incoming.dropped ? 'drop' : stop ? 'interrupt' : 'queue' },
     }
-    const db = this.store.db
-    db.exec('BEGIN IMMEDIATE')
-    try {
+    this.#persistWork(() => {
       if (previous) this.#updateTrigger(trigger)
       else this.#insertTrigger(trigger)
       if (trigger.dropped === 'unsupported-type') {
@@ -146,11 +157,7 @@ export class Router {
           body: trigger.message, sessionId: stop ? this.registry.get('chief')?.sessionId ?? null : null, requestId,
         })
       }
-      db.exec('COMMIT')
-    } catch (error) {
-      db.exec('ROLLBACK')
-      throw error
-    }
+    })
     if (stop) {
       this.#currentStops.add(outboxId)
       await this.runner.tick({ kind: 'stop' })
@@ -440,50 +447,58 @@ export class Router {
     const existing = triggerRef === undefined ? undefined : this.getTrigger(triggerRef)
     if (existing) {
       const ticket = this.#ticketByTrigger(triggerRef)
-      if (ticket || existing.kind !== 'feishu') {
+      if (ticket || !['feishu', 'route'].includes(existing.kind)) {
+        const sessionId = ticket ? ticket.targetSession ?? this.registry.get(ticket.owner)?.sessionId : owner.sessionId
         return {
-          ownerId: ticket?.owner ?? ownerId, sessionId: ticket?.targetSession ?? owner.sessionId,
-          ticketId: ticket?.id ?? null, requestId: ticket?.requestId ?? null,
+          ownerId: ticket?.owner ?? ownerId, ...(sessionId && { sessionId }),
+          ...(ticket && { ticketId: ticket.id }), requestId: ticket?.requestId ?? null,
           createdSession: false, rebuilt: false, deduped: true, stage: ticket ? normalizeStage(ticket.stage) : null,
         }
       }
-      if (existing.dropped || !existing.authorization || String(existing.source?.messageId ?? '').startsWith('om_selftest-')) {
-        throw new RouterError('invalid-route-trigger', 'route_to_owner: the Feishu message is not eligible for dispatch')
+      if (existing.dropped || !existing.authorization || existing.policy?.mode === 'interrupt'
+        || String(existing.source?.messageId ?? '').startsWith('om_selftest-')) {
+        throw new RouterError('invalid-route-trigger', 'route_to_owner: this event is not eligible for dispatch')
+      }
+      if (existing.kind === 'route' && existing.ownerId !== ownerId) {
+        throw new RouterError('route-owner-mismatch', 'route_to_owner: this event already belongs to another owner')
       }
     }
     const at = this.now()
     const auth = existing?.authorization ?? authorization ?? { actor: 'user', source: 'dsh', at }
-    const trigger = existing ?? this.#insertTrigger({
-      id: triggerRef ?? 'trg-' + this.ids.uuid(), kind: 'route', ownerId, message, authorization: auth, at,
-      source: { kind: 'route', addressing: auth.addressing ?? 'direct' },
-      policy: { addressing: auth.addressing ?? 'direct', mode: 'queue', allowed: true, reason: null },
-    })
-    const ensured = await this.#ensureSession(owner)
+    const addressing = auth.addressing ?? 'direct'
+    const instruction = existing?.kind === 'route' ? existing.message : message
+    const trigger = existing ?? {
+      id: triggerRef ?? 'trg-' + this.ids.uuid(), kind: 'route', ownerId, message: instruction, authorization: auth, at,
+      source: { kind: 'route', addressing },
+      policy: { addressing, mode: 'queue', allowed: true, reason: null },
+    }
     const requestId = 'hub-bot-route-' + this.ids.uuid()
     const freshTicketId = 'tsk-' + this.ids.uuid()
-    // #72 执行槽： with every per-owner slot busy the new task queues （排队中） — trigger, ticket and the
-    // HELD injection row are all stored now （先存后做）; the row delivers when a slot frees (#promoteQueued).
-    // The ledger counts working tickets only: handing a task back to a person releases the slot at once
-    // (spec「并发与人的优先」). count→insert→enqueue run synchronously — no interleaving mid-decision.
     const atCapacity = this.#workingCount(ownerId) >= this.#slotsPerOwner()
-    // 先存后做： the ticket waits as 待触发 (idle) — or 排队中 (queued) at capacity — until the stored
-    // injection is actually delivered.
-    this.#insertTicket({
-      id: freshTicketId, triggerId: trigger.id, owner: ownerId, stage: atCapacity ? 'queued' : 'idle', mechanism: 'inject',
-      targetSession: ensured.sessionId, requestId, authorization: auth, createdAt: at, updatedAt: at,
-      ...(existing && { routedMessage: message }),
+    // Write the source, ticket, and confirmation or delivery intent before creating a Session.
+    const awaitingConfirmation = this.#persistWork(() => {
+      if (!existing) this.#insertTrigger(trigger)
+      this.#insertTicket({
+        id: freshTicketId, triggerId: trigger.id, owner: ownerId, stage: atCapacity ? 'queued' : 'idle', mechanism: 'inject',
+        targetSession: owner.sessionId, requestId, authorization: auth, createdAt: at, updatedAt: at,
+        ...(existing?.kind === 'feishu' && { routedMessage: instruction }),
+      })
+      if (this.#holdDangerous(freshTicketId, instruction, 'route')) return true
+      const text = '[hub-bot 路由 ' + freshTicketId + '] ' + instruction + '\n\n授权：' + auth.actor + ' 经 ' + auth.source + ' 于 ' + auth.at + '；任务 ' + freshTicketId
+      this.runner.enqueue({
+        ticketId: freshTicketId, triggerId: trigger.id, kind: 'inject',
+        to: owner.sessionId ? 'session:' + owner.sessionId : 'owner:' + ownerId,
+        sessionId: owner.sessionId, body: text, requestId, held: atCapacity,
+      })
+      return false
     })
-    // 危险命令黑名单 (spec「Policy」安全兜底): 命中即挂起 — 票转 person/confirm, 原文落票面 action,
-    // 不 enqueue 任何注入; 用户确认后由 #confirmDangerousInject 放行。GitHub/飞书/L1/devApi 皆汇于此, 同护。
-    if (this.#holdDangerous(freshTicketId, message, 'route')) {
-      const heldTicket = this.tasks.getTicket(freshTicketId)
-      return { ownerId, sessionId: ensured.sessionId, ticketId: freshTicketId, requestId, createdSession: ensured.created, rebuilt: false, deduped: false, stage: heldTicket.stage }
-    }
-    const text = '[hub-bot 路由 ' + freshTicketId + '] ' + message + '\n\n授权：' + auth.actor + ' 经 ' + auth.source + ' 于 ' + auth.at + '；任务 ' + freshTicketId
-    this.runner.enqueue({ ticketId: freshTicketId, kind: 'inject', to: 'session:' + ensured.sessionId, sessionId: ensured.sessionId, body: text, requestId, held: atCapacity })
-    await this.runner.tick()
+    if (!awaitingConfirmation) await this.runner.tick()
     const stored = this.tasks.getTicket(freshTicketId)
-    return { ownerId, sessionId: stored.targetSession, ticketId: freshTicketId, requestId, createdSession: ensured.created, rebuilt: stored.lastDelivery?.rebuilt ?? false, deduped: false, stage: stored.stage }
+    const sessionId = stored.targetSession ?? this.registry.get(ownerId)?.sessionId ?? null
+    return {
+      ownerId, ...(sessionId !== null && { sessionId }), ticketId: freshTicketId, requestId, createdSession: !owner.sessionId && sessionId !== null,
+      rebuilt: stored.lastDelivery?.rebuilt ?? false, deduped: false, stage: stored.stage,
+    }
   }
 
   #serialized(key, fn) {

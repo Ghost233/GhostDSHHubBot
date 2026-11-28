@@ -380,9 +380,18 @@ export function readMessageDetail(store, triggerId) {
   const tickets = store.db.prepare("SELECT id FROM ticket WHERE json_extract(value, '$.triggerId') = ?").all(triggerId)
   const ticketTriggers = new Map(tickets.map(ticket => [ticket.id, triggerId]))
   const { row, unlinked } = indexMessageReplies(store, new Map([[triggerId, trigger]]), ticketTriggers)(trigger)
+  const intakeRows = store.db.prepare(
+    "SELECT value FROM outbox WHERE json_extract(value, '$.triggerId') = ? "
+    + "AND json_extract(value, '$.kind') IN ('inbox', 'stop', 'inject')",
+  ).all(triggerId).map(record => JSON.parse(String(record.value)))
+  const delivery = pickQueueRow(intakeRows)
   return {
     id: triggerId, message: storedMessage(trigger), at: trigger.at ?? null,
     dropped: trigger.dropped ?? null, replyUnlinked: unlinked,
+    intake: trigger.policy || delivery ? {
+      disposition: delivery?.state === 'failed' ? 'failed' : intakeDisposition(trigger, null),
+      queueState: delivery?.state ?? null, lastError: delivery?.lastError ?? null,
+    } : null,
     reply: row ? { ...projectReply(row), sentAt: row.sentAt ?? null } : null,
   }
 }

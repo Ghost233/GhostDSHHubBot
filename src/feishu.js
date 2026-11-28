@@ -417,7 +417,6 @@ export class FeishuSource {
     const msg = this.normalize(raw)
     if (typeof msg.messageId !== 'string' || !msg.messageId || typeof msg.chatId !== 'string' || !msg.chatId) {
       return { dropped: 'malformed' }
-      return { dropped: 'malformed' } // 形状都不对: 没有可信的 dedup 键，不落任何行
     }
     return this.#acceptViaRouter(msg)
   }
