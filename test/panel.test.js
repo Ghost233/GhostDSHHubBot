@@ -643,3 +643,15 @@ test('message detail distinguishes pending, failed, and admitted intake for the 
     assert.equal(readMessageDetail(store, trigger.id).intake.disposition, 'injected')
   } finally { cleanup() }
 })
+
+test('message detail agrees with the overview after routing an owner request', async () => {
+  const { router, registry, store, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Details fixture', cwd: '/repos/details' })
+    const triggerId = 'fixture-route-detail'
+    await router.routeToOwner({ ownerId: owner.id, triggerRef: triggerId, message: 'fixture routing request' })
+    const overview = buildOverview({ store, registry })
+    assert.equal(overview.intake.sources.find(entry => entry.triggerId === triggerId)?.disposition, 'injected')
+    assert.equal(readMessageDetail(store, triggerId)?.intake?.disposition, 'injected')
+  } finally { cleanup() }
+})

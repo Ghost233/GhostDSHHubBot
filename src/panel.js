@@ -377,8 +377,9 @@ export function readMessageDetail(store, triggerId) {
   const record = store.db.prepare('SELECT value FROM trigger WHERE id = ?').get(triggerId)
   if (!record) return null
   const trigger = JSON.parse(String(record.value))
-  const tickets = store.db.prepare("SELECT id FROM ticket WHERE json_extract(value, '$.triggerId') = ?").all(triggerId)
+  const tickets = store.db.prepare("SELECT id, value FROM ticket WHERE json_extract(value, '$.triggerId') = ? ORDER BY rowid").all(triggerId)
   const ticketTriggers = new Map(tickets.map(ticket => [ticket.id, triggerId]))
+  const ticket = tickets.length ? JSON.parse(String(tickets.at(-1).value)) : null
   const { row, unlinked } = indexMessageReplies(store, new Map([[triggerId, trigger]]), ticketTriggers)(trigger)
   const intakeRows = store.db.prepare(
     "SELECT value FROM outbox WHERE json_extract(value, '$.triggerId') = ? "
@@ -389,7 +390,7 @@ export function readMessageDetail(store, triggerId) {
     id: triggerId, message: storedMessage(trigger), at: trigger.at ?? null,
     dropped: trigger.dropped ?? null, replyUnlinked: unlinked,
     intake: trigger.policy || delivery ? {
-      disposition: delivery?.state === 'failed' ? 'failed' : intakeDisposition(trigger, null),
+      disposition: delivery?.state === 'failed' ? 'failed' : intakeDisposition(trigger, ticket),
       queueState: delivery?.state ?? null, lastError: delivery?.lastError ?? null,
     } : null,
     reply: row ? { ...projectReply(row), sentAt: row.sentAt ?? null } : null,
