@@ -307,12 +307,14 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       feishuConnecting: '连接中',
       feishuReconnecting: '正在重连',
       feishuCredentialsInvalid: '凭据失效',
-      feishuInvalid: '凭据失效 — 请重新扫码绑定',
+      feishuInvalid: '凭据失效，请检查现有 Bot 的凭据记录。',
+      feishuCredentialsUnavailable: '宿主凭据服务不可用。请检查 DSH 的凭据服务和存储状态。',
+      feishuCredentialsMalformed: '凭据记录格式无效。请检查现有 Bot 的引用和绑定。',
       feishuBindStart: '开始扫码绑定',
       feishuBinding: '正在等待二维码…',
       feishuScanHint: '用飞书手机 App 扫码完成授权；二维码有时效，过期请重新发起。',
       feishuPermsTitle: '权限申明（授权时将申请）',
-      feishuBindFailed: '发起绑定失败',
+      feishuBindFailed: '绑定失败',
       feishuDisabled: '飞书入口已暂停。',
       feishuEnableSwitch: '启用飞书入口',
       feishuPausedBound: '飞书入口已暂停，现有绑定已保留。',
@@ -638,12 +640,14 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       feishuConnecting: 'Connecting',
       feishuReconnecting: 'Reconnecting',
       feishuCredentialsInvalid: 'Credentials invalid',
-      feishuInvalid: 'Credentials invalid — scan to re-bind',
+      feishuInvalid: 'Credentials are invalid. Check the existing bot’s credential record.',
+      feishuCredentialsUnavailable: 'The host credential service is unavailable. Check the DSH credential service and store.',
+      feishuCredentialsMalformed: 'The credential record is malformed. Check the existing bot’s binding and reference.',
       feishuBindStart: 'Start scan-to-bind',
       feishuBinding: 'Waiting for the QR code…',
       feishuScanHint: 'Scan with the Feishu mobile app to authorize; the QR code expires — restart if it does.',
       feishuPermsTitle: 'Permissions (requested at authorization)',
-      feishuBindFailed: 'Failed to start binding',
+      feishuBindFailed: 'Binding failed',
       feishuDisabled: 'Feishu is paused.',
       feishuEnableSwitch: 'Enable Feishu',
       feishuPausedBound: 'Feishu is paused. The existing bot binding is saved.',
@@ -1115,6 +1119,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
         function feishuPresentation(enabled, status) {
           if (!enabled) return { label: 'disabled', stage: 'idle' };
           if (status.registration === 'pending') return { label: 'feishuBindingStatus', stage: 'working' };
+          if (status.registration === 'failed') return { label: 'feishuBindFailed', stage: 'failed' };
           if (status.credentialState === 'invalid') return { label: 'feishuCredentialsInvalid', stage: 'failed' };
           if (status.credentialState !== 'ok') return { label: 'feishuWaitingBind', stage: 'queued' };
           if (status.wsState === 'reconnecting') return { label: 'feishuReconnecting', stage: 'working' };
@@ -1132,6 +1137,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var feishu = health.feishu || {};
           var connection = feishuPresentation(feishu.enabled, feishu);
           if (connection.label === 'feishuCredentialsInvalid') items.push(t('healthFeishuCred'));
+          if (connection.label === 'feishuBindFailed') items.push(t(connection.label));
           if (connection.label === 'feishuWsDown') items.push(t('healthFeishuWs'));
           var gh = health.github || {};
           var problems = gh.enabled ? githubProblemCount(gh) : 0;
@@ -1152,6 +1158,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var pending = enabled && fs.registration === 'pending';
           var form = useSettingsForm(scoped, { enabled }, edits => ({ feishu: edits }), props.onSaved);
           var invalid = fs.credentialState === 'invalid' && !pending;
+          var credentialHint = fs.credentialReason === 'credentials-unavailable' ? 'feishuCredentialsUnavailable'
+            : fs.credentialReason === 'credentials-malformed' ? 'feishuCredentialsMalformed' : 'feishuInvalid';
           var connection = feishuPresentation(enabled, fs);
           var connectionTone = TONES[STAGE_TONE[connection.stage]];
           var bs = React.useState(false); var busy = bs[0]; var setBusy = bs[1];
@@ -1194,7 +1202,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 mtParts.map(function (part, i) { return h('span', { key: i }, part); })));
             }
           } else if (enabled) {
-            if (invalid) rows.push(h('p', { key: 'inv', style: { fontSize: '13px', color: TONES.red.fg, margin: '0 0 4px' } }, t('feishuInvalid')));
+            if (invalid) rows.push(h('p', { key: 'inv', style: { fontSize: '13px', color: TONES.red.fg, margin: '0 0 4px' } }, t(credentialHint)));
             else if (!pending) rows.push(h('div', { key: 'nb', style: { marginBottom: '4px' } },
               h('div', { style: { fontWeight: 600 } }, t('feishuNotBound')),
               h('p', { style: { fontSize: '12px', opacity: 0.75, margin: '4px 0' } }, t('feishuSetupHint'))));

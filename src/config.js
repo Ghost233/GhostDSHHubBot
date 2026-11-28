@@ -11,6 +11,7 @@
  */
 import { isAbsolute } from 'node:path'
 import { DEFAULT_DANGEROUS_PATTERNS, validateDangerousPatterns } from './security.js'
+import { DEFAULT_FEISHU_CREDENTIAL_REF, isFeishuCredentialRef } from './feishu-credentials.js'
 
 /** The configuration keys this plugin understands. Anything else is rejected so typos cannot pass silently. */
 const KNOWN_KEYS = new Set(['stateDir', 'homeRepo', 'devApi', 'reporting', 'feishu', 'github', 'concurrency', 'security', 'chief', 'workspaces'])
@@ -21,8 +22,10 @@ const KNOWN_REPORTING_KEYS = new Set(['auto', 'intervalMs'])
 /** The keys the optional development management API understands. */
 const KNOWN_DEV_API_KEYS = new Set(['token'])
 
-/** The keys the Feishu entry (#68) understands. OFF unless enabled; the allowlist names authorized open_ids. */
-const KNOWN_FEISHU_KEYS = new Set(['enabled', 'appId', 'appSecret', 'botOpenId'])
+/** The keys the Feishu entry (#68) understands. OFF unless enabled; the allowlist names authorized open_ids.
+ *  `appId`/`appSecret` stay listed on purpose: they are the retired v1 plaintext credential channel, and naming them
+ *  lets the validation below answer with a migration hint instead of a bare "unknown key" typo message. */
+const KNOWN_FEISHU_KEYS = new Set(['enabled', 'appId', 'appSecret', 'botOpenId', 'credentialRef'])
 
 /** The keys the GitHub loop (#71) understands. Watched repos FOLLOW the owner registry (repo owners' origins),
  *  so there is no config list — a stale `repos` key is rejected by strict validation below. */
@@ -141,7 +144,7 @@ export function resolveConfig(config) {
   if (raw.feishu !== undefined) {
     const rawFeishu = raw.feishu
     if (typeof rawFeishu !== 'object' || rawFeishu === null || Array.isArray(rawFeishu)) {
-      throw new ConfigError('hub-bot config.feishu must be an object { enabled?, appId?, appSecret?, botOpenId? }')
+      throw new ConfigError('hub-bot config.feishu must be an object { enabled?, botOpenId?, credentialRef? }')
     }
     for (const key of Object.keys(rawFeishu)) {
       if (!KNOWN_FEISHU_KEYS.has(key)) throw new ConfigError('hub-bot does not know config.feishu key ["' + key + '"]')
@@ -150,12 +153,22 @@ export function resolveConfig(config) {
       if (typeof rawFeishu.enabled !== 'boolean') throw new ConfigError('hub-bot config.feishu.enabled must be a boolean')
       feishu.enabled = rawFeishu.enabled
     }
-    // appId/appSecret here are a manual fallback (凭据失效人工降级); the registerApp flow writes stateDir instead.
-    for (const key of ['appId', 'appSecret', 'botOpenId']) {
-      if (rawFeishu[key] !== undefined) {
-        if (typeof rawFeishu[key] !== 'string' || !rawFeishu[key]) throw new ConfigError('hub-bot config.feishu.' + key + ' must be a non-empty string')
-        feishu[key] = rawFeishu[key]
+    const legacyCredentialKeys = ['appId', 'appSecret'].filter(key => Object.hasOwn(rawFeishu, key))
+    if (legacyCredentialKeys.length > 0) {
+      throw new ConfigError(
+        'hub-bot feishu 凭据迁移：请删掉 config.feishu.' + legacyCredentialKeys.join(' / config.feishu.') +
+        '，将现有应用绑定存入宿主 credentials 的 grant，并用 config.feishu.credentialRef 指向它（默认 ' + DEFAULT_FEISHU_CREDENTIAL_REF + '）。',
+      )
+    }
+    if (rawFeishu.credentialRef !== undefined) {
+      if (!isFeishuCredentialRef(rawFeishu.credentialRef)) {
+        throw new ConfigError('hub-bot config.feishu.credentialRef must be a hub-bot/<lowercase-id> credential record reference')
       }
+      feishu.credentialRef = rawFeishu.credentialRef
+    }
+    if (rawFeishu.botOpenId !== undefined) {
+      if (typeof rawFeishu.botOpenId !== 'string' || !rawFeishu.botOpenId) throw new ConfigError('hub-bot config.feishu.botOpenId must be a non-empty string')
+      feishu.botOpenId = rawFeishu.botOpenId
     }
   }
   resolved.feishu = feishu

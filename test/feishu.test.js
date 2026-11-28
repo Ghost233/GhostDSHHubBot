@@ -5,18 +5,19 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, statSync, readFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Store } from '../src/store.js'
 import { OwnerRegistry } from '../src/registry.js'
 import { Router } from '../src/router.js'
-import { FeishuSource, credentialPath } from '../src/feishu.js'
+import { FeishuSource } from '../src/feishu.js'
+import { CredentialsError, DEFAULT_FEISHU_CREDENTIAL_REF, MALFORMED, MISSING, UNAVAILABLE } from '../src/feishu-credentials.js'
 import { insertOutbox } from '../src/outbox.js'
 import { resolveConfig } from '../src/config.js'
 
-/** A registry+router+source with fake sessions and a fake lark SDK; sent messages land in sent. */
-function fixture({ botOpenId = 'ou_bot', larkOverrides = {}, chiefConfig } = {}) {
+/** A registry+router+source with fake sessions, Lark SDK, and DSH credential records. */
+function fixture({ botOpenId = 'ou_bot', larkOverrides = {}, chiefConfig, credentials = fakeCredentialsPort(), config } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'hub-bot-feishu-'))
   const store = new Store(dir)
   const registry = new OwnerRegistry(store, { scratchRoot: join(dir, 'scratch') })
@@ -40,16 +41,38 @@ function fixture({ botOpenId = 'ou_bot', larkOverrides = {}, chiefConfig } = {})
   }
   const source = new FeishuSource({
     store, registry, sessions,
-    config: { enabled: true, botOpenId },
+    config: config ?? { enabled: true, botOpenId },
     chiefConfig,
     logger: { info() {}, warn() {} },
     lark: fakeLark,
     now: () => new Date(nowMs).toISOString(),
+    credentials,
   })
   return {
-    source, router, registry, store, calls, sent, fakeLark,
+    source, router, registry, store, calls, sent, fakeLark, dir,
     advance: ms => { nowMs += ms },
     cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }) },
+  }
+}
+
+/** Fake the asynchronous, namespaced DSH credential record service. */
+function fakeCredentialsPort({ record, readError, beforeWrite } = {}) {
+  const records = new Map()
+  if (record !== undefined) records.set(DEFAULT_FEISHU_CREDENTIAL_REF, record)
+  const writeKeys = []
+  return {
+    records, writeKeys,
+    async readRecord(key) {
+      if (readError) throw readError
+      return records.get(key)
+    },
+    async modifyRecord(key, mutate) {
+      writeKeys.push(key)
+      await beforeWrite?.()
+      const next = await mutate(records.get(key))
+      if (next !== undefined) records.set(key, next)
+      return next
+    },
   }
 }
 
@@ -252,36 +275,40 @@ test('ws metrics persist in kv and surface in status (连接质量)', () => {
   } finally { f.cleanup() }
 })
 
-test('credentials persist with mode 0600 and reload; status reports missing/ok', async () => {
-  const { source, store, cleanup } = fixture()
+test('S04 regression: a scoped persistent grant supplies the binding after remount', async () => {
+  const credentials = fakeCredentialsPort()
+  const config = { enabled: true, credentialRef: 'hub-bot/existing-feishu' }
+  const f = fixture({ credentials, config })
   try {
-    assert.equal(source.status().credentialState, 'missing')
-    source.saveCredentials({ appId: 'cli_1', appSecret: 's_1' })
-    const file = credentialPath(store.stateDir)
-    assert.equal(statSync(file).mode & 0o777, 0o600, 'credential file is owner-only')
-    const persisted = JSON.parse(readFileSync(file, 'utf8'))
-    assert.equal(persisted.appId, 'cli_1')
-    assert.equal(persisted.appSecret, 's_1')
-    assert.equal(typeof persisted.boundAt, 'string', '绑定时间落盘（面板名片用）')
-    assert.equal(source.status().credentialState, 'ok')
-    const st = source.status()
-    assert.ok(st.bot, '绑定后出现 bot 名片')
-    assert.equal(st.bot.name, 'DSH 中枢 Bot')
-    assert.ok(st.permissions.length >= 4, '权限明文清单随行')
-    // 未绑定时无名片有预告
-    const s2 = fixture()
+    await f.source.credentialsReady
+    assert.equal(f.source.status().credentialReason, MISSING)
+    await f.source.saveCredentials({ appId: 'fixture-app-0001', appSecret: 'fixture-record-first' })
+    await f.source.saveCredentials({ appId: 'fixture-app-0002', appSecret: 'fixture-record-rebind' })
+    assert.deepEqual(credentials.writeKeys, [config.credentialRef, config.credentialRef])
+    assert.deepEqual(credentials.records.get(config.credentialRef), {
+      kind: 'grant', payload: { appId: 'fixture-app-0002', appSecret: 'fixture-record-rebind', boundAt: '2026-11-15T00:00:00.000Z' },
+    })
+    assert.equal(f.source.status().bot.name, 'DSH 中枢 Bot')
+    assert.equal(f.source.status().permissions.length, 4)
+    const restarted = fixture({ credentials, config })
     try {
-      assert.equal(s2.source.status().bot, undefined)
-      assert.equal(s2.source.status().preset.name, 'DSH 中枢 Bot')
-    } finally { s2.cleanup() }
-  } finally { cleanup() }
+      await restarted.source.credentialsReady
+      assert.equal(restarted.source.status().credentialState, 'ok')
+      assert.deepEqual(restarted.source.status().bot, f.source.status().bot)
+      assert.doesNotMatch(JSON.stringify(restarted.source.status()), /fixture-record-rebind/)
+    } finally { restarted.cleanup() }
+  } finally { f.cleanup() }
 })
 
-test('register() runs the device flow: QR surfaced, credentials saved 0600, event-mode patch attempted (未验证)', async () => {
+test('register() surfaces the QR and waits for the DSH grant before connecting', async () => {
   const calls = { patch: [] }
   const qr = Promise.withResolvers()
   const complete = Promise.withResolvers()
-  const { source, store, cleanup } = fixture({
+  const writing = Promise.withResolvers()
+  const persisted = Promise.withResolvers()
+  const credentials = fakeCredentialsPort({ beforeWrite() { writing.resolve(); return persisted.promise } })
+  const { source, cleanup } = fixture({
+    credentials,
     larkOverrides: {
       registerApp: async options => {
         options.onQRCodeReady({ url: 'https://accounts.feishu.cn/scan?x=1', expireIn: 300 })
@@ -301,10 +328,14 @@ test('register() runs the device flow: QR surfaced, credentials saved 0600, even
     await qr.promise
     assert.equal(source.status().qr.url, 'https://accounts.feishu.cn/scan?x=1')
     complete.resolve({ client_id: 'cli_new', client_secret: 'secret_new' })
+    await writing.promise
+    assert.equal(source.status().credentialState, 'missing')
+    assert.equal(calls.patch.length, 0)
+    persisted.resolve()
     const result = await flow
     assert.equal(result.appId, 'cli_new')
     assert.equal(source.status().qr, undefined)
-    assert.equal(statSync(credentialPath(store.stateDir)).mode & 0o777, 0o600)
+    assert.equal(credentials.records.get(DEFAULT_FEISHU_CREDENTIAL_REF)?.kind, 'grant')
     assert.equal(calls.patch.length, 1, 'event-subscription mode auto-config attempted once')
     assert.ok(String(calls.patch[0].url).includes('application'), 'application-config patch')
   } finally { cleanup() }
@@ -321,7 +352,7 @@ test('pausing Feishu closes the active socket and ignores stale callbacks', asyn
     EventDispatcher: class { register(handlers) { this.handlers = handlers; return this } },
   } })
   try {
-    f.source.saveCredentials({ appId: 'fixture-app', appSecret: 'fixture-secret' })
+    await f.source.saveCredentials({ appId: 'fixture-app', appSecret: 'fixture-secret' })
     const connect = f.source.connect()
     assert.equal((await f.source.connect()).started, false)
     await connect
@@ -410,4 +441,80 @@ test('deliverReplies sends recorded rows oldest-first (ORDER BY rowid — 收敛
     await source.deliverReplies()
     assert.deepEqual(sent, ['第一条', '第二条'], '按入队顺序实投')
   } finally { cleanup() }
+})
+
+// 凭据设施 fail-closed 的回归（issue #35 v2 阶段 1）：写入没成功就绝不允许出现「已绑定」的假状态——
+// 面板状态只反映凭据设施里真实存在的那条记录。
+test('S04 regression: asynchronous credential write failure leaves a new binding unconfirmed', async () => {
+  const writing = Promise.withResolvers()
+  const persisted = Promise.withResolvers()
+  const credentials = fakeCredentialsPort({ beforeWrite() { writing.resolve(); return persisted.promise } })
+  const f = fixture({ credentials })
+  try {
+    const registering = f.source.register()
+    const failure = assert.rejects(registering, error => {
+      assert.ok(error instanceof CredentialsError)
+      assert.equal(error.reason, UNAVAILABLE)
+      assert.doesNotMatch(error.message, /secret_new/)
+      return true
+    })
+    await writing.promise
+    assert.equal(f.source.status().credentialState, 'missing')
+    assert.equal(f.source.status().bot, undefined)
+    persisted.reject(new Error('provider write failed: secret_new'))
+    await failure
+    assert.equal(f.source.status().credentialState, 'missing')
+    assert.equal(f.source.status().bot, undefined)
+    assert.equal(f.source.status().wsState, 'off')
+    assert.match(f.source.status().registrationError, /无法保存宿主凭据记录/)
+    assert.doesNotMatch(JSON.stringify(f.source.status()), /secret_new/)
+    assert.equal(credentials.records.size, 0)
+  } finally { persisted.resolve(); f.source.disconnect(); f.cleanup() }
+})
+
+test('S04 regression: an unconfirmed write preserves the previous binding', async () => {
+  const record = { kind: 'grant', payload: { appId: 'fixture-app-0001', appSecret: 'previous-secret' } }
+  const credentials = fakeCredentialsPort({ record })
+  credentials.modifyRecord = async () => undefined
+  const f = fixture({ credentials })
+  try {
+    await f.source.credentialsReady
+    const original = f.source.status().bot
+    await assert.rejects(f.source.saveCredentials({ appId: 'fixture-app-0002', appSecret: 'unsaved-secret' }), { reason: UNAVAILABLE })
+    assert.deepEqual(f.source.status().bot, original)
+    assert.deepEqual(credentials.records.get(DEFAULT_FEISHU_CREDENTIAL_REF), record)
+  } finally { f.cleanup() }
+})
+
+test('S04 regression: missing, malformed, and unavailable host records are distinguishable', async () => {
+  for (const [credentials, reason] of [
+    [fakeCredentialsPort(), MISSING],
+    [fakeCredentialsPort({ record: { kind: 'grant', payload: { appId: 'fixture-app' } } }), MALFORMED],
+    [fakeCredentialsPort({ readError: new Error('fixture secret must not leave the provider') }), UNAVAILABLE],
+    [null, UNAVAILABLE],
+  ]) {
+    const f = fixture({ credentials })
+    try {
+      await f.source.credentialsReady
+      const status = f.source.status()
+      assert.equal(status.credentialState, reason === MISSING ? 'missing' : 'invalid')
+      assert.equal(status.credentialReason, reason)
+      assert.equal(status.bot, undefined)
+      assert.doesNotMatch(JSON.stringify(status), /fixture secret/)
+      await assert.rejects(f.source.connect(), /no credentials/)
+    } finally { f.cleanup() }
+  }
+})
+
+test('S04 regression: an old local Feishu credential file is not used as a fallback', async () => {
+  const f = fixture({ credentials: null })
+  try {
+    writeFileSync(join(f.store.stateDir, 'feishu-credentials.json'), JSON.stringify({ appId: 'fixture-old', appSecret: 'old-secret' }), { mode: 0o600 })
+    const source = new FeishuSource({ store: f.store, logger: { info() {}, warn() {} }, config: { enabled: true } })
+    await source.credentialsReady
+    assert.equal(source.status().credentialReason, UNAVAILABLE)
+    assert.equal(source.status().bot, undefined)
+    await assert.rejects(source.register(), /宿主凭据服务不可用/)
+    assert.doesNotMatch(JSON.stringify(source.status()), /old-secret/)
+  } finally { f.cleanup() }
 })
