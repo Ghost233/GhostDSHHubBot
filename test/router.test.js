@@ -805,3 +805,51 @@ test('a routed request survives a failed session create and reopens with its sav
     rmSync(directory, { recursive: true, force: true })
   }
 })
+
+test('overlapping stop requests are recorded without interrupting the next turn', { timeout: 2500 }, async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'hub-bot-stop-overlap-'))
+  const store = new Store(directory)
+  const registry = new OwnerRegistry(store, { scratchRoot: join(directory, 'scratch') })
+  registry.ensureChief({ cwd: directory, workspace: 'Fixture' })
+  registry.bindSession('chief', 'fixture-chief')
+  const entered = Promise.withResolvers()
+  const release = Promise.withResolvers()
+  const cancelled = []
+  let turn = 'first'
+  const router = new Router({ store, registry, sessions: {
+    async cancel({ sessionId }) {
+      assert.equal(sessionId, 'fixture-chief')
+      cancelled.push(turn)
+      entered.resolve()
+      await release.promise
+      return { accepted: true }
+    },
+  } })
+  const stop = number => {
+    const at = '2026-11-15T00:00:00.000Z'
+    const messageId = 'stop-fixture-' + number
+    return router.acceptFeishuTrigger({
+      id: 'feishu-' + messageId, kind: 'feishu', message: '停止', at,
+      source: { chatId: 'fixture-chat', messageId, addressing: 'direct' },
+      authorization: { actor: 'fixture-user', source: 'feishu', at },
+    })
+  }
+  try {
+    const first = stop(1)
+    await entered.promise
+    const second = await stop(2)
+    assert.equal(second.queued, false)
+    release.resolve()
+    await first
+    turn = 'next'
+    await router.tick()
+    assert.deepEqual(cancelled, ['first'])
+    const saved = router.listOutbox().find(row => row.id === second.outboxId)
+    assert.equal(saved.state, 'recorded')
+    assert.equal(saved.skipReason, 'interrupt-in-flight')
+  } finally {
+    release.resolve()
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})

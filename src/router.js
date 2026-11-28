@@ -57,7 +57,7 @@ export class Router {
   #lastAutoReportText = null
   // Owner queues protect execution slots. Trigger queues prevent duplicate tickets across owners.
   #queues = new Map()
-  #currentStops = new Set()
+  #currentStops = new Map()
 
   constructor({ store, registry, sessions, tasks, runner, config, now, ids, onSystemProblem, placer }) {
     this.store = store
@@ -137,6 +137,8 @@ export class Router {
     }
 
     const stop = !previous && !incoming.dropped && ['停', '停止'].includes(incoming.message)
+    const sessionId = stop ? this.registry.get('chief')?.sessionId ?? null : null
+    const skipStop = stop && (!sessionId ? 'no-current-session' : this.#currentStops.has(sessionId) ? 'interrupt-in-flight' : null)
     const trigger = {
       ...(previous ?? incoming),
       ownerId: 'chief',
@@ -151,16 +153,25 @@ export class Router {
           id: outboxId, ticketId: null, triggerId: id, kind: 'reply', to: 'feishu:chat:' + trigger.source.chatId,
           body: UNSUPPORTED_MESSAGE_TYPE, state: 'recorded', requestId: 'hub-bot-feishu-unsupported-' + messageId,
         }, () => Date.parse(trigger.at))
+      } else if (skipStop) {
+        insertOutbox(this.store, {
+          id: outboxId, ticketId: null, triggerId: id, kind: 'stop', to: 'owner:chief',
+          body: trigger.message, sessionId, requestId, state: 'recorded', recordedAt: this.now(), skipReason: skipStop,
+        }, () => Date.parse(trigger.at))
       } else if (!trigger.dropped) {
         this.runner.enqueue({
           id: outboxId, ticketId: null, triggerId: id, kind: stop ? 'stop' : 'inbox', to: 'owner:chief',
-          body: trigger.message, sessionId: stop ? this.registry.get('chief')?.sessionId ?? null : null, requestId,
+          body: trigger.message, sessionId, requestId,
         })
       }
     })
-    if (stop) {
-      this.#currentStops.add(outboxId)
-      await this.runner.tick({ kind: 'stop' })
+    if (stop && !skipStop) {
+      this.#currentStops.set(sessionId, outboxId)
+      try {
+        await this.runner.tick({ kind: 'stop' })
+      } finally {
+        this.#currentStops.delete(sessionId)
+      }
     }
     const row = this.#outboxRow(outboxId)
     return { ...receipt, deduped: false, dropped: trigger.dropped ?? null, outboxId: row?.id ?? null, queued: row?.state === 'queued' }
@@ -177,7 +188,7 @@ export class Router {
     }
     if (row.kind === 'stop') {
       // A stop applies to the turn active when it was requested. A restart never replays it.
-      if (!this.#currentStops.delete(row.id)) return { recorded: true, skipped: 'interrupt-stale' }
+      if (this.#currentStops.get(row.sessionId) !== row.id) return { recorded: true, skipped: 'interrupt-stale' }
       if (!row.sessionId || row.sessionId !== this.registry.get('chief')?.sessionId) return { recorded: true, skipped: 'no-current-session' }
       try {
         await this.sessions.cancel({ sessionId: row.sessionId })
