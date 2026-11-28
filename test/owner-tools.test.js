@@ -417,3 +417,45 @@ test('create_session validates the normalized absolute worker directory', async 
     assert.equal(h.creates.length, 0)
   } finally { f.cleanup() }
 })
+
+test('read_session requests the chosen history page and exposes its continuation', async () => {
+  const f = fixture()
+  try {
+    const h = ownerToolsHarness(f)
+    const page = await h.tools.get('read_session').execute({ sessionId: 'session-w1', maxMessages: 12, beforeSeq: 800 }, h.exec)
+    assert.deepEqual(h.pageRequests[0], {
+      address: { kind: 'session', sessionId: 'session-w1' }, maxMessages: 12, beforeSeq: 800,
+    })
+    assert.equal(page.hasMore, false)
+  } finally { f.cleanup() }
+})
+
+test('fork_session verifies the cut in the selected worker before requesting confirmation', async () => {
+  const f = fixture()
+  try {
+    const ticket = await f.router.routeToOwner({ ownerId: f.owner.id, message: 'fixture work' })
+    const h = ownerToolsHarness(f)
+    const tool = h.tools.get('fork_session')
+    const args = { sessionId: 'session-w1', ticketId: ticket.ticketId, reason: 'fixture clean boundary' }
+    await assert.rejects(tool.execute({ ...args, atSeq: 800 }, h.exec), /fork-atseq-not-found/)
+    assert.equal(f.router.getTicket(ticket.ticketId).stage, 'working')
+    await tool.execute({ ...args, atSeq: PAGE_SEQS.clean }, h.exec)
+    assert.deepEqual(h.pageRequests.map(request => request.throughSeq), [800, PAGE_SEQS.clean])
+    const saved = f.router.getTicket(ticket.ticketId).pendingConfirm?.action
+    assert.equal(saved.sessionId, 'session-w1')
+    assert.equal(saved.atSeq, PAGE_SEQS.clean)
+  } finally { f.cleanup() }
+})
+
+test('the worker tools refuse out-of-scope sessions before host effects', async () => {
+  const f = fixture()
+  try {
+    const sessionId = 'fixture-sibling-worker'
+    const h = ownerToolsHarness(f, { extraSessions: [{ sessionId, cwd: '/Volumes/home/sibling' }] })
+    await assert.rejects(h.tools.get('read_session').execute({ sessionId }, h.exec), /outside this/)
+    await assert.rejects(h.tools.get('inject_session').execute({ sessionId, text: 'fixture' }, h.exec), /outside this/)
+    await assert.rejects(h.tools.get('fork_session').execute({ sessionId, ticketId: 'fixture', reason: 'fixture' }, h.exec), /outside this/)
+    assert.equal(h.pageRequests.length, 0)
+    assert.equal(h.prompts.length, 0)
+  } finally { f.cleanup() }
+})

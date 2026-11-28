@@ -140,13 +140,12 @@ function compactTranscript(page, max) {
 
 /** The real event seqs of one page, oldest first — the fork boundaries the model may choose from. */
 function transcriptSeqs(page) {
-  const out = []
+  const out = new Set()
   for (const record of page?.records ?? []) {
-    const event = record.event ?? record
-    const seq = event?.seq
-    if (Number.isSafeInteger(seq) && seq >= 0 && !out.includes(seq)) out.push(seq)
+    const seq = (record.event ?? record)?.seq
+    if (Number.isSafeInteger(seq) && seq >= 0) out.add(seq)
   }
-  return out.sort((a, b) => a - b)
+  return [...out].sort((a, b) => a - b)
 }
 
 export function apply(ctx) {
@@ -194,12 +193,13 @@ export function apply(ctx) {
 
   ctx.tools.register({
     name: 'read_session',
-    description: '读取一个会话的近期记录（压缩成 role: 文本 行，行首 #序号 是真实事件序号），用于观察执行会话的进展与结果。返回的 seqs 是本页真实事件序号，可原样作为 fork_session 的 atSeq 切点（含边界）——不要自己猜序号。',
+    description: '读取执行会话的历史记录和真实事件序号。可用 beforeSeq 翻看更早记录，fork_session 只接受目标会话中存在的切点。',
     parameters: {
       type: 'object',
       properties: {
         sessionId: { type: 'string', description: '目标会话 id（必须在责任边界内，且不是负责人会话）' },
-        maxMessages: { type: 'number', description: '可选：最多回多少行压缩记录，缺省 30' },
+        maxMessages: { type: 'integer', minimum: 1, maximum: 200, description: '可选：单页最多读取的消息数，缺省 30' },
+        beforeSeq: { type: 'integer', minimum: 0, description: '可选：从此事件之前读取更早的一页，使用前页最小的事件序号' },
       },
       required: ['sessionId'],
       additionalProperties: false,
@@ -210,21 +210,32 @@ export function apply(ctx) {
         properties: {
           lines: { type: 'array', items: { type: 'string' } },
           seqs: { type: 'array', items: { type: 'number' } },
+          hasMore: { type: 'boolean' },
         },
-        required: ['lines', 'seqs'],
+        required: ['lines', 'seqs', 'hasMore'],
         additionalProperties: false,
       },
       render: (_args, value) => [{ type: 'text', text: (value.seqs.length === 0
         ? '（本页没有可核验的事件序号，fork_session 请省略 atSeq 走最近完成回合边界）'
         : '（本页真实事件序号：' + value.seqs.join(', ') + ' —— 可作为 fork_session 的 atSeq 切点，含边界）')
+        + (value.hasMore && value.seqs.length ? '\n较早记录可用 beforeSeq=' + value.seqs[0] + ' 读取。' : '')
         + '\n' + (value.lines.length === 0 ? '（无记录）' : value.lines.join('\n')) }],
     },
     execute: async (args, exec) => {
       const owner = await callerOwner(ctx, api, exec)
       const signal = exec?.signal ?? AbortSignal.timeout(30000)
       await workerCwd(ctx, api, owner, args.sessionId, 'read_session', signal)
-      const page = await ctx.sessionController.page({ address: { kind: 'session', sessionId: args.sessionId }, maxMessages: 200 }, signal)
-      return { lines: compactTranscript(page, args.maxMessages ?? 30), seqs: transcriptSeqs(page) }
+      const maxMessages = args.maxMessages ?? 30
+      if (!Number.isSafeInteger(maxMessages) || maxMessages < 1 || maxMessages > 200) {
+        throw new Error('read_session: maxMessages must be an integer from 1 to 200')
+      }
+      const { beforeSeq } = args
+      const page = await ctx.sessionController.page({
+        address: { kind: 'session', sessionId: args.sessionId }, maxMessages,
+        ...(beforeSeq !== undefined && { beforeSeq }),
+      }, signal)
+      requireCurrentBinding(api, owner)
+      return { lines: compactTranscript(page, maxMessages), seqs: transcriptSeqs(page), hasMore: page.hasMore === true }
     },
   })
 
@@ -397,6 +408,16 @@ export function apply(ctx) {
       mustOwnTicket(api, owner, args.ticketId)
       try {
         const action = buildForkAction({ sessionId: args.sessionId, cwd, atSeq: args.atSeq, reason: args.reason })
+        if (action.atSeq !== undefined) {
+          const page = await ctx.sessionController.page({
+            address: { kind: 'session', sessionId: action.sessionId }, throughSeq: action.atSeq, maxMessages: 1,
+          }, signal)
+          if (!transcriptSeqs(page).includes(action.atSeq)) {
+            throw new TaskError('fork-atseq-not-found', 'the requested event is not present in the target session')
+          }
+          requireCurrentBinding(api, owner)
+          mustOwnTicket(api, owner, args.ticketId)
+        }
         const ticket = api.tasks.askConfirm({ ticketId: args.ticketId, question: forkConfirmText(action, args.ticketId), action })
         // 需要行动 = 汇报事实： the confirm request joins this wake's digest and reaches the user via the chief.
         recordReportFact(api.store, owner.id, ticket)
