@@ -1124,6 +1124,40 @@ test('separate occurrences reuse the same follow-up worker without reusing the o
   } finally { cleanup() }
 })
 
+test('an approval for an unbound owner can initialize its exact prepared replacement', async () => {
+  const { router, registry, store, calls, advance, cleanup } = fixture({ config: { security: { dangerousPatterns: ['fixture-review-phrase'] } } })
+  try {
+    const owner = registry.create({ kind: 'dir', cwd: '/repos/prepare-approval' })
+    registry.bindSession(owner.id, 'fixture-unavailable-owner')
+    router.installDeferred(new DeferredRegistry({ store, tasks: router.tasks, now: router.now,
+      owners: { currentBinding: id => registry.get(id), isOwnerSession: id => registry.isOwnerSession(id) } }))
+    let prepareId
+    router.sessions.create = async input => { calls.create.push(input); prepareId = input.sessionId; return { sessionId: prepareId } }
+    let first = true
+    router.sessions.prompt = async input => {
+      calls.prompt.push(input)
+      if (input.sessionId === 'fixture-unavailable-owner') throw Object.assign(new Error('fixture owner missing'), { code: 'session/not-found' })
+      if (first) { first = false; throw new Error('fixture first admission retry') }
+      return { accepted: true }
+    }
+    await router.routeToOwner({ ownerId: owner.id, message: 'fixture normal first request' })
+    assert.equal(registry.get(owner.id).sessionId, null)
+    const work = await router.routeToOwner({ ownerId: owner.id, message: 'fixture-review-phrase' })
+    const { requestId, target } = router.getTicket(work.ticketId).deferred
+    assert.deepEqual(target, { ownerId: owner.id })
+    await router.resolveDeferred({ channel: 'panel', ticketId: work.ticketId, requestId, decision: 'approve' })
+    await router.tick()
+    advance(2000)
+    await router.tick()
+    const promptId = 'hub-bot-approved-' + requestId
+    const approved = router.listOutbox().find(row => row.requestId === promptId)
+    assert.equal(approved.state, 'sent')
+    assert.equal(registry.get(owner.id).sessionId, prepareId)
+    assert.deepEqual(calls.prompt.filter(call => call.requestId === promptId).map(call => call.sessionId), [prepareId])
+    assert.equal(calls.create.length, 1)
+  } finally { cleanup() }
+})
+
 test('an exhausted approval cannot restart the original work at a changed target', async () => {
   const { router, registry, store, calls, advance, cleanup } = fixture({ config: { security: { dangerousPatterns: ['needs-approval'] } } })
   try {

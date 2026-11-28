@@ -364,7 +364,9 @@ export function apply(ctx, rawConfig) {
           return { text: JSON.stringify(detail) }
         }
         if (section !== undefined || offset !== undefined || limit !== undefined) {
-          return { text: JSON.stringify(listOwnerFactIndex({ ...input, section, offset, limit })) }
+          const page = listOwnerFactIndex({ ...input, section, offset, limit })
+          if (!page) throw new Error('Invalid owner fact section or page.')
+          return { text: JSON.stringify(page) }
         }
         return { text: formatOwnerFacts(buildOwnerFacts(input)) }
       },

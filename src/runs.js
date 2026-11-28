@@ -7,7 +7,7 @@ const RUN_KEY_END = 'run-audit:run.' // Exclusive upper bound for the SQLite pri
 const TRIGGER_KEY = 'run-audit:trigger:'
 const OUTBOX_KEY = 'run-audit:outbox:'
 const BACKFILL_KEY = 'run-audit:backfilled'
-const BACKFILL_VERSION = 2
+const BACKFILL_VERSION = 3
 const SOURCES = ['github', 'timer']
 const RESULT_KINDS = ['result', 'failure', 'blocked']
 const WAITING_STATES = ['held', 'queued', 'recorded']
@@ -141,6 +141,17 @@ function runSummary({ decisions, results = [], lastProgressAt, ...run }, ticket,
   return { ...run, stage: STAGES.includes(stage) ? stage : null, workerSession, result: results.at(-1) ?? null, ...outcome }
 }
 
+function savedTerminalResult(ticket) {
+  const stage = normalizeStage(ticket.stage)
+  if (stage === 'failed') return { kind: 'failure', at: timestamp(ticket.failed?.at) }
+  if (stage !== 'person/review' && stage !== 'done') return undefined
+  if (stage === 'done' && Array.isArray(ticket.transitions)) {
+    const transition = ticket.transitions.at(-1)
+    if (transition && normalizeStage(transition.from) !== 'person/review') return undefined
+  }
+  return { kind: 'result', at: timestamp(ticket.report?.at) }
+}
+
 function transaction(store, write) {
   const { db } = store
   if (db.isTransaction) return write()
@@ -184,6 +195,7 @@ export class RunAudit {
         }
       }
       const findReply = this.#store.db.prepare('SELECT value FROM outbox WHERE id = ?')
+      let ticketsWithChannelReplies
       for (const row of legacy) {
         const ticket = JSON.parse(row.ticket)
         const trigger = JSON.parse(row.trigger)
@@ -194,7 +206,7 @@ export class RunAudit {
           || (trigger.ownerId && trigger.ownerId !== ownerId)) continue
         const existing = this.#store.get(RUN_KEY + ticketId)
         if (existing) {
-          if (existing.triggerRef !== triggerRef || existing.ownerId !== ownerId || existing.source.kind !== trigger.kind) continue
+          if (existing.triggerRef !== triggerRef || existing.ownerId !== ownerId || existing.source?.kind !== trigger.kind) continue
         } else {
           if (this.#store.get(TRIGGER_KEY + triggerRef)) continue
           this.ensure({ ticketId, triggerRef, ownerId, source: trigger.source, at })
@@ -205,9 +217,25 @@ export class RunAudit {
           ].filter(result => result.at).sort((a, b) => a.at.localeCompare(b.at))
           for (const result of results) this.recordResult(ticketId, result)
         }
-        if (trigger.kind === 'timer' && trigger.source.origin?.kind === 'feishu') {
-          this.#backfillQuestions(ticket, trigger.source.origin, requestsByTicket.get(ticketId) ?? [], findReply)
+        if (trigger.kind !== 'timer') continue
+        const { origin } = trigger.source
+        if (origin?.kind === 'feishu') {
+          this.#backfillQuestions(ticket, origin, requestsByTicket.get(ticketId) ?? [], findReply)
+          continue
         }
+        if (origin != null || existing?.source?.origin != null || existing?.decisions?.length) continue
+
+        const outcome = savedTerminalResult(ticket)
+        if (!outcome?.at) continue
+        const latest = existing?.results?.at(-1)
+        if (latest && latest.kind !== outcome.kind && latest.at >= outcome.at) continue
+        // A stored external reply already names this ticket. Preserve that evidence even without an audit link.
+        ticketsWithChannelReplies ??= new Set(this.#store.db.prepare(`SELECT DISTINCT json_extract(value, '$.ticketId') AS ticketId
+          FROM outbox WHERE json_extract(value, '$.kind') = 'reply'
+          AND (json_extract(value, '$.to') GLOB 'feishu:?*' OR json_extract(value, '$.to') GLOB 'github:?*')
+          AND json_extract(value, '$.state') IN (SELECT value FROM json_each(?))`).all(JSON.stringify(OUTBOX_STATES))
+          .map(row => row.ticketId))
+        if (!ticketsWithChannelReplies.has(ticketId)) this.#recordNoNotification(ticketId, 'not-notified', 'local-panel', outcome.at)
       }
       this.#store.set(BACKFILL_KEY, BACKFILL_VERSION)
     })
@@ -300,12 +328,12 @@ export class RunAudit {
     return this.#change(ticketId, run => run.lastProgressAt >= at ? run : { ...run, lastProgressAt: at })
   }
 
-  #recordNoNotification(ticketId, kind, reasonCode) {
+  #recordNoNotification(ticketId, kind, reasonCode, at) {
     return this.#change(ticketId, run => {
       const decisions = run.decisions ?? []
       const previous = decisions.at(-1)
       if (previous?.kind === kind && previous.reasonCode === reasonCode) return run
-      return { ...run, decisions: [...decisions, { kind, reasonCode, at: this.#time() }] }
+      return { ...run, decisions: [...decisions, { kind, reasonCode, at: this.#time(at) }] }
     })
   }
 

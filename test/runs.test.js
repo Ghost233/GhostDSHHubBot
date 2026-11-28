@@ -334,6 +334,73 @@ test('local timer outcomes explain silence and progress only updates the last ti
   assert.deepEqual(reopened.list({ status: 'silent' }).map(row => row.id), [local.id])
 })
 
+test('Stage 3 local timer outcomes recover their panel reason across the prior backfill marker', t => {
+  const completedAt = '2026-11-28T12:05:00.000Z'
+  const { runs, reopen } = fixture(t, store => {
+    store.set('run-audit:backfilled', 2)
+    const save = (name, fields, { origin, run } = {}) => {
+      const ticketId = 'tsk-legacy-' + name
+      const timerId = 'tmr-legacy-' + name
+      const triggerRef = 'timer:' + timerId + ':1'
+      const source = { kind: 'timer', timerId, ...(origin && { origin }) }
+      const ticket = { id: ticketId, triggerId: triggerRef, owner: 'chief', createdAt: initialTime,
+        background: { kind: 'timer', timerId }, ...fields }
+      const trigger = { id: triggerRef, kind: 'timer', ownerId: ticket.owner, at: initialTime, source }
+      store.db.prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)').run(triggerRef, JSON.stringify(trigger), initialTime)
+      store.db.prepare('INSERT INTO ticket (id, value) VALUES (?, ?)').run(ticketId, JSON.stringify(ticket))
+      if (run) {
+        store.set('run-audit:trigger:' + triggerRef, ticketId)
+        store.set('run-audit:run-' + ticketId, { id: 'run-' + ticketId, ticketId, triggerRef, ownerId: ticket.owner,
+          source, createdAt: initialTime, ...run })
+      }
+      return { ticketId, triggerRef }
+    }
+    const report = { summary: 'synthetic-secret-result', at: completedAt }
+    const ready = { stage: 'person/review', report }
+    save('result', ready)
+    save('accepted', { stage: 'done', report, transitions: [{ from: 'person/review', to: 'done' }] })
+    save('failure', { stage: 'failed', failed: { reason: 'synthetic-secret-failure', at: completedAt } }, { run: {
+      results: [{ ticketId: 'tsk-legacy-failure', kind: 'failure', reportId: 'out-kept', at: completedAt }],
+      lastProgressAt: initialTime,
+    } })
+    save('working', { stage: 'working', report })
+    save('newer-result', ready, { run: {
+      results: [{ ticketId: 'tsk-legacy-newer-result', kind: 'failure', reportId: 'out-newer-failure',
+        at: '2026-11-28T12:06:00.000Z' }],
+    } })
+    save('cancelled', { stage: 'done', report, transitions: [{ from: 'person/confirm', to: 'done' }] })
+    save('feishu', ready, { origin: { kind: 'feishu', triggerId: 'feishu:om-timer', chatId: 'oc-timer' } })
+    save('silent', ready, { run: { decisions: [{ kind: 'silent', reasonCode: 'no-change', at: completedAt }] } })
+    const notified = save('notice', ready, { run: { decisions: [{ kind: 'notification', outboxId: 'out-legacy-notice', at: completedAt }] } })
+    insertOutbox(store, { id: 'out-legacy-notice', ...notified, triggerId: notified.triggerRef, kind: 'reply',
+      state: 'sent', to: 'feishu:chat:oc-timer', sentAt: completedAt })
+    const rawReply = save('raw-reply', ready)
+    insertOutbox(store, { ticketId: rawReply.ticketId, triggerId: rawReply.triggerRef, kind: 'reply',
+      to: 'feishu:chat:oc-timer', state: 'recorded' })
+  })
+
+  const get = name => runs.get('run-tsk-legacy-' + name)
+  for (const name of ['failure', 'result']) {
+    const run = get(name)
+    assert.equal(run.status, 'silent')
+    assert.equal(run.reason, '结果已记录在本机面板。')
+    assert.equal(run.notification, null)
+    assert.equal(run.result.kind, name)
+    assert.deepEqual(run.decisions, [{ kind: 'not-notified', reasonCode: 'local-panel', at: completedAt }])
+    assert.doesNotMatch(JSON.stringify(run), /synthetic-secret/)
+  }
+  assert.equal(get('failure').result.reportId, 'out-kept')
+  assert.equal(get('failure').lastProgressAt, initialTime)
+  assert.equal(get('silent').decisions[0].reasonCode, 'no-change')
+  assert.equal(get('notice').status, 'sent')
+  assert.equal(get('accepted').decisions[0].reasonCode, 'local-panel')
+  assert.equal(get('newer-result').result.reportId, 'out-newer-failure')
+  for (const name of ['working', 'cancelled', 'feishu', 'raw-reply', 'newer-result']) assert.equal(get(name).reason, null)
+  const { runs: reopened } = reopen()
+  assert.deepEqual(reopened.list({ status: 'silent' }).map(run => run.ticketId).sort(),
+    ['tsk-legacy-accepted', 'tsk-legacy-failure', 'tsk-legacy-result', 'tsk-legacy-silent'])
+})
+
 test('a sparse timeline filter uses bounded SQLite statements across a long history', t => {
   const { store, runs } = fixture(t)
   store.db.exec('BEGIN IMMEDIATE')

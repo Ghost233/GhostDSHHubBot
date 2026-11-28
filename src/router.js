@@ -363,7 +363,7 @@ export class Router {
     } else {
       const owner = this.registry.get(request.ownerId)
       if (!owner || owner.recycled) throw permanent('The original owner is no longer available.')
-      const delivered = await this.#promptOwner(owner.id, ticket.id, row.requestId, text(), current)
+      const delivered = await this.#promptOwner(owner.id, ticket.id, row.requestId, text(), { isCurrent: current })
       if (!delivered) return skipped()
     }
     if (this.store.closed) return
@@ -1173,22 +1173,14 @@ export class Router {
     const current = () => this.#currentDeferredWork(row.ticketId, requestId)
     const ticket = current()
     if (!ticket) return { recorded: true, skipped: 'deferred-no-longer-active' }
-    const target = this.registry.get(ticket.owner)
-    const unavailable = () => {
-      const reason = 'The original owner session is unavailable. Request a new confirmation for the current session.'
-      return Object.assign(new Error(reason), { permanent: true })
-    }
-    if (!target || target.sessionId !== row.sessionId || target.recycled || this.sessions.isArchived?.(row.sessionId)) throw unavailable()
     const text = ticket.recoveryPending ? RECOVERY_NOTE + '\n\n' + row.body : row.body
-    try {
-      await this.sessions.prompt({ sessionId: row.sessionId, requestId: row.requestId, text })
-    } catch (error) {
-      if (isMissingSession(error) || error?.code === 'session/not-found') throw unavailable()
-      throw error
-    }
+    const delivered = await this.#promptOwner(ticket.owner, ticket.id, row.requestId, text, {
+      isCurrent: current, fixedSessionId: row.sessionId ?? null,
+    })
+    if (!delivered) return { recorded: true, skipped: 'deferred-no-longer-active' }
     if (this.store.closed || !current()) return
     this.tasks.noteRecoveryCarried(ticket.id)
-    this.#mergeTicket(ticket.id, { targetSession: row.sessionId, lastDelivery: { state: 'sent', at: this.now(), rebuilt: false } })
+    this.#mergeTicket(ticket.id, { targetSession: delivered.sessionId, lastDelivery: { state: 'sent', at: this.now(), rebuilt: delivered.rebuilt } })
   }
 
   #timerWorker(ticket) {
@@ -1436,7 +1428,7 @@ export class Router {
   }
 
   /** Admit a prompt, retrying a missing binding only while the originating ticket is active. */
-  #promptOwner(ownerId, ticketId, requestId, text, isCurrent) {
+  #promptOwner(ownerId, ticketId, requestId, text, { isCurrent, fixedSessionId } = {}) {
     return this.#serialized('owner-prompt:' + ownerId, async () => {
       const ticketClosed = () => {
         if (this.store.closed || (isCurrent && !isCurrent())) return true
@@ -1464,6 +1456,21 @@ export class Router {
       }
       if (ticketClosed()) return null
       let owner = this.registry.get(ownerId)
+      if (fixedSessionId !== undefined) {
+        const unavailable = () => Object.assign(new Error(
+          'The original owner session is unavailable. Request a new confirmation for the current session.',
+        ), { permanent: true })
+        const planned = this.store.get('owner-bootstrap/' + ownerId)
+        const target = owner?.sessionId ?? (planned?.prepared ? planned.sessionId : null)
+        if (!owner || owner.recycled || !fixedSessionId || target !== fixedSessionId || this.sessions.isArchived?.(fixedSessionId)) throw unavailable()
+        try {
+          return await send(fixedSessionId)
+        } catch (error) {
+          if (ticketClosed()) return null
+          if (isMissingSession(error) || error?.code === 'session/not-found') throw unavailable()
+          throw error
+        }
+      }
       if (!owner || owner.recycled) throw new RouterError('owner-unavailable', 'The registered owner is unavailable.')
       const ensured = await this.#ensureSession(owner)
       const sessionId = this.registry.get(ownerId)?.sessionId ?? ensured.sessionId
