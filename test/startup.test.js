@@ -521,6 +521,120 @@ test('Feishu explicit switch and the management panel share a durable owner oper
   assert.equal(cancellations.length, 0)
 })
 
+test('both workspace endpoints keep the same owner facts after replacement and restrict unknown IDs', async t => {
+  const homeRepo = await mkdtemp(join(tmpdir(), 'hub-bot-owner-workspace-host-'))
+  const Context = contexts.at(-1)[1]
+  const root = new Context()
+  const token = 'fixture-owner-workspace-token'
+  const oldSession = 'session-workspace-original'
+  const otherSession = 'session-workspace-other'
+  const sessions = new Set([oldSession, otherSession])
+  const archived = []
+  let refuseFirstArchive = true
+  const registered = new Map()
+  let handler
+  root.provide('tools', { register(tool) { registered.set(tool.name, tool); return () => registered.delete(tool.name) } })
+  root.provide('sessionController', {
+    async state({ sessionId }) {
+      if (!sessions.has(sessionId)) throw Object.assign(Error('Fixture session missing'), { code: 'session/not-found' })
+      return { running: false, queue: [], pendingInput: [] }
+    },
+    async create(request) { sessions.add(request.sessionId); return request },
+    async prompt(request) { assert.ok(sessions.has(request.sessionId)); return { accepted: true } },
+  })
+  root.provide('sessionPersistence', { async flush() {} })
+  root.provide('workspaceController', { async archiveSession({ sessionId }) {
+    if (sessionId === oldSession && refuseFirstArchive) throw new Error('Fixture first archive refusal')
+    archived.push(sessionId)
+    return { archivedSessionIds: [sessionId] }
+  } })
+  root.provide('webServer', { host: '127.0.0.1', port: 3199, register(entry) {
+    handler = entry.handler
+    return () => { handler = undefined }
+  } })
+  const mounted = root.plugin(plugin, { homeRepo, stateDir: join(homeRepo, 'state'), workspaces: { enabled: false }, devApi: { token } })
+  t.after(async () => { await mounted.dispose(); await rm(homeRepo, { recursive: true, force: true }) })
+  await mounted
+  await setImmediate()
+  const hub = root.reflect.get('hubBot', false)
+  const settings = root.reflect.get('hubBotSettings', false)
+  const owner = hub.registry.create({ kind: 'repo', workspace: 'Scoped workspace', cwd: homeRepo })
+  const other = hub.registry.create({ kind: 'repo', workspace: 'Other workspace', cwd: join(homeRepo, 'other') })
+  hub.registry.bindSession(owner.id, oldSession)
+  hub.registry.bindSession(other.id, otherSession)
+  const task = await hub.router.routeToOwner({ ownerId: owner.id, message: 'visible pending task' })
+  const pending = hub.router.openQuestion({ ticketId: task.ticketId, question: 'Keep this request ID?' })
+  const outside = await hub.router.routeToOwner({ ownerId: other.id, message: 'not in selected workspace' })
+  await hub.router.routeBackground({ ownerId: owner.id, message: 'owner run', triggerRef: 'github:fixture/workspace:issue:1',
+    authorization: { actor: 'fixture', source: 'github', at: hub.router.now() },
+    source: { kind: 'github', repo: 'fixture/workspace', event: 'issue', issueNumber: 1 } })
+  await hub.router.routeBackground({ ownerId: other.id, message: 'other run', triggerRef: 'github:fixture/workspace:issue:2',
+    authorization: { actor: 'fixture', source: 'github', at: hub.router.now() },
+    source: { kind: 'github', repo: 'fixture/workspace', event: 'issue', issueNumber: 2 } })
+  const timer = (await registered.get('timer_create').execute({ ownerId: owner.id, message: 'owned reminder',
+    fireAt: new Date(Date.now() + 60000).toISOString() }, { agent: { id: oldSession } })).timer
+  async function request(ownerId, authenticated = true) {
+    const req = Readable.from([Buffer.from(JSON.stringify({ ownerId }))])
+    Object.assign(req, { url: '/hub-bot/api/owners/workspace', method: 'POST',
+      headers: { host: '127.0.0.1:3199', ...(authenticated && { 'x-hub-bot-token': token }) } })
+    let status, body
+    await handler(req, { writeHead(code) { status = code }, end(value) { body = JSON.parse(value) } })
+    return { status, body }
+  }
+  assert.equal((await request(owner.id, false)).status, 401)
+  assert.equal((await request('unknown-owner-fixture')).status, 404)
+  await assert.rejects(settings.ownerWorkspace({ ownerId: 'unknown-owner-fixture' }), { code: 'owner-workspace/not-found' })
+  const before = (await request(owner.id)).body
+  assert.equal(before.owner.id, owner.id)
+  assert.equal(before.owner.sessionId, oldSession)
+  assert.ok(before.tickets.every(row => row.owner === owner.id && row.id !== outside.ticketId))
+  assert.equal(before.tickets.find(row => row.id === task.ticketId).deferred.requestId, pending.deferred.requestId)
+  assert.deepEqual(before.timers.map(row => row.id), [timer.id])
+  assert.deepEqual(before.runs.map(row => row.ownerId), [owner.id])
+  const swap = await settings.ownerSwitchAction({ action: 'request', mode: 'wait', ownerId: owner.id, expectedSessionId: oldSession })
+  await hub.router.ownerSwitch.tick()
+  await hub.router.ownerSwitch.tick()
+  const firstArchive = await settings.ownerWorkspace({ ownerId: owner.id })
+  assert.equal(firstArchive.owner.sessionId, swap.newSessionId)
+  assert.equal(firstArchive.switchOperation.oldSessionId, oldSession)
+  assert.equal(firstArchive.switchOperation.status, 'archive-failed')
+  assert.deepEqual(firstArchive.archiveFailures, [])
+  const next = await settings.ownerSwitchAction({ action: 'request', mode: 'wait', ownerId: owner.id, expectedSessionId: swap.newSessionId })
+  await hub.router.ownerSwitch.tick()
+  await hub.router.ownerSwitch.tick()
+  const after = await settings.ownerWorkspace({ ownerId: owner.id })
+  assert.equal(after.owner.sessionId, next.newSessionId)
+  assert.equal(after.switchOperation.oldSessionId, swap.newSessionId)
+  assert.equal(after.switchOperation.status, 'completed')
+  assert.deepEqual(after.archiveFailures.map(row => row.operationId), [swap.operationId])
+  assert.equal(after.archiveFailures[0].oldSessionId, oldSession)
+  assert.deepEqual((await request(other.id)).body.archiveFailures, [])
+  refuseFirstArchive = false
+  await settings.ownerSwitchAction({ action: 'retry-archive', ownerId: owner.id, operationId: swap.operationId })
+  await hub.router.ownerSwitch.tick()
+  assert.deepEqual(archived, [swap.newSessionId, oldSession])
+  const retried = await settings.ownerWorkspace({ ownerId: owner.id })
+  assert.equal(retried.owner.sessionId, next.newSessionId)
+  assert.deepEqual(retried.archiveFailures, [])
+  for (const workspace of ['长'.repeat(509), 'release\tqa']) {
+    const registered = hub.registry.create({ kind: 'repo', workspace, cwd: homeRepo })
+    const opened = await request(registered.id)
+    assert.equal(opened.status, 200)
+    assert.equal(opened.body.owner.id, registered.id)
+  }
+  const scratch = hub.registry.create({ kind: 'scratch' })
+  hub.registry.bindSession(scratch.id, 'session-workspace-history-only')
+  hub.registry.markRecycled(scratch.id)
+  const historical = await settings.ownerWorkspace({ ownerId: scratch.id })
+  assert.equal(historical.owner.recycled, true)
+  assert.equal(historical.owner.sessionId, 'session-workspace-history-only')
+  assert.equal(hub.registry.findByCurrentSession('session-workspace-history-only'), undefined)
+  assert.deepEqual(after.tickets.map(row => row.id), before.tickets.map(row => row.id))
+  assert.deepEqual(after.runs.map(row => row.id), before.runs.map(row => row.id))
+  assert.equal(after.tickets.find(row => row.id === task.ticketId).deferred.requestId, pending.deferred.requestId)
+  assert.deepEqual(after.timers.map(row => row.id), [timer.id])
+})
+
 test('both authenticated run timeline endpoints expose the same exact persisted result', async t => {
   const homeRepo = await mkdtemp(join(tmpdir(), 'hub-bot-run-host-'))
   const Context = contexts.at(-1)[1]

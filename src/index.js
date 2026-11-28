@@ -33,7 +33,7 @@ import { resolveConfig } from './config.js'
 const PKG_VERSION = createRequire(import.meta.url)('../package.json').version
 import {
   SETTINGS_FILE, applySettingsOverlay, applySettingsPatch, loadSettingsOverlay, mergeSettingsOverlay,
-  saveSettingsOverlay, buildOverview, buildOutboxHealth, buildSettingsView, feishuSelfTestMarker, readMessageDetail, readTicketDetail,
+  saveSettingsOverlay, buildOverview, buildOutboxHealth, buildSettingsView, feishuSelfTestMarker, readMessageDetail, readTicketDetail, readOwnerWorkspace,
 } from './panel.js'
 import { discardOutboxRows, retryOutboxRows } from './outbox.js'
 import { Store, SCHEMA_VERSION } from './store.js'
@@ -455,6 +455,18 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+  const ownerWorkspace = request => {
+    const ownerId = requireString(request, 'ownerId')
+    if (!ownerId.trim()) throw new HttpError(400, 'An owner ID is required.')
+    if (!hub.registry.get(ownerId)) throw new HttpError(404, 'Unknown owner.')
+    const [currentOperation, ...priorOperations] = ownerSwitch.list({ ownerId })
+    const workspace = readOwnerWorkspace({ store, registry: hub.registry, ownerId, timers: timers.list({ ownerId }),
+      runs: listRuns({ ownerId }), switchOperation: currentOperation ?? null })
+    if (!workspace) throw new HttpError(404, 'Unknown owner.')
+    const archiveFailures = priorOperations.filter(operation => operation.status === 'archive-failed')
+    return { ...workspace, archiveFailures }
+  }
+
   const overview = async () => ({
     ...buildOverview({ store, registry: hub.registry, health: await buildHealth(), compact: true }),
     timers: timers.list(),
@@ -823,6 +835,7 @@ export function apply(ctx, rawConfig) {
     ticketDetail: forwardDep('ticketDetail'),
     notificationDetail: forwardDep('notificationDetail'),
     ownerSwitchAction: forwardDep('ownerSwitchAction'),
+    ownerWorkspace: forwardDep('ownerWorkspace'),
     handoffSummaryAction: forwardDep('handoffSummaryAction'),
     listRuns: forwardDep('listRuns'),
     runDetail: forwardDep('runDetail'),
@@ -870,6 +883,7 @@ export function apply(ctx, rawConfig) {
     ticketDetail: ticketId => readTicketDetail({ store, registry: hub.registry, ticketId }),
     notificationDetail: id => notificationThrottle.details(id),
     ownerSwitchAction,
+    ownerWorkspace,
     handoffSummaryAction,
     listRuns,
     runDetail: id => hub.router.runs.get(id),
@@ -1195,6 +1209,8 @@ export function apply(ctx, rawConfig) {
         } else if (route === 'overview' && method === 'GET') {
           // 三问视图数据 (#73): 票面 + 注册表 + 健康快照, 一次取齐
           json(res, 200, await overview())
+        } else if (route === 'owners/workspace' && method === 'POST') {
+          json(res, 200, ownerWorkspace(await readBody(req)))
         } else if (route === 'owners/handoff-summary' && method === 'POST') {
           try { json(res, 200, await handoffSummaryAction(await readBody(req))) } catch (error) {
             if (error?.name !== 'HandoffSummaryError') throw error

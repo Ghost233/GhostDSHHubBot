@@ -111,6 +111,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           parameters: [],
           result: anyCodec('dsh-hub-bot#json-result'),
         },
+        'hubBotSettings/ownerWorkspace': {
+          service: 'hubBotSettings', description: 'Read the workspace for one stable owner ID.', invocation: { kind: 'direct' },
+          parameters: [{ name: 'request', source: 'json', description: '{ ownerId }',
+            codec: anyCodec('dsh-hub-bot#json-request'), strictCodec: anyCodec('dsh-hub-bot#json-request') }],
+          result: anyCodec('dsh-hub-bot#json-result'),
+        },
         'hubBotSettings/ticketDetail': {
           service: 'hubBotSettings', description: 'Read the complete report and facts for one ticket.', invocation: { kind: 'direct' },
           parameters: [{ name: 'ticketId', source: 'json', description: 'Ticket ID',
@@ -299,6 +305,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       kindRepo: '仓库',
       kindTemp: '临时',
       sessionNone: '尚未绑定',
+      ownerRecycled: '已回收', switchEarlierArchives: '之前更换的归档失败',
       openSessionButton: '打开会话',
       copySessionButton: '复制 ID',
       openOwnerSession: '打开「{n}」的会话',
@@ -401,6 +408,19 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       intakeFailed: '投递失败',
       intakeDiscarded: '已丢弃投递',
       timersSection: '提醒',
+      ownerWorkspace: '负责人工作区',
+      ownerWorkspaceOpen: '打开工作区',
+      ownerWorkspaceOpenFor: '打开「{n}」的工作区',
+      ownerWorkspaceChoose: '选择负责人',
+      ownerWorkspaceLoading: '正在读取负责人工作区…',
+      ownerWorkspaceUnavailable: '该负责人工作区不可用。',
+      ownerWorkspaceProgress: '进行中与排队',
+      ownerWorkspaceNoProgress: '暂无进行中或排队的任务。',
+      ownerWorkspaceNoTicket: '此任务不在当前负责人工作区。',
+      ownerWorkspaceCurrent: '当前会话',
+      ownerWorkspacePrevious: '原会话',
+      ownerWorkspaceReplacement: '替换会话',
+      switchOpenNew: '打开新会话',
       handoffSummary: '交接摘要', handoffGenerate: '生成草稿', handoffConfirm: '确认这版摘要', handoffConfirmed: '摘要已确认。',
       handoffCarry: '携摘要更换', handoffCarryStop: '停止后携摘要更换', handoffDiscard: '放弃摘要', handoffClose: '关闭', handoffDraft: '交接摘要正文',
       handoffSource: '来源会话', handoffEvent: '截至事件', handoffExpires: '有效至',
@@ -411,6 +431,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       switchWaiting: '等待原会话空闲', switchPreparing: '正在准备新会话', switchCommitted: '新会话已接管，等待归档',
       switchArchiveFailed: '旧会话归档失败', switchCompleted: '更换完成', switchFailed: '更换失败', switchCancelled: '已取消更换',
       notificationId: '通知编号', notificationLookup: '查找通知', notificationLoading: '正在读取通知索引…',
+      notificationOpen: '查看通知详情', notificationEmpty: '暂无关联任务。',
       runSection: '后台运行记录', runStateFilter: '通知状态', runSourceFilter: '运行来源', runAll: '全部',
       runSilent: '未通知', runWaiting: '待发送或汇总', runSent: '通道已接受', runFailed: '发送失败', runUnsent: '无发送记录',
       runTimer: '提醒', runResult: '有结果', runExecutionFailed: '执行失败', runBlocked: '需要介入', runTask: '查看关联任务',
@@ -703,6 +724,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       kindRepo: 'Repo',
       kindTemp: 'Temp',
       sessionNone: 'Unbound',
+      ownerRecycled: 'Recycled', switchEarlierArchives: 'Earlier archive failures',
       openSessionButton: 'Open session',
       copySessionButton: 'Copy ID',
       openOwnerSession: 'Open the session for {n}',
@@ -804,6 +826,19 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       intakeFailed: 'delivery failed',
       intakeDiscarded: 'delivery discarded',
       timersSection: 'Follow-ups',
+      ownerWorkspace: 'Owner workspace',
+      ownerWorkspaceOpen: 'Open workspace',
+      ownerWorkspaceOpenFor: 'Open workspace for {n}',
+      ownerWorkspaceChoose: 'Select an owner',
+      ownerWorkspaceLoading: 'Loading owner workspace…',
+      ownerWorkspaceUnavailable: 'This owner workspace is unavailable.',
+      ownerWorkspaceProgress: 'In progress and queued',
+      ownerWorkspaceNoProgress: 'No work in progress or queued.',
+      ownerWorkspaceNoTicket: 'This task is unavailable in the selected owner workspace.',
+      ownerWorkspaceCurrent: 'Current session',
+      ownerWorkspacePrevious: 'Previous session',
+      ownerWorkspaceReplacement: 'Replacement session',
+      switchOpenNew: 'Open new session',
       handoffSummary: 'Handoff summary', handoffGenerate: 'Generate draft', handoffConfirm: 'Confirm this summary', handoffConfirmed: 'Summary confirmed.',
       handoffCarry: 'Replace with summary', handoffCarryStop: 'Stop and replace with summary', handoffDiscard: 'Discard summary', handoffClose: 'Close', handoffDraft: 'Handoff summary text',
       handoffSource: 'Source session', handoffEvent: 'Through event', handoffExpires: 'Expires',
@@ -814,6 +849,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       switchWaiting: 'Waiting for current session to go idle', switchPreparing: 'Preparing a new session', switchCommitted: 'New session is current, awaiting archive',
       switchArchiveFailed: 'Previous session could not be archived', switchCompleted: 'Replacement complete', switchFailed: 'Replacement failed', switchCancelled: 'Replacement cancelled',
       notificationId: 'Notification ID', notificationLookup: 'Find notification', notificationLoading: 'Loading notification index…',
+      notificationOpen: 'View notification details', notificationEmpty: 'No linked tasks.',
       runSection: 'Background runs', runStateFilter: 'Notification status', runSourceFilter: 'Run source', runAll: 'All',
       runSilent: 'Silent', runWaiting: 'Awaiting send or summary', runSent: 'Accepted by channel', runFailed: 'Delivery failed', runUnsent: 'No delivery record',
       runTimer: 'Reminder', runResult: 'Result available', runExecutionFailed: 'Work failed', runBlocked: 'Needs attention', runTask: 'Open linked task',
@@ -1874,7 +1910,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
         var runStateLabels = { silent: 'runSilent', waiting: 'runWaiting', sent: 'runSent', failed: 'runFailed', 'in-progress': 'runUnsent' };
         var runResultLabels = { result: 'runResult', failure: 'runExecutionFailed', blocked: 'runBlocked' };
 
-        function TicketFacts({ ticket, render, generationId }) {
+        function TicketFacts({ ticket, render, generationId, ownerId }) {
           var t = scoped.locale.bind(NS);
           var [reading, setReading] = React.useState(null);
           var [attempt, retry] = React.useState(0);
@@ -1883,36 +1919,42 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             setReading(null);
             if (!generationId) return;
             void scoped.remote.hubBotSettings.ticketDetail(ticket.id).then(unwrap).then(detail => {
-              if (!detail) throw new Error(t('ticketUnavailable'));
+              if (!detail || (ownerId && detail.owner !== ownerId)) throw new Error(t('ticketUnavailable'));
               if (current) setReading({ detail });
             }).catch(error => { if (current) setReading({ error: error?.message ?? String(error) }); });
             return () => { current = false; };
-          }, [ticket.id, ticket.updatedAt, generationId, attempt]);
+          }, [ticket.id, ticket.updatedAt, generationId, attempt, ownerId]);
           if (!generationId) return h('p', { role: 'status' }, t('monitorDisconnected'));
           if (reading?.error) return h('div', null, h('p', { role: 'alert' }, t('loadFailed') + ' · ' + reading.error),
             h('button', { type: 'button', style: settingsButtonStyle, onClick: () => retry(value => value + 1) }, t('retry')));
           return reading?.detail ? render(reading.detail) : h('p', { role: 'status', style: settingsHintStyle }, t('loading'));
         }
 
-        function RunHistoryRow({ run, onTask, onWorker, t }) {
+        function RunHistoryRow({ run, onTask, onWorker, ticketIds, t }) {
           var [open, setOpen] = React.useState(false);
           var [detail, setDetail] = React.useState(null);
           var [error, setError] = React.useState(null);
+          var [notificationRequest, setNotificationRequest] = React.useState(null);
           React.useEffect(function () {
             if (!open) return;
             var current = true;
-            setDetail(null);
             setError(null);
             void scoped.remote.hubBotSettings.runDetail({ id: run.id }).then(unwrap).then(value => {
+              if (value?.id !== run.id || value.ownerId !== run.ownerId || value.ticketId !== run.ticketId) throw new Error(t('loadFailed'));
               if (current) setDetail(value);
             }).catch(error => { if (current) setError(error?.message ?? String(error)); });
             return () => { current = false; };
-          }, [open, run.id]);
+          }, [open, run]);
           var date = instant => instant ? new Date(instant).toLocaleString() : '';
           var source = run.source.kind === 'github' ? [run.source.repo ?? 'GitHub', run.source.issueNumber && '#' + run.source.issueNumber].filter(Boolean).join(' ')
             : [t('runTimer'), run.source.timerId].filter(Boolean).join(' ');
           return h('details', { style: { marginBottom: '8px' }, onToggle: event => {
-            if (event.target === event.currentTarget) setOpen(event.currentTarget.open);
+            if (event.target !== event.currentTarget) return;
+            setOpen(event.currentTarget.open);
+            if (!event.currentTarget.open) {
+              setDetail(null);
+              setNotificationRequest(null);
+            }
           } },
             h('summary', { style: { cursor: 'pointer', padding: '4px 0', overflowWrap: 'anywhere' } },
               [date(run.createdAt), source, t(runStateLabels[run.status] ?? 'runUnsent'), run.result && t(runResultLabels[run.result.kind])].filter(Boolean).join(' · ')),
@@ -1928,74 +1970,197 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               detail?.lastProgressAt ? h('p', null, t('runLastProgress') + ' · ' + date(detail.lastProgressAt)) : null,
               ...(detail?.results ?? []).map((result, index) => h('p', { key: 'result-' + index },
                 [t(runResultLabels[result.kind]), date(result.at)].filter(Boolean).join(' · '))),
-              ...(detail?.notifications ?? []).map((notice, index) => h('p', { key: 'notice-' + index },
-                [notice.channel, notice.channelAccepted ? t('runSent') : t(runStateLabels[notice.state] ?? (['held', 'queued', 'recorded'].includes(notice.state) ? 'runWaiting' : 'runUnsent')), date(notice.acceptedAt)].filter(Boolean).join(' · ')))) : null);
+              ...(detail?.notifications ?? []).map((notice, index) => h('div', { key: 'notice-' + index,
+                style: { display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', gap: '4px 8px', margin: '6px 0' } },
+                [notice.channel, notice.channelAccepted ? t('runSent') : t(runStateLabels[notice.state] ?? (['held', 'queued', 'recorded'].includes(notice.state) ? 'runWaiting' : 'runUnsent')), date(notice.acceptedAt)].filter(Boolean).join(' · '),
+                notice.id ? h('span', null, notice.id) : null,
+                notice.id && ['recorded', 'queued', 'sent', 'failed'].includes(notice.state) ? h('button', { type: 'button', style: settingsButtonStyle, title: notice.id,
+                  onClick: () => setNotificationRequest({ id: notice.id }) }, t('notificationOpen')) : null)),
+              notificationRequest ? h(RunNotification, { request: notificationRequest, ticketIds, onTask, t }) : null) : null);
+        }
+
+        function NotificationTasks({ detail, ticketIds, onTask, t }) {
+          var tickets = ticketIds ? detail.tickets.filter(ticket => ticketIds.has(ticket.ticketId)) : detail.tickets;
+          if (!tickets.length) return h('p', { style: settingsHintStyle }, t('notificationEmpty'));
+          return h('ul', { style: { paddingInlineStart: '18px' } }, tickets.map(ticket => h('li', { key: ticket.ticketId },
+            h('button', { type: 'button', style: Object.assign({}, settingsButtonStyle, { maxWidth: '100%', overflowWrap: 'anywhere' }),
+              onClick: () => onTask(ticket.ticketId) }, t('runTask') + ' ' + ticket.ticketId))));
+        }
+
+        function RunNotification({ request, ticketIds, onTask, t }) {
+          var [reading, setReading] = React.useState(null);
+          React.useEffect(() => {
+            var active = true;
+            void scoped.remote.hubBotSettings.notificationDetail(request).then(unwrap).then(detail => {
+              if (detail?.id !== request.id || !Array.isArray(detail.tickets)) throw new Error(t('loadFailed'));
+              if (active) setReading({ request, detail });
+            }).catch(error => { if (active) setReading({ request, error: error?.message ?? String(error) }); });
+            return () => { active = false; };
+          }, [request]);
+          if (reading?.request !== request) return h('p', { role: 'status' }, t('notificationLoading'));
+          if (reading.error) return h('p', { role: 'alert' }, reading.error);
+          return h('div', null, h('p', null, t('notificationId') + ' · ' + request.id),
+            h(NotificationTasks, { detail: reading.detail, ticketIds, onTask, t }));
         }
 
         function NotificationLookup({ onTask, t }) {
           var [id, setId] = React.useState('');
-          var [state, setState] = React.useState({});
-          async function lookup(event) {
+          var [request, setRequest] = React.useState(null);
+          function lookup(event) {
             event.preventDefault();
-            if (!id.trim() || state.loading) return;
-            setState({ loading: true });
-            try {
-              var detail = unwrap(await scoped.remote.hubBotSettings.notificationDetail({ id: id.trim() }));
-              setState({ detail });
-            } catch (error) {
-              setState({ error: error?.message ?? String(error) });
-            }
+            if (id.trim()) setRequest({ id: id.trim() });
           }
           return h('div', { style: { margin: '8px 0' } },
             h('form', { onSubmit: lookup, style: { display: 'flex', flexWrap: 'wrap', gap: '6px 8px', alignItems: 'center' } },
               h('label', null, t('notificationId'), ' ', h('input', { type: 'text', value: id, onChange: event => setId(event.target.value), required: true, maxLength: 200, style: settingsInputStyle })),
-              h('button', { type: 'submit', style: settingsButtonStyle, disabled: state.loading }, t('notificationLookup'))),
-            state.loading ? h('p', { role: 'status' }, t('notificationLoading')) : null,
-            state.error ? h('p', { role: 'alert' }, state.error) : null,
-            state.detail ? h('ul', null, state.detail.tickets.map(ticket => h('li', { key: ticket.ticketId },
-              h('button', { type: 'button', style: Object.assign({}, settingsButtonStyle, { maxWidth: '100%', overflowWrap: 'anywhere' }), onClick: () => onTask(ticket.ticketId) }, t('runTask') + ' ' + ticket.ticketId)))) : null);
+              h('button', { type: 'submit', style: settingsButtonStyle }, t('notificationLookup'))),
+            request ? h(RunNotification, { request, onTask, t }) : null);
         }
 
-        function RunHistory({ onTask, onWorker, active }) {
+        function RunHistory({ onTask, onWorker, active, workspace, refreshWorkspace }) {
           var t = scoped.locale.bind(NS);
+          var ownerId = workspace?.owner.id;
+          var headingId = ownerId ? 'hub-bot-owner-runs-title' : 'hub-bot-runs-title';
+          var ticketIds = React.useMemo(() => workspace && new Set(workspace.tickets.map(ticket => ticket.id)), [workspace]);
           var [status, setStatus] = React.useState('');
           var [source, setSource] = React.useState('');
-          var [offset, setOffset] = React.useState(0);
+          var [offsets, setOffsets] = React.useState([0]);
           var [refresh, setRefresh] = React.useState(0);
-          var [page, setPage] = React.useState(null);
-          var [error, setError] = React.useState(null);
+          var [reading, setReading] = React.useState(null);
+          var offset = offsets.at(-1);
+          var homePage = Boolean(workspace && !status && !source && offset === 0);
+          var queryKey = JSON.stringify([ownerId, status, source, offset]);
           React.useEffect(function () {
-            if (!active) return;
+            if (!active || homePage) return;
             var current = true;
-            setPage(null);
-            setError(null);
-            var request = { limit: 20, offset, ...(status && { status }), ...(source && { source }) };
+            var request = { limit: 20, offset, ...(ownerId && { ownerId }), ...(status && { status }), ...(source && { source }) };
             void scoped.remote.hubBotSettings.listRuns(request).then(unwrap).then(value => {
-              if (current) setPage(value);
-            }).catch(error => { if (current) setError(error?.message ?? String(error)); });
+              if (!Array.isArray(value?.runs)) throw new Error(t('loadFailed'));
+              var page = ownerId ? { ...value, runs: value.runs.filter(run => run.ownerId === ownerId) } : value;
+              if (current) setReading({ queryKey, page });
+            }).catch(error => { if (current) setReading({ queryKey, error: error?.message ?? String(error) }); });
             return () => { current = false; };
-          }, [source, status, offset, refresh, active]);
+          }, [queryKey, refresh, active, homePage, workspace]);
+          var page = homePage ? { runs: workspace.runs, nextOffset: workspace.nextRunOffset } : reading?.queryKey === queryKey ? reading.page : null;
+          var error = !homePage && reading?.queryKey === queryKey ? reading.error : null;
           function select(label, value, options, setValue) {
             return h('label', null, t(label), ' ', h('select', { style: settingsButtonStyle, value, onChange: event => {
-              setOffset(0); setValue(event.target.value);
+              setOffsets([0]); setValue(event.target.value);
             } }, options.map(([key, label]) => h('option', { key, value: key }, t(label)))));
           }
-          return h('section', { id: 'hub-bot-runs', style: sectionStyle, 'aria-labelledby': 'hub-bot-runs-title' },
-            h('h3', { id: 'hub-bot-runs-title', tabIndex: -1, className: 'hb-scroll-target', style: sectionTitleStyle }, t('runSection')),
+          return h('section', { id: ownerId ? 'hub-bot-owner-runs' : 'hub-bot-runs', style: sectionStyle, 'aria-labelledby': headingId },
+            h('h3', { id: headingId, tabIndex: -1, className: 'hb-scroll-target', style: sectionTitleStyle }, t('runSection')),
             h('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '6px 10px' } },
               select('runStateFilter', status, [['', 'runAll'], ...Object.entries(runStateLabels)], setStatus),
               select('runSourceFilter', source, [['', 'runAll'], ['github', 'kindGitHub'], ['timer', 'runTimer']], setSource),
-              h('button', { type: 'button', style: settingsButtonStyle, onClick: () => setRefresh(value => value + 1) }, t('runRefresh'))),
-            h(NotificationLookup, { onTask, t }),
-            error ? h('p', { role: 'alert' }, error) : !page ? h('p', { style: settingsHintStyle }, t('runLoading')) : null,
+              h('button', { type: 'button', style: settingsButtonStyle, onClick: () => {
+                if (homePage) void refreshWorkspace(); else setRefresh(value => value + 1);
+              } }, t('runRefresh'))),
+            ownerId ? null : h(NotificationLookup, { onTask, t }),
+            error ? h('p', { role: 'alert', style: { overflowWrap: 'anywhere' } }, error) : !page ? h('p', { role: 'status', style: settingsHintStyle }, t('runLoading')) : null,
             page && page.runs.length === 0 ? h('p', { style: settingsHintStyle }, t('runEmpty')) : null,
-            ...(page?.runs ?? []).map(run => h(RunHistoryRow, { key: run.id, run, onTask, onWorker, t })),
-            page && offset > 0 ? h('button', { type: 'button', style: settingsButtonStyle, onClick: () => setOffset(Math.max(0, offset - 20)) }, t('runPrevious')) : null,
-            page?.nextOffset != null ? h('button', { type: 'button', style: settingsButtonStyle, onClick: () => setOffset(page.nextOffset) }, t('runNext')) : null);
+            ...(page?.runs ?? []).map(run => h(RunHistoryRow, { key: run.id, run, onTask, onWorker, ticketIds, t })),
+            h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '6px 8px' } },
+              offsets.length > 1 ? h('button', { type: 'button', style: settingsButtonStyle, onClick: () => setOffsets(offsets.slice(0, -1)) }, t('runPrevious')) : null,
+              page?.nextOffset != null ? h('button', { type: 'button', style: settingsButtonStyle, onClick: () => setOffsets([...offsets, page.nextOffset]) }, t('runNext')) : null));
+        }
+
+        function TimerSection({ headingId = 'hub-bot-timers-title', timers, ownerNames, onTask, onWorker, onRefresh, disabled }) {
+          var t = scoped.locale.bind(NS);
+          var [busy, setBusy] = React.useState(false);
+          var [error, setError] = React.useState(null);
+          if (!Array.isArray(timers)) return null;
+          var timerActionsStyle = { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '6px 8px' };
+          async function act(timer, action) {
+            if (busy || disabled || (action === 'cancel' && !window.confirm(t('timerCancel') + ' · ' + timer.message + '?'))) return;
+            setBusy(true);
+            setError(null);
+            try {
+              unwrap(await scoped.remote.hubBotSettings.timerAction({ id: timer.id, action }));
+              await onRefresh();
+            } catch (failure) { setError(failure?.message ?? String(failure)); }
+            finally { setBusy(false); }
+          }
+          return h('section', { id: headingId.replace(/-title$/, ''), style: sectionStyle, 'aria-labelledby': headingId },
+            h('h3', { id: headingId, tabIndex: -1, className: 'hb-scroll-target', style: sectionTitleStyle }, t('timersSection')),
+            error ? h('p', { role: 'alert', style: settingsHintStyle }, error) : null,
+            timers.length ? timers.map(function (timer) {
+              var stoppable = timer.status === 'firing' || (timer.status === 'fired' && timer.delivery?.state === 'queued') || (timer.schedule && timer.status === 'failed');
+              var actions = timer.status === 'pending' ? ['pause', 'cancel'] : timer.status === 'paused' ? ['resume', 'cancel'] : stoppable ? ['cancel'] : [];
+              var statusKey = ({ pending: 'timerPending', paused: 'timerPaused', firing: 'timerFiring', fired: 'timerFired', cancelled: 'timerCancelled', failed: 'timerFailed' })[timer.status];
+              var deliveryKey = ({ sent: 'timerDeliverySent', queued: 'timerDeliveryQueued', failed: 'timerDeliveryFailed' })[timer.delivery?.state];
+              var worker = timer.delivery?.workerSession;
+              var schedule = timer.schedule;
+              var cadence = schedule?.frequency === 'daily' ? t('timerDaily').replace('{time}', schedule.time)
+                : schedule?.frequency === 'weekly' ? t('timerWeekly').replace('{weekday}', t('timerWeekday' + schedule.weekday)).replace('{time}', schedule.time) : null;
+              var time = timer.fireAt ? new Date(timer.fireAt).toLocaleString(undefined, schedule ? { timeZone: 'Asia/Shanghai' } : {}) : '—';
+              if (schedule) time = timer.status === 'cancelled' ? null : t('timerNext').replace('{time}', time);
+              return h('div', { key: timer.id, style: { margin: '8px 0', overflowWrap: 'anywhere' } },
+                h('strong', null, timer.message),
+                h('div', { style: settingsHintStyle }, [ownerNames?.get(timer.ownerId) ?? (ownerNames ? timer.ownerId : null), cadence, time, statusKey ? t(statusKey) : timer.status, deliveryKey ? t(deliveryKey) : null, timer.late ? t('timerLate') : null].filter(Boolean).join(' · ')),
+                timer.lastError?.message || timer.delivery?.lastError
+                  ? h('p', { role: 'alert', style: settingsHintStyle }, timer.lastError?.message ?? timer.delivery.lastError) : null,
+                h('div', { style: timerActionsStyle }, actions.map(action => h('button', { key: action, type: 'button', style: settingsButtonStyle, disabled: busy || disabled, onClick: () => void act(timer, action) },
+                  t(({ pause: 'timerPause', resume: 'timerResume', cancel: 'timerCancel' })[action]))),
+                  timer.delivery?.ticketId ? h('button', { type: 'button', style: settingsButtonStyle, onClick: () => onTask(timer.delivery.ticketId) }, t('timerRun')) : null,
+                  worker?.sessionId && onWorker ? h('button', { type: 'button', style: settingsButtonStyle, onClick: () => {
+                    void onWorker(worker.sessionId).catch(failure => setError(failure?.message ?? String(failure)));
+                  } }, t('timerWorker')) : null));
+            }) : h('p', { style: settingsHintStyle }, t('timersEmpty')));
+        }
+
+        var ownerWorkspacePage = 'hub-bot-owner-workspace-title';
+        function linkedWorkspaceOwner() {
+          return new URL(window.location.href).searchParams.get('hubBotWorkspace') || '';
+        }
+
+        function useOwnerWorkspace(ownerId, generationId) {
+          var address = React.useMemo(() => ownerId && generationId ? { ownerId, generationId } : null, [ownerId, generationId]);
+          var active = React.useRef(null);
+          var [reading, setReading] = React.useState(null);
+          React.useLayoutEffect(() => {
+            active.current = address && { address, request: null };
+            return () => { active.current = null; };
+          }, [address]);
+          var isCurrent = React.useCallback(() => Boolean(address && active.current?.address === address
+            && scoped.connection.generation.getSnapshot()?.id === address.generationId), [address]);
+          var refresh = React.useCallback(async () => {
+            if (!isCurrent()) return;
+            var scope = active.current;
+            var request = {};
+            scope.request = request;
+            setReading(current => current?.address === address ? { ...current, loading: true } : { address, loading: true });
+            var isLatest = () => isCurrent() && active.current === scope && scope.request === request;
+            try {
+              var value = unwrap(await scoped.remote.hubBotSettings.ownerWorkspace({ ownerId: address.ownerId }));
+              if (value?.owner?.id !== address.ownerId || !Array.isArray(value.tickets) || !Array.isArray(value.timers) || !Array.isArray(value.runs)
+                || value.tickets.some(ticket => ticket.owner !== address.ownerId) || value.timers.some(timer => timer.ownerId !== address.ownerId)
+                || value.runs.some(run => run.ownerId !== address.ownerId) || (value.switchOperation && value.switchOperation.ownerId !== address.ownerId)) {
+                throw new Error(scoped.locale.bind(NS)('loadFailed'));
+              }
+              if (isLatest()) setReading({ address, value });
+            } catch (error) {
+              if (isLatest()) setReading(current => ({
+                address, error: error?.message ?? String(error),
+                value: current?.address === address && (error?.remoteError?.code ?? error?.code) !== 'owner-workspace/not-found' ? current.value : undefined,
+              }));
+            } finally {
+              if (scope.request === request) scope.request = null;
+            }
+          }, [address, isCurrent]);
+          React.useEffect(() => {
+            if (!address) return;
+            void refresh();
+            function poll() { if (!document.hidden && !active.current?.request) void refresh(); }
+            var timer = setInterval(poll, 15000);
+            document.addEventListener('visibilitychange', poll);
+            return () => { clearInterval(timer); document.removeEventListener('visibilitychange', poll); };
+          }, [address, refresh]);
+          return { ...(reading?.address === address ? reading : null), refresh, isCurrent };
         }
 
         var boardSections = [
-          ['hub-bot-overview-title', 'statusSection'], ['hub-bot-timers-title', 'timersSection'],
+          ['hub-bot-overview-title', 'statusSection'], [ownerWorkspacePage, 'ownerWorkspace'], ['hub-bot-timers-title', 'timersSection'],
           ['hub-bot-runs-title', 'runSection'], ['hub-bot-connections', 'connectionsSection'], ['hub-bot-settings', 'settingsDivider'],
         ];
         var boardScrollGap = 16;
@@ -2005,7 +2170,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           completed: 'switchCompleted', failed: 'switchFailed', cancelled: 'switchCancelled',
         };
 
-        function HandoffSummaryEditor({ owner, t, onClose, onRefresh }) {
+        function HandoffSummaryEditor({ owner, t, onClose, onRefresh, disabled }) {
           var [draft, setDraft] = React.useState(null);
           var [text, setText] = React.useState('');
           var [busy, setBusy] = React.useState(true);
@@ -2028,7 +2193,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             return () => { mounted = false; };
           }, [owner.id, owner.sessionId]);
           async function run(work) {
-            if (busy) return;
+            if (busy || disabled) return;
             setBusy(true);
             setError(null);
             setStatus('');
@@ -2037,7 +2202,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           }
           var confirmed = draft?.status === 'confirmed' && text === draft.text;
           var version = draft && { draftId: draft.draftId, revision: draft.revision };
-          var button = (label, action) => h('button', { type: 'button', style: settingsButtonStyle, disabled: busy, onClick: () => void run(action) }, t(label));
+          var button = (label, action) => h('button', { type: 'button', style: settingsButtonStyle, disabled: busy || disabled, onClick: () => void run(action) }, t(label));
           async function confirmDraft() {
             var saved = text !== draft.text ? await send('edit', { ...version, text }) : draft;
             place(saved);
@@ -2071,12 +2236,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             error ? h('p', { role: 'alert', style: { overflowWrap: 'anywhere' } }, error) : null);
         }
 
-        function OwnerSwitchControls({ owner, operation, onRefresh, onOldSession, t }) {
+        function OwnerSwitchControls({ owner, operation, onRefresh, onOperationSession, showSessions, disabled, historyOnly, t }) {
           var [expanded, setExpanded] = React.useState(false);
           var [busy, setBusy] = React.useState(false);
           var [error, setError] = React.useState(null);
           async function act(request) {
-            if (busy || (request.mode === 'stop' && !window.confirm(t('switchStopConfirm')))) return;
+            if (busy || disabled || (request.mode === 'stop' && !window.confirm(t('switchStopConfirm')))) return;
             setBusy(true);
             setError(null);
             try {
@@ -2086,20 +2251,29 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               setError(error?.message ?? String(error));
             } finally { setBusy(false); }
           }
-          var pending = ['waiting', 'preparing', 'committed', 'archive-failed'].includes(operation?.status);
+          async function openBinding(binding) {
+            setError(null);
+            try { await onOperationSession(operation.operationId, binding); }
+            catch (failure) { setError(t('openSessionFailed') + ' · ' + (failure?.message ?? String(failure))); }
+          }
+          var pending = historyOnly || ['waiting', 'preparing', 'committed', 'archive-failed'].includes(operation?.status);
           var newRequest = { action: 'request', expectedSessionId: owner.sessionId };
-          var button = (label, request) => h('button', { type: 'button', style: settingsButtonStyle, disabled: busy, onClick: () => void act(request) }, t(label));
+          var button = (label, request) => h('button', { type: 'button', style: settingsButtonStyle, disabled: busy || disabled, onClick: () => void act(request) }, t(label));
           return h('div', { style: { display: 'flex', gap: '6px 8px', flexWrap: 'wrap', alignItems: 'center' } },
             owner.sessionId && !owner.recycled && !pending ? button('switchWait', { ...newRequest, mode: 'wait' }) : null,
             owner.sessionId && !owner.recycled && !pending ? button('switchStop', { ...newRequest, mode: 'stop' }) : null,
             owner.sessionId && !owner.recycled && !pending && !expanded ? h('button', { type: 'button', style: settingsButtonStyle,
-              onClick: () => setExpanded(true) }, t('handoffSummary')) : null,
+              disabled, onClick: () => setExpanded(true) }, t('handoffSummary')) : null,
             owner.sessionId && !owner.recycled && !pending && expanded ? h(HandoffSummaryEditor, { key: owner.sessionId, owner, t,
-              onClose: () => setExpanded(false), onRefresh }) : null,
+              onClose: () => setExpanded(false), onRefresh, disabled }) : null,
             operation ? h('span', { role: 'status', style: settingsHintStyle }, t(ownerSwitchLabels[operation.status] ?? 'switchFailed')) : null,
             operation?.status === 'waiting' ? button('switchCancel', { action: 'cancel', operationId: operation.operationId }) : null,
             operation?.status === 'archive-failed' ? button('switchRetryArchive', { action: 'retry-archive', operationId: operation.operationId }) : null,
-            operation?.committedAt && onOldSession ? h('button', { type: 'button', style: settingsButtonStyle, onClick: () => onOldSession(operation.oldSessionId) }, t('switchOpenPrevious')) : null,
+            operation?.committedAt && onOperationSession ? h('button', { type: 'button', style: settingsButtonStyle, onClick: () => void openBinding('oldSessionId') }, t('switchOpenPrevious')) : null,
+            showSessions && operation?.committedAt && onOperationSession ? h('button', { type: 'button', style: settingsButtonStyle, onClick: () => void openBinding('newSessionId') }, t('switchOpenNew')) : null,
+            showSessions && operation ? h('dl', { style: { ...settingsHintStyle, flexBasis: '100%', margin: 0, overflowWrap: 'anywhere' } },
+              h('dt', null, t('ownerWorkspacePrevious')), h('dd', { style: { margin: '0 0 4px' } }, operation.oldSessionId),
+              h('dt', null, t('ownerWorkspaceReplacement')), h('dd', { style: { margin: 0 } }, operation.newSessionId)) : null,
             error || operation?.reason ? h('p', { role: 'alert', style: { margin: 0, overflowWrap: 'anywhere' } }, error ?? operation.reason) : null);
         }
 
@@ -2107,7 +2281,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var t = scoped.locale.bind(NS);
           var boardRef = React.useRef(null);
           var navigationRef = React.useRef(null);
-          var [panelPage, setPanelPage] = React.useState(boardSections[0][0]);
+          var [workspaceOwnerId, setWorkspaceOwnerId] = React.useState(linkedWorkspaceOwner);
+          var [panelPage, setPanelPage] = React.useState(workspaceOwnerId ? ownerWorkspacePage : boardSections[0][0]);
+          var [workspaceTarget, setWorkspaceTarget] = React.useState(null);
+          var workspaceHeading = React.useRef(null);
+          var workspaceCard = React.useRef(null);
+          var workspaceTicketError = React.useRef(null);
           var vs = React.useState(null); var view = vs[0]; var setView = vs[1];
           var viewReadId = React.useRef(0);
           var os = React.useState(null); var owners = os[0]; var setOwners = os[1];
@@ -2123,7 +2302,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var connectionState = React.useSyncExternalStore(connectionStateSource.subscribe, connectionStateSource.getSnapshot);
           var generationSource = scoped.connection.generation;
           var generation = React.useSyncExternalStore(generationSource.subscribe, generationSource.getSnapshot);
-
+          var workspace = useOwnerWorkspace(panelPage === ownerWorkspacePage ? workspaceOwnerId : '', generation?.id);
+          var workspaceId = workspace.value?.owner.id;
+          React.useLayoutEffect(() => {
+            if (workspaceTarget?.ownerId !== workspaceId) return;
+            var target = workspaceCard.current || workspaceTicketError.current;
+            if (target) focusBoardTarget(target);
+          }, [workspaceTarget, workspaceId]);
 
           var [selfTestResult, setSelfTestResult] = React.useState(null);
           var selfTestBusy = selfTestResult?.stage === 'starting' || selfTestResult?.stage === 'waiting';
@@ -2137,8 +2322,6 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
 
           var [ticketOperation, setTicketOperation] = React.useState(null);
           var [ticketFeedback, setTicketFeedback] = React.useState(null);
-          var [timerBusy, setTimerBusy] = React.useState(false);
-          var [timerError, setTimerError] = React.useState(null);
           var [ownerSessionError, setOwnerSessionError] = React.useState(null);
           var linkedOwnerError = React.useSyncExternalStore(listener => {
             ownerLinkListeners.add(listener);
@@ -2167,11 +2350,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var rds = React.useState(false); var recentDroppedOnly = rds[0]; var setRecentDroppedOnly = rds[1];
           var rus = React.useState(false); var recentUnprocOnly = rus[0]; var setRecentUnprocOnly = rus[1];
 
-          function publishOverview(board) {
+          function publishOverview(board, generationId) {
+            if (!generationId || generationSource.getSnapshot()?.id !== generationId) return;
             if (!board?.generatedAt) throw new Error(t('loadFailed'));
             var receivedAt = Date.now();
-            var generationId = generationSource.getSnapshot()?.id;
-            setMonitor(current => current.generationId === generationId && current.overview?.generatedAt > board.generatedAt
+            setMonitor(current => generationSource.getSnapshot()?.id !== generationId
+              || (current.generationId === generationId && current.overview?.generatedAt > board.generatedAt)
               ? current : { overview: board, receivedAt, generationId, error: null });
           }
           function refreshMonitoring() {
@@ -2183,7 +2367,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               .then(function ([board, rows]) {
                 if (monitorRequest.current !== pending || generationSource.getSnapshot()?.id !== generationId) return;
                 if (board.status === 'rejected') throw board.reason;
-                publishOverview(board.value);
+                publishOverview(board.value, generationId);
                 if (rows.status === 'rejected') {
                   if (Array.isArray(board.value.owners)) setOwners(board.value.owners);
                   throw rows.reason;
@@ -2252,17 +2436,22 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               finishSelfTest(run, 'error', 'selfTestTimeout');
               return;
             }
+            var generationId = generationSource.getSnapshot()?.id;
             scoped.remote.hubBotSettings.overview().then(function (raw) {
               if (selfTestRun.current !== run) return;
+              if (generationSource.getSnapshot()?.id !== generationId) {
+                run.timer = setTimeout(function () { pollSelfTest(run); }, 2500);
+                return;
+              }
               var ov = unwrap(raw);
               var result = ov?.selfTests?.find(test => test.id === run.triggerId);
               if (result?.dropped) {
                 finishSelfTest(run, 'error', 'selfTestDropped', result.dropped);
               } else if (result?.reply?.state === 'sent') {
-                publishOverview(ov);
+                publishOverview(ov, generationId);
                 finishSelfTest(run, 'success', 'selfTestPassed');
               } else if (result?.reply?.state === 'failed') {
-                publishOverview(ov);
+                publishOverview(ov, generationId);
                 finishSelfTest(run, 'error', 'selfTestDeliveryFailed', result.reply.lastError);
               } else {
                 run.timer = setTimeout(function () { pollSelfTest(run); }, 2500);
@@ -2342,6 +2531,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             return ticket.deferred?.status === 'pending' ? { requestId: ticket.deferred.requestId } : {};
           }
 
+          function answerDraftKey(ticket) {
+            return JSON.stringify([ticket.id, ticket.stage, ticket.question?.at ?? null, ticket.deferred?.requestId ?? null, ticket.report?.at ?? null]);
+          }
+
           async function sendTicketResolution(request) {
             var result = unwrap(await scoped.remote.hubBotSettings.resolveTicket(request));
             if (result?.ticketId !== request.ticketId) throw new Error(t('ticketResultMissing'));
@@ -2350,7 +2543,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
 
           async function finishTicketOperation(scope, feedback) {
             try {
-              publishOverview(unwrap(await scoped.remote.hubBotSettings.overview()));
+              await Promise.all([refreshOverview(), scope === 'owner:' + workspaceId ? workspace.refresh() : null]);
             } catch (error) {
               feedback.refreshError = error?.message || String(error);
             } finally {
@@ -2361,7 +2554,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           }
 
           async function resolve(tk, resolution, scope) {
-            if (ticketInFlight.current) return;
+            if (ticketInFlight.current || (scope.startsWith('owner:') && (workspace.error || !workspace.isCurrent()))) return;
             var labels = {
               confirm: ['confirmBtn', 'confirmDone'], reject: ['rejectBtn', 'rejectDone'],
               retry: ['retryTicketBtn', 'retryDone'],
@@ -2369,7 +2562,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             };
             var [actionLabel, successLabel] = labels[resolution];
             if (resolution === 'answer' && tk.stage === 'person/review') successLabel = 'reworkDone';
-            var message = resolution === 'answer' ? (answers[tk.id] || '').trim() : '';
+            var draftKey = answerDraftKey(tk);
+            var message = resolution === 'answer' ? (answers[draftKey] || '').trim() : '';
             if (resolution === 'answer') {
               if (!message) return;
             } else if (!window.confirm(t(actionLabel) + ' · ' + (tk.pendingConfirm?.text || tk.message || tk.id))) return;
@@ -2379,7 +2573,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               var result = await sendTicketResolution({ ticketId: tk.id, resolution, ...decisionId(tk), ...(message ? { message } : {}) });
               if (resolution === 'answer') setAnswers(function (current) {
                 var next = { ...current };
-                delete next[tk.id];
+                delete next[draftKey];
                 return next;
               });
               if (selected.has(tk.id)) setSelected(function (current) {
@@ -2436,6 +2630,25 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             measureNavigation();
             return () => resize.disconnect();
           }, [Boolean(view && owners && overview)]);
+
+          React.useLayoutEffect(() => {
+            if (panelPage === ownerWorkspacePage && workspaceHeading.current) focusBoardTarget(workspaceHeading.current);
+          }, [panelPage, Boolean(view && owners && overview)]);
+
+          function refreshOverview() {
+            var generationId = generationSource.getSnapshot()?.id;
+            return scoped.remote.hubBotSettings.overview().then(unwrap).then(board => publishOverview(board, generationId));
+          }
+
+          async function refreshWorkspace() {
+            await Promise.all([workspace.refresh(), refreshOverview()]);
+          }
+
+          function selectWorkspace(ownerId) {
+            setWorkspaceOwnerId(ownerId);
+            setWorkspaceTarget(null);
+            switchPage(ownerWorkspacePage);
+          }
 
           function switchPage(page) {
             setPanelPage(page);
@@ -2541,47 +2754,6 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           function intakeDash(value) {
             return value === null || value === undefined || value === '' ? '—' : String(value);
           }
-          function renderTimers() {
-            if (!Array.isArray(overview.timers)) return null;
-            var timerActionsStyle = { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '6px 8px' };
-            async function act(timer, action) {
-              if (action === 'cancel' && !window.confirm(t('timerCancel') + ' — ' + timer.message + '?')) return;
-              setTimerBusy(true);
-              setTimerError(null);
-              try {
-                unwrap(await scoped.remote.hubBotSettings.timerAction({ id: timer.id, action }));
-                publishOverview(unwrap(await scoped.remote.hubBotSettings.overview()));
-              } catch (error) { setTimerError(error?.message ?? String(error)); }
-              finally { setTimerBusy(false); }
-            }
-            return h('section', { id: 'hub-bot-timers', style: sectionStyle, 'aria-labelledby': 'hub-bot-timers-title' },
-              h('h3', { id: 'hub-bot-timers-title', tabIndex: -1, className: 'hb-scroll-target', style: sectionTitleStyle }, t('timersSection')),
-              timerError ? h('p', { role: 'alert', style: settingsHintStyle }, timerError) : null,
-              overview.timers.length ? overview.timers.map(function (timer) {
-                var stoppable = timer.status === 'firing' || (timer.status === 'fired' && timer.delivery?.state === 'queued') || (timer.schedule && timer.status === 'failed');
-                var actions = timer.status === 'pending' ? ['pause', 'cancel'] : timer.status === 'paused' ? ['resume', 'cancel'] : stoppable ? ['cancel'] : [];
-                var statusKey = ({ pending: 'timerPending', paused: 'timerPaused', firing: 'timerFiring', fired: 'timerFired', cancelled: 'timerCancelled', failed: 'timerFailed' })[timer.status];
-                var deliveryKey = ({ sent: 'timerDeliverySent', queued: 'timerDeliveryQueued', failed: 'timerDeliveryFailed' })[timer.delivery?.state];
-                var worker = timer.delivery?.workerSession;
-                var schedule = timer.schedule;
-                var cadence = schedule?.frequency === 'daily' ? t('timerDaily').replace('{time}', schedule.time)
-                  : schedule?.frequency === 'weekly' ? t('timerWeekly').replace('{weekday}', t('timerWeekday' + schedule.weekday)).replace('{time}', schedule.time) : null;
-                var time = timer.fireAt ? new Date(timer.fireAt).toLocaleString(undefined, schedule ? { timeZone: 'Asia/Shanghai' } : {}) : '—';
-                if (schedule) time = timer.status === 'cancelled' ? null : t('timerNext').replace('{time}', time);
-                return h('div', { key: timer.id, style: { margin: '8px 0' } },
-                  h('strong', null, timer.message),
-                  h('div', { style: settingsHintStyle }, [ownerNames.get(timer.ownerId) || timer.ownerId, cadence, time, statusKey ? t(statusKey) : timer.status, deliveryKey ? t(deliveryKey) : null, timer.late ? t('timerLate') : null].filter(Boolean).join(' · ')),
-                  timer.lastError?.message || timer.delivery?.lastError
-                    ? h('p', { role: 'alert', style: settingsHintStyle }, timer.lastError?.message ?? timer.delivery.lastError) : null,
-                  h('div', { style: timerActionsStyle }, actions.map(action => h('button', { key: action, type: 'button', style: settingsButtonStyle, disabled: timerBusy, onClick: () => void act(timer, action) },
-                    t(({ pause: 'timerPause', resume: 'timerResume', cancel: 'timerCancel' })[action]))),
-                    timer.delivery?.ticketId ? h('button', { type: 'button', style: settingsButtonStyle, onClick: () => openStream({ ticketId: timer.delivery.ticketId }) }, t('timerRun')) : null,
-                    worker?.sessionId && canOpenOwnerSession ? h('button', { type: 'button', style: settingsButtonStyle, onClick: async () => {
-                      try { await scoped.get('uiWorkspace').openSession(worker.sessionId); }
-                      catch (error) { setTimerError(error?.message ?? String(error)); }
-                    } }, t('timerWorker')) : null));
-              }) : h('p', { style: settingsHintStyle }, t('timersEmpty')));
-          }
 
           function renderIntake() {
             // 旧后端没有 intake 投影时整块不出现——不拿「没有数据」冒充「没有记录」。
@@ -2679,7 +2851,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                   return h(RecentMessageRow, { key: entry.id, entry, t, channel: kindLabel(entry.kind), copiedId, onCopy: copyText,
                     ownerButton: ownerFilterButton(ownerId, entry.ownerLabel, { maxWidth: '135px', fontSize: '11px' }),
                     onTicket: ticketId => openStream({ ticketId }),
-                    onRetry: () => scoped.remote.hubBotSettings.overview().then(unwrap).then(publishOverview).catch(() => {}),
+                    onRetry: () => refreshOverview().catch(() => {}),
                   });
                 })));
           }
@@ -2738,7 +2910,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             var navigation = navigationRef.current;
             if (!board?.contains(target) || !navigation) return;
             target.focus({ preventScroll: true });
-            var status = target.hasAttribute('data-hb-ticket') ? target.closest('#hub-bot-stream')?.querySelector('[data-hb-ticket-status]') : null;
+            var status = target.hasAttribute('data-hb-ticket') ? target.closest('#hub-bot-stream, [data-hb-owner-workspace]')?.querySelector('[data-hb-ticket-status]') : null;
             var top = board.scrollTop + target.getBoundingClientRect().top - board.getBoundingClientRect().top
               - navigation.offsetHeight - boardScrollGap - (status?.offsetHeight ?? 0);
             board.scrollTo({ top, behavior: 'instant' });
@@ -2756,18 +2928,38 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               h('span', { style: cardValueStyle }, color ? dot(color) : null, value), details);
           }
 
-          async function openOwnerSession(owner) {
+          async function openSessionById(sessionId) {
+            var uiWorkspace = scoped.get('uiWorkspace');
+            if (typeof uiWorkspace?.openSession !== 'function') throw new Error(t('ownerSessionUnavailable'));
+            await uiWorkspace.openSession(sessionId);
+          }
+
+          async function openOwnerSession(owner, inWorkspace = false) {
             setOwnerSessionError(null);
-            try {
-              var workspace = scoped.get('uiWorkspace');
-              if (typeof workspace?.openSession !== 'function') throw new Error(t('ownerSessionUnavailable'));
-              var rows = unwrap(await scoped.remote.hubBotSettings.listOwners());
-              var current = rows.find(row => row.id === owner.id);
-              if (!current?.sessionId) throw new Error(t('sessionNone'));
-              await workspace.openSession(current.sessionId);
-            } catch (error) {
-              setOwnerSessionError({ ownerId: owner.id, sessionId: owner.sessionId, message: error?.message || String(error) });
+            var generationId = generationSource.getSnapshot()?.id;
+            function isCurrent() {
+              return generationSource.getSnapshot()?.id === generationId && (!inWorkspace || workspace.isCurrent());
             }
+            try {
+              var api = scoped.remote.hubBotSettings;
+              var current = inWorkspace ? unwrap(await api.ownerWorkspace({ ownerId: owner.id }))?.owner
+                : unwrap(await api.listOwners()).find(row => row.id === owner.id);
+              if (!isCurrent()) return;
+              if (current?.id !== owner.id || current.recycled || !current.sessionId) throw new Error(t('sessionNone'));
+              await openSessionById(current.sessionId);
+            } catch (error) {
+              if (isCurrent()) setOwnerSessionError({ ownerId: owner.id, sessionId: owner.sessionId, message: error?.message || String(error) });
+            }
+          }
+
+          async function openOperationSession(ownerId, operationId, binding, inWorkspace = false) {
+            var generationId = generationSource.getSnapshot()?.id;
+            var operation = unwrap(await scoped.remote.hubBotSettings.ownerSwitchAction({ action: 'status', ownerId, operationId }));
+            if (generationSource.getSnapshot()?.id !== generationId || (inWorkspace && !workspace.isCurrent())) return;
+            if (operation?.ownerId !== ownerId || operation.operationId !== operationId || !operation.committedAt || !operation[binding]) {
+              throw new Error(t('ownerSessionUnavailable'));
+            }
+            await openSessionById(operation[binding]);
           }
 
           function renderOwnerCard(owner) {
@@ -2824,8 +3016,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 sessionError ? h('div', { role: 'alert', style: { flexBasis: '100%', color: 'var(--dsw-alias-state-error-primary)', fontSize: '12px', overflowWrap: 'anywhere' } },
                   t('openSessionFailed') + ' · ' + sessionError) : null),
               h(OwnerSwitchControls, { owner, t, operation: (overview.ownerSwitches ?? []).find(row => row.ownerId === owner.id),
-                onRefresh: () => scoped.remote.hubBotSettings.overview().then(unwrap).then(publishOverview),
-                onOldSession: canOpenOwnerSession ? sessionId => openOwnerSession({ id: owner.id, sessionId }) : null }),
+                onRefresh: refreshOverview,
+                onOperationSession: canOpenOwnerSession ? (id, binding) => openOperationSession(owner.id, id, binding) : null }),
               current ? h('button', { type: 'button', className: 'hb-text-action', onClick: () => openStream({ ticketId: current.id }),
                 title: current.message || current.id, 'aria-label': fill(t('openTicketLabel'), current.id) + (current.message ? ' · ' + current.message : ''),
                 style: { fontSize: '12px', alignSelf: 'start', maxWidth: '100%' },
@@ -2839,6 +3031,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 }, stage.text + ' · ' + stage.count);
               })) : null,
               h('div', { style: Object.assign({}, rowStyle, { marginTop: 'auto', fontSize: '12px' }) },
+                h('button', { type: 'button', style: Object.assign({}, settingsButtonStyle, { background: 'var(--dsw-alias-state-business-tertiary)' }),
+                  'aria-label': fill(t('ownerWorkspaceOpenFor'), accessibleLabel), onClick: () => selectWorkspace(owner.id),
+                }, t('ownerWorkspaceOpen')),
                 h('button', { type: 'button', style: settingsButtonStyle, 'aria-label': fill(t('openOwnerTasks'), accessibleLabel),
                   onClick: () => openStream({ ownerId: owner.id }),
                 }, t('ownerTicketsButton')),
@@ -2873,24 +3068,28 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
 
           var ticketRowItem = function (tk, scope, isTarget, archiveDetails) {
             var rows = [];
+            var inWorkspace = scope.startsWith('owner:');
             var reviewing = tk.stage === 'person/review';
-            var inlineActions = scope === 'needs' || reviewing || tk.stage === 'idle' || tk.stage === 'queued';
+            var disableTicketActions = Boolean(ticketBusy || (inWorkspace && workspace.error));
+            var inlineActions = scope === 'needs' || reviewing || tk.stage === 'idle' || tk.stage === 'queued'
+              || (inWorkspace && NEEDS_ME.includes(tk.stage));
             var detailKey = scope + ':' + tk.id;
             var detailsOpen = archiveDetails || (openTicketDetails[detailKey] ?? Boolean(isTarget));
-            if (!archiveDetails) rows.push(h('div', { key: 'head', style: { display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0 } },
+            if (!archiveDetails) rows.push(h('div', { key: 'head', style: { display: 'flex', alignItems: 'center', gap: '6px 10px', minWidth: 0, flexWrap: inWorkspace ? 'wrap' : undefined } },
               stagePill(tk.stage, tk.stageText || tk.stage),
               tk.trigger && tk.trigger.kind
                 ? h('span', { style: { flexShrink: 0, fontSize: '10px', padding: '0 6px', borderRadius: '999px', background: tk.trigger.kind === 'feishu' ? 'rgba(70,150,255,0.14)' : 'rgba(150,150,150,0.14)', color: tk.trigger.kind === 'feishu' ? '#7db8ff' : 'rgba(200,200,200,0.8)', border: '1px solid ' + (tk.trigger.kind === 'feishu' ? 'rgba(70,150,255,0.3)' : 'rgba(150,150,150,0.25)') }, title: t('originHint') }, kindLabel(tk.trigger.kind))
                 : null,
-              ownerFilterButton(tk.owner, tk.ownerLabel, { fontWeight: 600, maxWidth: '32%' }),
+              inWorkspace ? null : ownerFilterButton(tk.owner, tk.ownerLabel, { fontWeight: 600, maxWidth: '32%' }),
               h('span', {
-                style: { flex: 1, opacity: 0.85, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: tk.message ? 'pointer' : 'default' },
+                style: { flex: inWorkspace ? '1 1 160px' : 1, minWidth: 0, opacity: 0.85, overflow: 'hidden', textOverflow: 'ellipsis',
+                  whiteSpace: inWorkspace ? 'normal' : 'nowrap', overflowWrap: 'anywhere', cursor: tk.message ? 'pointer' : 'default' },
                 title: tk.message ? String(tk.message) + '\n' + t('copyMsgHint') : '',
                 onClick: tk.message ? function () { copyText(String(tk.message), 'msg:' + tk.id); } : undefined,
-              }, tk.message || '（无原文）'),
+              }, tk.message || tk.id),
               copiedId === 'msg:' + tk.id ? h('span', { style: { flexShrink: 0, fontSize: '11px', color: TONES.green.fg } }, t('copiedBtn')) : null,
               tk.recoveryPending ? h('span', { title: t('recoveringHint') }, stagePill('queued', t('recovering'))) : null,
-              scope === 'needs' && NEEDS_ME.indexOf(tk.stage) >= 0
+              (scope === 'needs' || inWorkspace) && NEEDS_ME.includes(tk.stage)
                 ? (function () {
                     var waitMs = Date.now() - new Date(tk.updatedAt || tk.createdAt).getTime();
                     if (!(waitMs >= 0)) waitMs = 0;
@@ -2957,14 +3156,14 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             var actions = [];
             if (reviewing && tk.ownerSessionId && canOpenOwnerSession) {
               actions.push(h('button', { key: 'owner-session', type: 'button', style: settingsButtonStyle,
-                onClick: () => openOwnerSession({ id: tk.owner, sessionId: tk.ownerSessionId }),
+                onClick: () => openOwnerSession({ id: tk.owner, sessionId: tk.ownerSessionId }, inWorkspace),
                 'aria-label': fill(t('openOwnerSession'), ownerFilterLabel(tk.owner)),
               }, t('openSessionButton')));
             }
             function actionButton(resolution, label, tone, disabled) {
-              return h('button', { key: resolution, type: 'button', disabled: ticketBusy || disabled,
+              return h('button', { key: resolution, type: 'button', disabled: disableTicketActions || disabled,
                 onClick: () => resolve(tk, resolution, scope),
-                style: Object.assign({}, settingsButtonStyle, { cursor: ticketBusy || disabled ? undefined : 'pointer',
+                style: Object.assign({}, settingsButtonStyle, { cursor: disableTicketActions || disabled ? undefined : 'pointer',
                   background: tone.bg, borderColor: tone.border, color: 'inherit' }),
               }, t(label));
             }
@@ -2979,14 +3178,15 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             }
             if (tk.stage === 'person/answer' || tk.stage === 'person/review') {
               var inputLabel = t(reviewing ? 'reworkPlaceholder' : 'answerPlaceholder');
-              var draft = answers[tk.id] || '';
-              actions.push(h('textarea', { key: 'reply', rows: 2,
+              var draftKey = answerDraftKey(tk);
+              var draft = answers[draftKey] || '';
+              actions.push(h('textarea', { key: draftKey, rows: 2,
                 style: Object.assign({}, settingsInputStyle, { flex: '1 1 180px', minWidth: 0, padding: '5px 10px', fontSize: '13px', resize: 'vertical' }),
-                value: draft, disabled: ticketBusy, placeholder: inputLabel, 'aria-label': inputLabel,
+                value: draft, disabled: disableTicketActions, placeholder: inputLabel, 'aria-label': inputLabel,
                 'aria-description': t('replyShortcut'), title: t('replyShortcut'),
                 onChange: function (ev) {
                   var value = ev.target.value;
-                  setAnswers(current => ({ ...current, [tk.id]: value }));
+                  setAnswers(current => ({ ...current, [draftKey]: value }));
                 },
                 onKeyDown: function (ev) {
                   if (ev.key === 'Enter' && !ev.shiftKey && !ev.nativeEvent.isComposing) {
@@ -3086,12 +3286,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               archiveDetails ? null : h('summary', { style: { cursor: 'pointer' } },
                 t(tk.report ? 'openReport' : !inlineActions && actionBar ? 'detailActionsToggle' : 'detailToggle')),
               detailsOpen && !inlineActions ? actionBar : null,
-              detailsOpen ? h(TicketFacts, { ticket: tk, generationId: generation?.id, render: renderFacts }) : null));
+              detailsOpen ? h(TicketFacts, { ticket: tk, generationId: generation?.id, ownerId: inWorkspace ? tk.owner : undefined, render: renderFacts }) : null));
             var stageTone = TONES[STAGE_TONE[tk.stage] || 'gray'];
             var isHover = hoverTicket === tk.id;
             return h('div', {
               key: tk.id,
-              ref: isTarget ? targetCard : undefined,
+              ref: isTarget ? (inWorkspace ? workspaceCard : targetCard) : undefined,
               tabIndex: isTarget ? -1 : undefined,
               className: isTarget ? 'hb-scroll-target' : undefined,
               'data-hb-ticket': tk.id,
@@ -3099,7 +3299,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               onMouseEnter: function () { setHoverTicket(tk.id); },
               onMouseLeave: function () { setHoverTicket(null); },
               style: {
-              padding: '10px 12px', borderRadius: '8px', marginBottom: '8px',
+              padding: '10px 12px', borderRadius: '8px', marginBottom: '8px', overflowWrap: inWorkspace ? 'anywhere' : undefined,
               border: '1px solid var(--dsh-border, rgba(127,127,127,0.2))',
               borderLeft: '3px solid ' + stageTone.border,
               background: 'var(--dsh-surface-raised, rgba(127,127,127,0.04))',
@@ -3108,6 +3308,97 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             } }, rows);
           };
 
+          function renderOwnerWorkspace() {
+            var value = workspace.value;
+            var sortedOwners = [...owners].sort((a, b) => ownerFilterLabel(a.id).localeCompare(ownerFilterLabel(b.id)));
+            var header = h('div', { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '8px 12px', marginBottom: '12px' } },
+              h('h2', { id: ownerWorkspacePage, tabIndex: -1, className: 'hb-scroll-target', ref: workspaceHeading,
+                style: { flex: '1 1 160px', fontSize: '17px', fontWeight: 600, margin: 0 } }, t('ownerWorkspace')),
+              h('select', { value: workspaceOwnerId, 'aria-label': t('ownerWorkspaceChoose'),
+                style: { ...settingsButtonStyle, minWidth: 0, maxWidth: '100%' }, onChange: event => selectWorkspace(event.target.value) },
+                h('option', { value: '' }, t('ownerWorkspaceChoose')),
+                workspaceOwnerId && !sortedOwners.some(owner => owner.id === workspaceOwnerId)
+                  ? h('option', { value: workspaceOwnerId }, workspaceOwnerId) : null,
+                sortedOwners.map(owner => h('option', { key: owner.id, value: owner.id }, ownerFilterLabel(owner.id)))),
+              workspaceOwnerId && generation ? h('button', { type: 'button', style: settingsButtonStyle, disabled: workspace.loading,
+                onClick: () => void workspace.refresh() }, t('refreshBtn')) : null);
+            if (!workspaceOwnerId) return h('div', null, header, h('p', { style: settingsHintStyle }, t(owners.length ? 'ownerWorkspaceChoose' : 'emptyOwners')));
+            if (!generation) return h('div', null, header, h('p', { role: 'status' }, t('monitorDisconnected')));
+            var readError = workspace.error ? h('div', null,
+              h('p', { role: 'alert', style: { overflowWrap: 'anywhere' } },
+                t(value ? 'monitorReadFailed' : 'ownerWorkspaceUnavailable') + ' · ' + workspace.error),
+              h('button', { type: 'button', style: settingsButtonStyle, disabled: workspace.loading, onClick: () => void workspace.refresh() }, t('retry'))) : null;
+            if (!value && readError) return h('div', null, header, readError);
+            if (!value) return h('div', null, header, h('p', { role: 'status', style: settingsHintStyle }, t('ownerWorkspaceLoading')));
+
+            var owner = value.owner;
+            var scope = 'owner:' + owner.id;
+            var targetId = workspaceTarget?.ownerId === owner.id ? workspaceTarget.ticketId : null;
+            var priorArchives = (value.archiveFailures ?? []).filter(operation => operation.ownerId === owner.id
+              && operation.status === 'archive-failed' && operation.operationId !== value.switchOperation?.operationId);
+            var currentSession = owner.recycled ? null : owner.sessionId;
+            var sessionError = ownerSessionError?.ownerId === owner.id && ownerSessionError.sessionId === owner.sessionId ? ownerSessionError.message : null;
+            var role = owner.role === 'chief' ? 'roleChief' : owner.kind === 'scratch' ? 'kindTemp' : 'roleOwner';
+            var sessionKey = 'sid:' + owner.id;
+            var directory = owner.cwd && owner.cwd !== owner.workspace ? owner.cwd : null;
+            var actions = { display: 'flex', gap: '6px 8px', flexWrap: 'wrap', alignItems: 'center', minWidth: 0 };
+            var needs = value.tickets.filter(ticket => NEEDS_ME.includes(ticket.stage));
+            var isTerminal = ticket => ['done', 'canceled'].includes(ticket.stage);
+            var progress = value.tickets.filter(ticket => !NEEDS_ME.includes(ticket.stage) && !isTerminal(ticket));
+            var outcomes = value.tickets.filter(ticket => ticket.report || isTerminal(ticket))
+              .sort((a, b) => String(b.report?.at ?? b.updatedAt ?? '').localeCompare(String(a.report?.at ?? a.updatedAt ?? '')));
+            function openTask(ticketId) {
+              if (!workspace.isCurrent()) return;
+              setOpenTicketDetails(current => ({ ...current, [scope + ':' + ticketId]: true }));
+              setWorkspaceTarget({ ownerId: owner.id, ticketId });
+            }
+            var openWorker = canOpenOwnerSession ? async sessionId => {
+              if (workspace.isCurrent()) await openSessionById(sessionId);
+            } : undefined;
+            function renderTicket(ticket) { return ticketRowItem(ticket, scope, ticket.id === targetId); }
+            function renderOutcome(ticket) {
+              if (isTerminal(ticket)) return renderTicket(ticket);
+              return h('div', { key: ticket.id, style: { paddingBlock: '6px' } },
+                h('button', { type: 'button', className: 'hb-text-action', style: { whiteSpace: 'normal', overflowWrap: 'anywhere' },
+                  onClick: () => openTask(ticket.id) }, ticket.report?.summary || ticket.message || ticket.id));
+            }
+            function ticketSection(id, label, rows, empty, render = renderTicket) {
+              return h('section', { 'aria-labelledby': id, style: sectionStyle },
+                h('h3', { id, style: sectionTitleStyle }, t(label)),
+                rows.length ? rows.map(render) : h('p', { style: settingsHintStyle }, t(empty)));
+            }
+            return h('div', { 'data-hb-owner-workspace': owner.id }, header, readError,
+              h(React.Fragment, { key: owner.id },
+                h('section', { 'aria-labelledby': 'hub-bot-workspace-owner', style: { ...sectionStyle, padding: '12px 14px', minWidth: 0,
+                  border: '1px solid var(--dsw-alias-border-l2)', borderRadius: '10px', overflowWrap: 'anywhere' } },
+                  h('div', { style: actions },
+                    h('h3', { id: 'hub-bot-workspace-owner', style: { margin: 0, fontSize: '15px', fontWeight: 600 } }, owner.workspace || owner.id),
+                    h('span', { style: settingsHintStyle }, t(role))),
+                  directory ? h('p', { style: { ...settingsHintStyle, margin: '4px 0' } }, directory) : null,
+                  h('div', { style: { ...actions, margin: '8px 0', paddingBlock: '8px', borderBlock: '1px solid var(--dsw-alias-border-l2)' } },
+                    h('div', { style: { flex: '1 1 160px', minWidth: 0 } },
+                      h('div', { style: settingsHintStyle }, t('ownerWorkspaceCurrent')),
+                      h('div', { style: { fontSize: '12px' } }, currentSession || t(owner.recycled ? 'ownerRecycled' : 'sessionNone'))),
+                    currentSession && canOpenOwnerSession ? h('button', { type: 'button', style: settingsButtonStyle,
+                      onClick: () => void openOwnerSession(owner, true) }, t('openSessionButton')) : null,
+                    currentSession ? h('button', { type: 'button', style: settingsButtonStyle,
+                      onClick: () => copyText(currentSession, sessionKey) }, t(copiedId === sessionKey ? 'copiedBtn' : 'copySessionButton')) : null),
+                  sessionError ? h('p', { role: 'alert', style: settingsHintStyle }, t('openSessionFailed') + ' · ' + sessionError) : null,
+                  h(OwnerSwitchControls, { key: owner.sessionId, owner, t, operation: value.switchOperation, showSessions: true, disabled: Boolean(workspace.error), onRefresh: refreshWorkspace,
+                    onOperationSession: canOpenOwnerSession ? (id, binding) => openOperationSession(owner.id, id, binding, true) : null })),
+                priorArchives.length ? h('section', { 'aria-labelledby': 'hub-bot-workspace-archive-failures', style: sectionStyle },
+                  h('h3', { id: 'hub-bot-workspace-archive-failures', style: sectionTitleStyle }, t('switchEarlierArchives')),
+                  ...priorArchives.map(operation => h(OwnerSwitchControls, { key: operation.operationId, owner, t, operation,
+                    historyOnly: true, showSessions: true, disabled: Boolean(workspace.error), onRefresh: refreshWorkspace,
+                    onOperationSession: canOpenOwnerSession ? (id, binding) => openOperationSession(owner.id, id, binding, true) : null }))) : null,
+                ticketStatus(scope),
+                targetId && !value.tickets.some(ticket => ticket.id === targetId) ? h('p', { ref: workspaceTicketError, tabIndex: -1, role: 'alert' }, t('ownerWorkspaceNoTicket')) : null,
+                ticketSection('hub-bot-owner-needs-title', 'needsMe', needs, 'quiet'),
+                ticketSection('hub-bot-owner-progress-title', 'ownerWorkspaceProgress', progress, 'ownerWorkspaceNoProgress'),
+                ticketSection('hub-bot-owner-results-title', 'outcomesSection', outcomes, 'noResults', renderOutcome),
+                h(TimerSection, { headingId: 'hub-bot-owner-timers-title', timers: value.timers, onTask: openTask, onWorker: openWorker, onRefresh: refreshWorkspace, disabled: Boolean(workspace.error) }),
+                h(RunHistory, { active: true, workspace: value, refreshWorkspace: workspace.refresh, onTask: openTask, onWorker: openWorker })));
+          }
           return h('div', { ref: boardRef, style: { padding: '0 24px 20px', overflowY: 'auto', height: '100%', boxSizing: 'border-box',
             scrollPaddingBlockStart: 'calc(var(--hb-nav-height, 48px) + ' + boardScrollGap + 'px)' },
           },
@@ -3183,7 +3474,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               onMessages: recent.some(row => row.unprocessed) ? () => {
                 setRecentKind(''); setRecentDroppedOnly(false); setRecentUnprocOnly(true); scrollToSection('hub-bot-recent-title');
               } : null,
-              refresh: () => scoped.remote.hubBotSettings.overview().then(unwrap).then(publishOverview),
+              refresh: refreshOverview,
             }),
              h('section', { id: 'hub-bot-needs', 'aria-labelledby': 'hub-bot-needs-title', style: Object.assign({}, sectionStyle, needs.length > 0 ? { borderLeft: '3px solid ' + TONES.amber.border, paddingLeft: '14px' } : {}) },
                h('div', { style: Object.assign({}, sectionTitleStyle, { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }) },
@@ -3348,10 +3639,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 ? h('p', { style: settingsHintStyle }, t('emptyOwners'))
                 : h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 315px), 1fr))', gap: '12px', maxWidth: '1080px' } },
                      owners.map(renderOwnerCard)))),
-             h('div', { hidden: panelPage !== 'hub-bot-timers-title' }, renderTimers()),
-             h('div', { hidden: panelPage !== 'hub-bot-runs-title' },
-               h(RunHistory, { active: panelPage === 'hub-bot-runs-title', onTask: ticketId => openStream({ ticketId }),
-                 onWorker: canOpenOwnerSession ? async sessionId => await scoped.get('uiWorkspace').openSession(sessionId) : undefined })),
+              panelPage === ownerWorkspacePage ? renderOwnerWorkspace() : null,
+              h('div', { hidden: panelPage !== 'hub-bot-timers-title' },
+                h(TimerSection, { timers: overview.timers, ownerNames, onRefresh: refreshOverview,
+                  onTask: ticketId => openStream({ ticketId }), onWorker: canOpenOwnerSession ? openSessionById : undefined })),
+              h('div', { hidden: panelPage !== 'hub-bot-runs-title' },
+                h(RunHistory, { active: panelPage === 'hub-bot-runs-title', onTask: ticketId => openStream({ ticketId }),
+                  onWorker: canOpenOwnerSession ? openSessionById : undefined })),
              h('div', { hidden: panelPage !== 'hub-bot-connections' },
                sectionDivider(t('connectionsSection'), 'hub-bot-connections'),
                h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 350px), 1fr))',
@@ -3388,7 +3682,21 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           });
         }, 'hub-bot: main panel');
 
-        if (typeof window !== 'undefined' && new URL(window.location.href).searchParams.has('hubBotOwner')) {
+        if (linkedWorkspaceOwner()) {
+          scoped.inject(['layout'], function (linkScope) {
+            linkScope.effect(function () {
+              var opened = false;
+              function selectLinkedWorkspace() {
+                if (opened || !linkedWorkspaceOwner() || !linkScope.slots.entries('main').some(entry => entry.options.key === 'hub-bot')) return;
+                opened = true;
+                linkScope.layout.selectPanel('hub-bot');
+              }
+              var unsubscribe = linkScope.slots.subscribe('main', selectLinkedWorkspace);
+              selectLinkedWorkspace();
+              return unsubscribe;
+            }, 'hub-bot: owner workspace link');
+          });
+        } else if (new URL(window.location.href).searchParams.has('hubBotOwner')) {
           scoped.inject(['uiWorkspace'], function (linkScope) {
             linkScope.effect(function () {
               var current = true;
@@ -3406,10 +3714,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                   var sessionId;
                   if (operationId) {
                     var operation = unwrap(await linkScope.remote.hubBotSettings.ownerSwitchAction({ action: 'status', ownerId, operationId }));
-                    sessionId = operation?.committedAt ? operation.oldSessionId : null;
+                    sessionId = operation?.ownerId === ownerId && operation.operationId === operationId && operation.committedAt ? operation.oldSessionId : null;
                   } else {
                     var owners = unwrap(await linkScope.remote.hubBotSettings.listOwners());
-                    sessionId = owners.find(row => row.id === ownerId)?.sessionId;
+                    sessionId = owners.find(row => row.id === ownerId && !row.recycled)?.sessionId;
                   }
                   if (!current || generations.getSnapshot()?.id !== generationId) return;
                   url = new URL(window.location.href);

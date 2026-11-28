@@ -11,6 +11,7 @@
   <h1>hub-bot</h1>
   <nav id="navigation" class="tabs" aria-label="Hub Bot 导航" hidden>
     <a class="tab" href="#board" data-page="board">总览</a>
+    <a class="tab" href="#owner-workspace" data-page="owner-workspace">负责人</a>
     <a class="tab" href="#timers-page" data-page="timers-page">提醒</a>
     <a class="tab" href="#run-history" data-page="run-history">运行记录</a>
     <a class="tab" href="#connections" data-page="connections">连接</a>
@@ -75,6 +76,51 @@
           <div id="intake" class="cards"></div>
         </section>
       </aside>
+    </div>
+  </section>
+
+  <section id="owner-workspace" class="page" aria-labelledby="workspace-title" hidden>
+    <div class="workspace-toolbar">
+      <h2 id="workspace-title" class="page-title">负责人工作区</h2>
+      <label for="workspace-select">负责人</label>
+      <select id="workspace-select"></select>
+    </div>
+    <div id="workspace-status" class="load-state"></div>
+    <div id="workspace-content" hidden>
+      <section class="overview-card workspace-session" aria-labelledby="workspace-session-title">
+        <h3 id="workspace-session-title" class="q">负责人会话</h3>
+        <div id="workspace-session"></div>
+      </section>
+      <div class="overview-layout">
+        <div id="workspace-work" class="overview-work">
+          <section class="overview-card" aria-labelledby="workspace-needs-title">
+            <h3 id="workspace-needs-title" class="q">需要您处理</h3>
+            <div id="workspace-needs" class="cards"></div>
+          </section>
+          <section class="overview-card" aria-labelledby="workspace-progress-title">
+            <h3 id="workspace-progress-title" class="q">工作进展</h3>
+            <div id="workspace-progress" class="groups"></div>
+          </section>
+          <section class="overview-card" aria-labelledby="workspace-results-title">
+            <h3 id="workspace-results-title" class="q">结果</h3>
+            <div id="workspace-results" class="cards"></div>
+          </section>
+          <details id="workspace-ticket-history" class="overview-card">
+            <summary>任务历史</summary>
+            <div id="workspace-history-tickets" class="groups"></div>
+          </details>
+        </div>
+        <aside class="overview-side">
+          <section class="overview-card" aria-labelledby="workspace-timers-title">
+            <h3 id="workspace-timers-title" class="q">提醒</h3>
+            <div id="workspace-timers" class="cards"></div>
+          </section>
+          <section class="overview-card" aria-labelledby="workspace-runs-title">
+            <h3 id="workspace-runs-title" class="q">后台运行记录</h3>
+            <div id="workspace-runs" class="cards" aria-live="polite"></div>
+          </section>
+        </aside>
+      </div>
     </div>
   </section>
 
