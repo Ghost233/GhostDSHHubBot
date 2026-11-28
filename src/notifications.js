@@ -21,6 +21,12 @@ function canonicalDestination(address) {
   throw new TypeError('A Feishu chat or GitHub item destination is required.')
 }
 
+function createSource({ ticketId, triggerId, to: address, body }) {
+  const to = canonicalDestination(address)
+  if (typeof body !== 'string' || !body.trim()) throw new TypeError('A notification body is required.')
+  return { id: 'out-' + randomUUID(), ticketId, triggerId, to, body, requestId: 'hub-bot-run-notice-' + randomUUID() }
+}
+
 function indexSources(sources) {
   const tickets = new Map()
   for (const source of sources) {
@@ -37,9 +43,9 @@ function fits(text) {
   return Buffer.byteLength(text) <= MAX_NOTIFICATION_BYTES && wordCount(text) <= REPLY_WORD_LIMIT
 }
 
-function formatBody(id, tickets) {
+function formatBody(id, tickets, label) {
   const lines = tickets.map(({ ticketId, latest }) => latest.body.includes(ticketId) ? latest.body : ticketId + ' · ' + latest.body)
-  const heading = '后台任务结果（' + tickets.length + ' 项）'
+  const heading = label + '（' + tickets.length + ' 项）'
   const reference = '在 Hub Bot 运行记录中按通知编号 ' + id + ' 查看完整任务索引与详情。'
   const resultLines = tickets[0].latest.id === id ? lines : [heading, ...lines.map(line => '- ' + line)]
   const summary = [...resultLines, reference].join('\n')
@@ -55,7 +61,7 @@ function formatBody(id, tickets) {
   return preview + '\n' + reference
 }
 
-/** Durable admission and aggregation for ordinary background results. */
+/** Durable background-result notifications and ordinary result throttling. */
 export class NotificationThrottle {
   #store
   #runs
@@ -70,20 +76,29 @@ export class NotificationThrottle {
   }
 
   /** Store one ordinary source and link its run in the same transaction. */
-  record({ ticketId, triggerId, to: address, body }) {
-    const to = canonicalDestination(address)
-    if (typeof body !== 'string' || !body.trim()) throw new TypeError('A notification body is required.')
+  record(input) {
+    const source = createSource(input)
+    const { to } = source
     return this.#write(() => {
       const now = this.#now()
       const blocked = this.#reservedDestinations(now, to).has(to)
       const waiting = blocked ? [] : this.#held(to)
       // Publish already-due work before admitting a result for the next window.
       if (waiting.length) this.#publishWaiting(to, waiting, now)
-      const source = { id: 'out-' + randomUUID(), ticketId, triggerId, to, body, requestId: 'hub-bot-run-notice-' + randomUUID() }
       const row = blocked || waiting.length
         ? insertOutbox(this.#store, { ...source, kind: 'notification-source', state: 'held' }, () => now)
-        : this.#publish(source, [source], now)
-      this.#runs.linkOutbox(ticketId, row.id)
+        : this.#publish({ ...source, notificationWindowMs: this.#window() }, [source], now)
+      this.#runs.linkOutbox(source.ticketId, row.id)
+      return row
+    })
+  }
+
+  /** Publish a bounded, indexed result for delivery without using ordinary capacity. */
+  recordImmediate(input) {
+    const source = createSource(input)
+    return this.#write(() => {
+      const row = this.#publish(source, [source], this.#now())
+      this.#runs.linkOutbox(source.ticketId, row.id)
       return row
     })
   }
@@ -131,16 +146,22 @@ export class NotificationThrottle {
     return new Set(rows.map(row => row.destination))
   }
 
-  #publish({ to, id = 'out-' + randomUUID(), requestId = 'hub-bot-run-notice-' + randomUUID() }, sources, now) {
-    const notificationWindowMs = this.#windowMs() ?? DEFAULT_NOTIFICATION_WINDOW_MS
-    if (!Number.isSafeInteger(notificationWindowMs) || notificationWindowMs <= 0) {
+  #window() {
+    const ms = this.#windowMs() ?? DEFAULT_NOTIFICATION_WINDOW_MS
+    if (!Number.isSafeInteger(ms) || ms <= 0) {
       throw new TypeError('The notification window must be a positive integer in milliseconds.')
     }
+    return ms
+  }
+
+  #publish({ to, id = 'out-' + randomUUID(), requestId = 'hub-bot-run-notice-' + randomUUID(), notificationWindowMs }, sources, now) {
     const tickets = indexSources(sources)
     const single = tickets.length === 1 ? tickets[0].latest : null
+    const label = notificationWindowMs === undefined ? '任务通知' : '后台任务结果'
     const row = insertOutbox(this.#store, {
       id, requestId, to, ticketId: single?.ticketId ?? null, triggerId: single?.triggerId ?? null,
-      body: formatBody(id, tickets), kind: 'reply', state: 'recorded', notificationWindowMs,
+      body: formatBody(id, tickets, label), kind: 'reply', state: 'recorded',
+      ...(notificationWindowMs !== undefined && { notificationWindowMs }),
     }, () => now)
     this.#store.set(DETAILS_KEY + id, { id, tickets: tickets.map(({ ticketId, runId, sourceOutboxIds }) => ({ ticketId, runId, sourceOutboxIds })) })
     return row
@@ -156,7 +177,7 @@ export class NotificationThrottle {
       return retry
     }
     const sources = waiting.filter(row => row.kind === 'notification-source')
-    const final = this.#publish({ to }, sources, now)
+    const final = this.#publish({ to, notificationWindowMs: this.#window() }, sources, now)
     for (const source of sources) {
       updateOutboxRow(this.#store, { ...source, state: 'aggregated', settledWith: final.id })
     }

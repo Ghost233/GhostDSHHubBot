@@ -136,6 +136,57 @@ test('aliases and owner changes share a fixed window while every source remains 
   assert.equal(f.run('tsk-other').notification.id, digest.id)
 })
 
+test('a long immediate GitHub result has a bounded lookup and leaves the ordinary deadline intact', async t => {
+  const f = fixture(t)
+  const to = 'github:fixture/project:7'
+  const first = f.result('tsk-first', { to })
+  assert.equal(first.state, 'recorded')
+  f.at(1_000)
+  const held = f.result('tsk-held', { to })
+  assert.equal(held.state, 'held')
+
+  const ticketId = 'tsk-github-comment'
+  const triggerId = 'github:fixture/project:comment:1234'
+  const run = f.runs.ensure({
+    ticketId, triggerRef: triggerId, ownerId: 'github-owner',
+    source: { kind: 'github', repo: 'fixture/project', issueNumber: 7, event: 'comment', commentId: 1234 },
+  })
+  f.runs.recordResult(ticketId, { kind: 'result', reportId: 'report-comment' })
+  const urgent = f.notifications.recordImmediate({ ticketId, triggerId, to, body: '改'.repeat(180) })
+  assert.equal(urgent.state, 'recorded')
+  assert.equal(Object.hasOwn(urgent, 'notificationWindowMs'), false)
+  assert.equal(f.runs.get(run.id).status, 'waiting')
+  await f.deliver({ channel: 'github', send: (_to, _body, row) => {
+    if (row.id === urgent.id) f.at(20_000)
+  } })
+  assert.deepEqual(f.sent.map(({ id }) => id), [first.id, urgent.id])
+  const { body } = f.sent[1]
+  assert.ok(body.includes(ticketId))
+  assert.ok(Buffer.byteLength(body) <= 4_096)
+  assert.ok(wordCount(body) <= 100)
+  const emittedId = /通知编号 (out-[a-f0-9-]+) 查看完整任务索引与详情。$/u.exec(body)?.[1]
+  assert.equal(emittedId, urgent.id)
+
+  f.reopen()
+  assert.deepEqual(f.notifications.details(emittedId), {
+    id: urgent.id, tickets: [{ ticketId, runId: run.id, sourceOutboxIds: [urgent.id] }],
+  })
+  const history = f.runs.get(run.id)
+  assert.equal(history.result.reportId, 'report-comment')
+  assert.equal(history.notification.acceptedAt, '2026-11-28T12:00:20.000Z')
+  assert.equal(history.notification.id, emittedId)
+
+  f.at(60_999)
+  assert.deepEqual(f.notifications.flush(), [])
+  assert.equal(f.run('tsk-held').status, 'waiting')
+  f.at(61_000)
+  const [digest] = f.notifications.flush()
+  await f.deliver({ channel: 'github' })
+  assert.equal(f.sent.at(-1).id, digest.id)
+  assert.equal(f.run('tsk-held').notification.linkedId, held.id)
+  assert.equal(f.run('tsk-held').notification.acceptedAt, '2026-11-28T12:01:01.000Z')
+})
+
 test('overflow uses a bounded index with a durable exact entry for every task', async t => {
   const f = fixture(t)
   const first = f.result('tsk-first')

@@ -538,34 +538,39 @@ test('progress insert failure preserves the prepared or committed phase for rest
   assert.deepEqual(effects.map(([effect]) => effect), ['create', 'prompt', 'archive'])
 })
 
-test('a replacement archived during the final idle check never becomes current', async t => {
-  const { switchSvc: { book, registry }, ownerId, ports, hosts, effects } = fixture(t)
-  hosts.get(OLD_SESSION).state = 'idle'
-  const operation = book.request({ ownerId, expectedSessionId: OLD_SESSION })
-  const readingOld = latch()
-  const allowOldRead = latch()
-  const status = ports.status
-  ports.status = async request => {
-    const result = await status(request)
-    if (request.sessionId === OLD_SESSION && hosts.get(operation.newSessionId)?.prompts?.size) {
-      readingOld.open()
-      await allowOldRead.promise
-    }
-    return result
-  }
-  const switched = book.tick()
-  await readingOld.promise
-  hosts.get(operation.newSessionId).archived = true
-  allowOldRead.open()
-  await switched
+test('the replacement must still be available after the final old idle check', async t => {
+  for (const [availability, errorCode] of [['archived', 'new-session-archived'], ['missing', 'new-session-unavailable']]) {
+    await t.test(availability, async t => {
+      const { switchSvc: { book, registry }, ownerId, ports, hosts, effects } = fixture(t)
+      hosts.get(OLD_SESSION).state = 'idle'
+      const operation = book.request({ ownerId, expectedSessionId: OLD_SESSION })
+      const readingOld = latch()
+      const allowOldRead = latch()
+      const status = ports.status
+      ports.status = async request => {
+        const result = await status(request)
+        if (request.sessionId === OLD_SESSION && hosts.get(operation.newSessionId)?.prompts?.size) {
+          readingOld.open()
+          await allowOldRead.promise
+        }
+        return result
+      }
+      const switched = book.tick()
+      await readingOld.promise
+      if (availability === 'missing') hosts.delete(operation.newSessionId)
+      else hosts.get(operation.newSessionId).archived = true
+      allowOldRead.open()
+      await switched
 
-  const result = book.get({ ownerId, operationId: operation.operationId })
-  assert.equal(result.status, 'failed')
-  assert.equal(result.errorCode, 'new-session-archived')
-  assert.equal(registry.get(ownerId).sessionId, OLD_SESSION)
-  assert.equal(book.isHeld(ownerId), false)
-  await book.tick()
-  assert.deepEqual(effects.map(([effect]) => effect), ['create', 'prompt'])
+      const result = book.get({ ownerId, operationId: operation.operationId })
+      assert.equal(result.status, 'failed')
+      assert.equal(result.errorCode, errorCode)
+      assert.equal(registry.get(ownerId).sessionId, OLD_SESSION)
+      assert.equal(book.isHeld(ownerId), false)
+      await book.tick()
+      assert.deepEqual(effects.map(([effect]) => effect), ['create', 'prompt'])
+    })
+  }
 })
 
 test('accepted facts keep ordinary work held until the replacement finishes initializing', async t => {

@@ -11,6 +11,8 @@ import { Router } from '../src/router.js'
 import { GitHubSource, watermarkPath, DSH_BADGE } from '../src/github.js'
 import { resolveConfig } from '../src/config.js'
 import { discardOutboxRows } from '../src/outbox.js'
+import { NotificationThrottle } from '../src/notifications.js'
+import { wordCount } from '../src/discipline.js'
 
 const REPO = 'Ghost233/DSH-Workflow'
 const REPO_CFG = { repo: REPO, workspace: 'DSH-Workflow', cwd: '/Volumes/home/DSH-Workflow', enabled: true }
@@ -144,6 +146,26 @@ test('background GitHub checks leave silent, accepted and failed notification ev
     assert.equal(reopened.source.router.runs.get(error.id).notification.discarded, true)
     assert.deepEqual(reopened.source.router.runs.list({ status: 'silent' }).map(row => row.id), [quiet.id])
   } finally { reopened?.store.close(); f.cleanup() }
+})
+
+test('explicit GitHub comments get a bounded immediate result with an exact notification index', async () => {
+  const f = fixture()
+  try {
+    f.router.notifications = new NotificationThrottle({ store: f.store, runs: f.router.runs, now: () => Date.parse(f.source.now()) })
+    const item = await f.source.handleCommentEvent(comment({ body: '@hub-bot 检查状态' }), REPO_CFG)
+    const sessionId = f.router.getTicket(item.ticketId).workerSession.sessionId
+    await f.router.reportBackground({ ticketId: item.ticketId, sessionId, summary: '确'.repeat(180) })
+    const record = f.router.runs.get('run-' + item.ticketId)
+    const row = f.outbox().find(item => item.id === record.notification.id)
+    assert.equal(row.state, 'recorded')
+    assert.equal(row.notificationWindowMs, undefined)
+    assert.ok(wordCount(row.body) <= 100)
+    assert.ok(row.body.includes(row.id))
+    assert.deepEqual(f.router.notifications.details(row.id).tickets.map(ticket => ticket.ticketId), [item.ticketId])
+    await f.source.deliverReplies()
+    assert.equal(f.posts.length, 1)
+    assert.equal(f.router.runs.get('run-' + item.ticketId).status, 'sent')
+  } finally { f.cleanup() }
 })
 
 test('a GitHub worker question creates an immediate audited notice at its original item', async () => {

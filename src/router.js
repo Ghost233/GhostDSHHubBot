@@ -1539,12 +1539,13 @@ export class Router {
       this.runs.recordNotNotified(ticket.id, 'local-panel')
       return
     }
-    if (ordinary && this.notifications) {
-      this.notifications.record({ ticketId: ticket.id, triggerId, to, body })
+    if (this.notifications) {
+      const record = ordinary ? 'record' : 'recordImmediate'
+      this.notifications[record]({ ticketId: ticket.id, triggerId, to, body })
       return
     }
     const row = insertOutbox(this.store, {
-      ticketId: ticket.id, triggerId, kind: 'reply', state: 'recorded', to, body,
+      ticketId: ticket.id, triggerId, kind: 'reply', state: 'recorded', to, body: truncateWords(body).text,
       requestId: 'hub-bot-run-notice-' + this.ids.uuid(),
     }, () => Date.parse(this.now()))
     this.runs.linkOutbox(ticket.id, row.id)

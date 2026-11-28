@@ -159,7 +159,7 @@ async function resolveTicket(ticket, resolution, message) {
   try {
     const result = await api('tickets/resolve', { method: 'POST',
       body: { ticketId: ticket.id, resolution, message, ...(['confirm', 'reject', 'answer'].includes(resolution) && { requestId: ticket.deferred?.requestId }) } })
-    const labels = { confirm: '已确认', reject: '已拒绝', answer: '答复已保存' }
+    const labels = { confirm: '已确认', reject: '已拒绝', answer: '答复已保存', retry: '已登记重试' }
     showNotice(result.stage === 'person/confirm' ? '请求仍在等待确认。' : labels[resolution])
     await refresh()
   } catch (error) {
@@ -178,7 +178,8 @@ function ticketActions(ticket) {
     } }, text('回复')))
   }
   if (['blocked', 'failed'].includes(ticket.stage)) {
-    return el('button', { class: 'btn', type: 'button', onclick: () => void resolveTicket(ticket, 'retry') }, text('重试任务'))
+    return el('span', { class: 'row-actions' }, el('button', { class: 'btn', type: 'button',
+      onclick: () => void resolveTicket(ticket, 'retry') }, text('重试任务')))
   }
   if (ticket.stage !== 'person/confirm') return null
   const wrap = el('span', { class: 'row-actions' })

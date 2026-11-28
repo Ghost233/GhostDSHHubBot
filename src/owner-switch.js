@@ -303,20 +303,19 @@ export class OwnerSwitch {
       }
       phase = 'commit'
       await this.withAdmission(row.ownerId, async () => {
-        if (!this.#same(row)) return
-        this.#requireOldBinding(row)
+        const oldStatus = await this.#oldStatus(row)
+        if (oldStatus === undefined) return
         this.#requireFreshSession(row.newSessionId)
+        // Sample the replacement last so its readiness is checked immediately before binding.
         const replacementStatus = await this.sessions.status({ sessionId: row.newSessionId })
         if (!this.#same(row)) return
         if (replacementStatus !== 'idle' && replacementStatus !== 'busy') {
           throw new OwnerSwitchError('new-session-unavailable', 'The initialized owner session is unavailable.')
         }
-        const oldIsIdle = replacementStatus === 'idle' && await this.#oldStatus(row) === 'idle'
-        if (!this.#same(row)) return
         if (this.sessions.isArchived?.(row.newSessionId)) {
           throw new OwnerSwitchError('new-session-archived', 'The initialized owner session is archived.')
         }
-        if (!oldIsIdle) return
+        if (oldStatus !== 'idle' || replacementStatus !== 'idle') return
         this.#transition(row, { status: 'committed', committedAt: this.now() }, () => {
           this.#requireOldBinding(row)
           this.#requireFreshSession(row.newSessionId)
