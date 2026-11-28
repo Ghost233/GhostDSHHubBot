@@ -240,6 +240,7 @@ test('authenticated handoff summary previews the exact source and carries only t
   const token = 'fixture-handoff-token'
   const oldSession = 'fixture-old-summary-owner'
   const feishuId = 'om_summary_real_source_fixture'
+  const companionId = 'om_summary_batch_companion_fixture'
   const creations = [], pages = [], prompts = []
   let handle
   root.provide('sessionController', {
@@ -277,7 +278,7 @@ test('authenticated handoff summary previews the exact source and carries only t
   await setImmediate()
   const hub = root.reflect.get('hubBot', false)
   const settings = root.reflect.get('hubBotSettings', false)
-  const owner = hub.registry.create({ kind: 'dir', cwd: homeRepo })
+  const owner = hub.registry.get('chief')
   hub.registry.bindSession(owner.id, oldSession)
   const source = { ownerId: owner.id, expectedSessionId: oldSession }
   async function request(path, body, authenticated = true) {
@@ -292,11 +293,20 @@ test('authenticated handoff summary previews the exact source and carries only t
   assert.equal((await request('owners/handoff-summary', generate, false)).status, 401)
   assert.equal((await request('owners/handoff-summary', { ...generate, expectedSessionId: 'other-fixture' })).status, 400)
   assert.equal(pages.length, 0)
-  assert.equal((await request('feishu/simulate', {
-    sender: { sender_type: 'user', sender_id: { open_id: 'ou_fixture' } },
-    message: { message_id: feishuId, chat_id: 'oc_fixture', chat_type: 'p2p', message_type: 'text',
-      content: JSON.stringify({ text: '用户的飞书原始讨论' }) },
-  })).status, 200)
+  async function receive(messageId, text) {
+    return request('feishu/simulate', {
+      sender: { sender_type: 'user', sender_id: { open_id: 'ou_fixture' } },
+      message: { message_id: messageId, chat_id: 'oc_fixture', chat_type: 'p2p', message_type: 'text', content: JSON.stringify({ text }) },
+    })
+  }
+  assert.equal((await receive(feishuId, '用户的飞书原始讨论')).status, 200)
+  assert.equal((await receive(companionId, '同一合并批次的后续原文')).status, 200)
+  assert.equal((await request('deliver', {})).status, 200)
+  assert.equal(prompts.find(row => row.requestId === 'hub-bot-feishu-' + feishuId)?.sessionId, oldSession)
+  const unrelated = hub.registry.create({ kind: 'dir', cwd: homeRepo })
+  hub.registry.bindSession(unrelated.id, 'unrelated-summary-session')
+  const unrelatedDraft = await settings.handoffSummaryAction({ action: 'generate', ownerId: unrelated.id, expectedSessionId: 'unrelated-summary-session' })
+  assert.doesNotMatch(unrelatedDraft.text, /用户的飞书原始讨论|同一合并批次的后续原文/)
   const draft = (await request('owners/handoff-summary', generate)).value
   assert.equal(draft.status, 'draft')
   assert.equal(draft.sourceSessionId, oldSession)
@@ -304,8 +314,9 @@ test('authenticated handoff summary previews the exact source and carries only t
   assert.match(draft.text, /#33.*选择验收范围/)
   assert.match(draft.text, /#35.*此前讨论了两个方案/)
   assert.match(draft.text, /#36.*用户的飞书原始讨论/)
+  assert.match(draft.text, /#36.*同一合并批次的后续原文/)
   assert.doesNotMatch(draft.text, /系统文本|工具参数|内部技能文本|切换初始化事实|重启恢复提示|飞书路由包装/)
-  assert.deepEqual(pages, [{ address: { kind: 'session', sessionId: oldSession }, maxMessages: 16 }])
+  assert.deepEqual(pages, ['unrelated-summary-session', oldSession].map(sessionId => ({ address: { kind: 'session', sessionId }, maxMessages: 16 })))
   const reference = value => ({ draftId: value.draftId, revision: value.revision })
   const replace = { action: 'request', mode: 'wait', ...source }
   assert.equal((await request('owners/switch', { ...replace, summary: reference(draft) })).status, 400)
@@ -322,7 +333,7 @@ test('authenticated handoff summary previews the exact source and carries only t
   assert.ok(bootstrap.content[0].text.includes(text))
   assert.doesNotMatch(bootstrap.content[0].text, /此前讨论了两个方案/)
   assert.equal(hub.registry.get(owner.id).sessionId, bootstrap.sessionId)
-  assert.equal(pages.length, 1)
+  assert.equal(pages.length, 2)
 })
 
 test('Feishu private-chat summary is idempotent, editable and usable only by its originating actor', async t => {

@@ -323,22 +323,29 @@ export function apply(ctx, rawConfig) {
         const source = message?.source
         if (fromUser && source?.kind !== 'user') continue
         const parts = Array.isArray(message?.content) ? message.content : []
-        let text
+        let discussion
         if (fromUser && typeof source.rpcId === 'string' && source.rpcId.startsWith('hub-bot-')) {
-          if (!source.rpcId.startsWith('hub-bot-feishu-') || source.rpcId.startsWith('hub-bot-feishu-unsupported-')) continue
-          const trigger = hub.router.getTrigger(source.rpcId.slice('hub-bot-'.length))
-          if (trigger?.kind !== 'feishu' || !trigger.authorization || trigger.dropped || (trigger.ownerId && trigger.ownerId !== 'chief')) continue
-          text = typeof trigger.message === 'string' ? trigger.message.slice(0, 960) : ''
+          if (!source.rpcId.startsWith('hub-bot-feishu-')) continue
+          const head = hub.router.getTrigger(source.rpcId.slice('hub-bot-'.length))
+          if (head?.kind !== 'feishu' || !head.authorization || head.dropped || head.injectedSessionId !== sessionId) continue
+          const cohort = head.intakeCohort
+          const matched = cohort?.requestId === source.rpcId && Array.isArray(cohort.triggerIds)
+          const members = matched ? cohort.triggerIds.slice(-8).map(id => hub.router.getTrigger(id)) : [head]
+          discussion = members.filter(member => member?.kind === 'feishu' && member.authorization && !member.dropped
+            && member.injectedSessionId === sessionId && member.source?.chatId === head.source?.chatId
+            && typeof member.message === 'string').map(member => member.message.slice(0, 960))
         } else {
-          text = parts.filter(part => part?.type === 'text' && typeof part.text === 'string')
-            .slice(0, 3).map(part => part.text.slice(0, 320)).join(' ')
+          discussion = [parts.filter(part => part?.type === 'text' && typeof part.text === 'string')
+            .slice(0, 3).map(part => part.text.slice(0, 320)).join(' ')]
         }
-        text = text.replace(/\s+/gu, ' ').trim()
-        if (!text) continue
-        const role = event.type === 'user/message' ? '用户' : '助手'
+        const role = fromUser ? '用户' : '助手'
         const seq = Number.isSafeInteger(event.seq) && event.seq >= 0 ? '#' + event.seq + ' ' : ''
-        const excerpt = Array.from(text).slice(0, 200).join('')
-        excerpts.push(seq + role + '：' + excerpt + (excerpt === text ? '' : '…'))
+        for (const original of discussion) {
+          const text = original.replace(/\s+/gu, ' ').trim()
+          if (!text) continue
+          const excerpt = Array.from(text).slice(0, 200).join('')
+          excerpts.push(seq + role + '：' + excerpt + (excerpt === text ? '' : '…'))
+        }
       }
       const selected = excerpts.slice(-8)
       while (selected.length && Buffer.byteLength(selected.join('\n')) > maxBytes) selected.shift()

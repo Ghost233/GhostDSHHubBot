@@ -723,12 +723,12 @@ export class Router {
     const text = sources.map(feishuPrompt).join('\n\n')
     const result = await this.#promptOwner('chief', null, row.requestId, text, { model: this.config.chief?.model })
     if (result?.postponeMs) return result
-    if (this.store.closed) return
+    if (this.store.closed || !result?.sessionId) return
     this.#persistWork(() => {
       const at = this.now()
       for (const { id } of sources) {
         const latest = this.getTrigger(id)
-        if (latest && !latest.injectedAt) this.#updateTrigger({ ...latest, injectedAt: at })
+        if (latest && !latest.injectedAt) this.#updateTrigger({ ...latest, injectedAt: at, injectedSessionId: result.sessionId })
       }
     })
   }
