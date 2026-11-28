@@ -11,12 +11,16 @@ import { join } from 'node:path'
 import { Store } from '../src/store.js'
 import { insertOutbox } from '../src/outbox.js'
 import { OwnerRegistry } from '../src/registry.js'
+import { OwnerSwitch } from '../src/owner-switch.js'
+import { buildOwnerFacts, formatOwnerFacts } from '../src/owner-facts.js'
+import { TimerService } from '../src/timers.js'
 import { Router } from '../src/router.js'
 import { resolveConfig } from '../src/config.js'
 import {
   SETTINGS_FILE, SettingsError,
   applySettingsPatch, applySettingsOverlay, loadSettingsOverlay, saveSettingsOverlay, mergeSettingsOverlay,
   buildSettingsView, buildOverview, buildOutboxHealth, readMessageDetail, readTicketDetail, buildIntakePolicy,
+  readOwnerWorkspace,
 } from '../src/panel.js'
 
 /** A fully resolved config with feishu/github sections on — the shape the panel mutates. */
@@ -41,7 +45,11 @@ function fixture() {
     prompt: async () => ({ accepted: true }),
   }
   const router = new Router({ store, registry, sessions, now: () => new Date(nowMs).toISOString() })
-  return { router, registry, store, cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }) } }
+  return {
+    router, registry, store,
+    advance: milliseconds => { nowMs += milliseconds },
+    cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }) },
+  }
 }
 
 test('settings patch applies whitelisted keys live and returns the storable overlay', () => {
@@ -280,6 +288,158 @@ test('large Overview history keeps report previews and opens one full result on 
   } finally {
     cleanup()
   }
+})
+
+test('S19: the owner workspace keeps tickets and result detail across owner sessions', async () => {
+  const { router, registry, store, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Results', cwd: '/repos/shared' })
+    const neighbor = registry.create({ kind: 'repo', workspace: 'Other', cwd: '/repos/shared' })
+    const workspace = ownerId => readOwnerWorkspace({
+      store, registry, ownerId, timers: [], runs: { runs: [], nextOffset: null }, switchOperation: null,
+    })
+    const empty = workspace(owner.id)
+    assert.equal(empty.owner.sessionId, null)
+    assert.deepEqual(empty.tickets, [])
+    assert.deepEqual(empty.timers, [])
+    assert.deepEqual(empty.runs, [])
+    assert.equal(empty.nextRunOffset, null)
+    assert.equal(empty.switchOperation, null)
+    registry.bindSession(owner.id, 'session-results-old')
+    const result = await router.routeToOwner({ ownerId: owner.id, message: 'Prepare result' })
+    router.tasks.bindWorkerSession(result.ticketId, { sessionId: 'session-result-worker', cwd: '/repos/shared' })
+    const evidence = 'Retained verification log. '.repeat(20)
+    router.tasks.report({ ticketId: result.ticketId, summary: 'Ready for review', evidence })
+    const pending = await router.routeToOwner({ ownerId: owner.id, message: 'Pick a branch' })
+    router.tasks.ask({ ticketId: pending.ticketId, question: 'Which branch?' })
+    const other = await router.routeToOwner({ ownerId: neighbor.id, message: 'Unrelated work' })
+
+    const before = workspace(owner.id)
+    assert.equal(before.owner.sessionId, 'session-results-old')
+    assert.deepEqual(before.tickets.map(ticket => ticket.id), [pending.ticketId, result.ticketId])
+    assert.deepEqual(workspace(neighbor.id).tickets.map(ticket => ticket.id), [other.ticketId])
+
+    const binding = registry.bindSession(owner.id, 'session-results-new')
+    const started = await router.routeToOwner({ ownerId: owner.id, message: 'Continue work' })
+    const after = workspace(owner.id)
+    assert.deepEqual(after.owner, {
+      id: owner.id, role: 'owner', kind: 'repo', workspace: 'Results', cwd: '/repos/shared',
+      sessionId: 'session-results-new', status: 'created', transient: false, recycled: false,
+      createdAt: owner.createdAt, updatedAt: binding.updatedAt,
+    })
+    assert.deepEqual(after.tickets.map(ticket => ticket.id), [pending.ticketId, result.ticketId, started.ticketId])
+    assert.ok(after.tickets.every(ticket => ticket.owner === owner.id && ticket.ownerSessionId === 'session-results-new'))
+    assert.equal(after.tickets[0].question.text, 'Which branch?')
+    assert.equal(after.tickets[1].message, 'Prepare result')
+    assert.equal(after.tickets[1].trigger.kind, 'route')
+    assert.deepEqual(after.tickets[1].report, { summary: 'Ready for review', at: router.now() })
+    assert.equal(after.tickets[1].workerSession.sessionId, 'session-result-worker')
+
+    const detail = readTicketDetail({ store, registry, ticketId: result.ticketId, listDir: () => ['proof.txt'] })
+    assert.equal(detail.report.evidence, evidence)
+    assert.deepEqual(detail.dirListing, ['proof.txt'])
+    assert.equal(workspace('session-results-old'), null)
+  } finally {
+    cleanup()
+  }
+})
+
+test('S19: the workspace preserves active timers, run pages, and exact switch receipts', async t => {
+  const { router, registry, store, advance, cleanup } = fixture()
+  t.after(cleanup)
+  const owner = registry.create({ kind: 'repo', workspace: 'Operations', cwd: '/repos/operations' })
+  const other = registry.create({ kind: 'repo', workspace: 'Neighbor', cwd: '/repos/neighbor' })
+  const oldSessionId = 'session-operations-old'
+  const otherSessionId = 'session-neighbor'
+  registry.bindSession(owner.id, oldSessionId)
+  registry.bindSession(other.id, otherSessionId)
+
+  const timers = new TimerService({ store, now: router.now, getOwner: id => registry.get(id),
+    getTicket: id => router.getTicket(id), routeBackground: request => router.routeBackground(request) })
+  router.timerDeliveryState = (id, ref) => timers.deliveryState(id, ref)
+  const schedule = { frequency: 'daily', time: '08:01' }
+  const timer = timers.create({ ownerId: owner.id, createdBy: other.id, message: 'Check this workspace', schedule })
+  const otherTimer = timers.create({ ownerId: other.id, createdBy: owner.id, message: 'Check another workspace', schedule })
+  advance(60_000)
+  await timers.tick()
+  const timerRun = timers.get(timer.id).delivery
+  const otherRun = timers.get(otherTimer.id).delivery
+  assert.equal(timerRun.state, 'sent')
+  assert.equal(otherRun.state, 'sent')
+
+  advance(1000)
+  const source = { kind: 'github', repo: 'fixture/workspace', event: 'issue', issueNumber: 7 }
+  const result = await router.routeBackground({
+    ownerId: owner.id, source, triggerRef: 'github:fixture/workspace:issue:7', message: 'Produce a result',
+    authorization: { actor: 'fixture-user', source: 'github', at: router.now() },
+  })
+  const evidence = 'Recorded verification for issue 7'
+  await router.reportBackground({ ticketId: result.ticketId, sessionId: result.workerSession.sessionId,
+    summary: 'Result for issue 7', evidence })
+
+  const sessionStates = new Map([[oldSessionId, 'busy'], [otherSessionId, 'busy']])
+  const switches = new OwnerSwitch({
+    store, registry, now: router.now,
+    buildFacts: ({ ownerId }) => formatOwnerFacts(buildOwnerFacts({ store, ownerId })),
+    sessions: {
+      status: async ({ sessionId }) => sessionStates.get(sessionId) ?? 'missing',
+      create: async ({ sessionId }) => {
+        sessionStates.set(sessionId, 'idle')
+        return { sessionId, agentPreset: 'hub-bot-owner' }
+      },
+      prompt: router.sessions.prompt,
+      archive: async () => { throw new Error('Fixture archive failure') },
+    },
+  })
+  const requested = switches.request({ ownerId: owner.id, expectedSessionId: oldSessionId })
+  const foreign = switches.request({ ownerId: other.id, expectedSessionId: otherSessionId })
+  const workspace = () => readOwnerWorkspace({
+    store, registry, ownerId: owner.id, timers: timers.list({ ownerId: owner.id }),
+    runs: { runs: router.runs.list({ ownerId: owner.id, limit: 1 }), nextOffset: 1 },
+    switchOperation: switches.list({ ownerId: owner.id })[0],
+  })
+
+  await switches.tick()
+  const before = workspace()
+  assert.equal(before.owner.sessionId, oldSessionId)
+  assert.deepEqual(before.switchOperation, requested)
+  assert.equal(before.switchOperation.status, 'waiting')
+
+  sessionStates.set(oldSessionId, 'idle')
+  await switches.tick()
+  await switches.tick()
+  const after = workspace()
+  assert.equal(after.owner.id, before.owner.id)
+  assert.equal(after.owner.sessionId, requested.newSessionId)
+  assert.equal(after.switchOperation.operationId, requested.operationId)
+  assert.equal(after.switchOperation.oldSessionId, oldSessionId)
+  assert.equal(after.switchOperation.status, 'archive-failed')
+  assert.deepEqual(after.tickets.map(ticket => ticket.id), [result.ticketId, timerRun.ticketId])
+  assert.deepEqual(after.timers, before.timers)
+  assert.equal(after.timers[0].id, timer.id)
+  assert.equal(after.timers[0].delivery.workerSession.sessionId, timerRun.workerSession.sessionId)
+  assert.deepEqual(after.runs, before.runs)
+  assert.equal(after.nextRunOffset, 1)
+  const older = router.runs.list({ ownerId: owner.id, limit: 1, offset: after.nextRunOffset })
+  assert.deepEqual(older.map(run => run.id), ['run-' + timerRun.ticketId])
+
+  const [preview] = after.runs
+  assert.equal(preview.id, 'run-' + result.ticketId)
+  assert.equal(preview.status, 'waiting')
+  assert.equal(preview.notification.channelAccepted, false)
+  const runDetail = router.runs.get(preview.id)
+  assert.deepEqual(runDetail.notification, preview.notification)
+  assert.equal(runDetail.results[0].kind, 'result')
+  const ticket = readTicketDetail({ store, registry, ticketId: runDetail.ticketId, listDir: () => null })
+  assert.equal(ticket.report.evidence, evidence)
+
+  const mixed = readOwnerWorkspace({
+    store, registry, ownerId: owner.id, timers: timers.list(),
+    runs: { runs: router.runs.list(), nextOffset: null }, switchOperation: foreign,
+  })
+  assert.deepEqual(mixed.timers.map(row => row.id), [timer.id])
+  assert.deepEqual(mixed.runs.map(row => row.id), [preview.id, older[0].id])
+  assert.equal(mixed.switchOperation, null)
 })
 
 test('overview lists artifacts for working tickets too (round 45)', async () => {

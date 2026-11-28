@@ -162,6 +162,16 @@ export class HubBotSettingsService extends TypertRemoteService {
     return detail
   }
 
+  async ownerWorkspace(request) {
+    try {
+      return await this.deps.ownerWorkspace(request)
+    } catch (error) {
+      if (error?.status === 400) throw new RemoteError('owner-workspace/invalid', error.message, {})
+      if (error?.status === 404) throw new RemoteError('owner-workspace/not-found', error.message, {})
+      throw error
+    }
+  }
+
   async ownerSwitchAction(request) {
     try {
       return await this.deps.ownerSwitchAction(request ?? {})
@@ -250,6 +260,7 @@ markRemote(HubBotSettingsService, 'messageDetail', {})
 markRemote(HubBotSettingsService, 'ticketDetail', {})
 markRemote(HubBotSettingsService, 'notificationDetail', {})
 markRemote(HubBotSettingsService, 'ownerSwitchAction', {})
+markRemote(HubBotSettingsService, 'ownerWorkspace', {})
 markRemote(HubBotSettingsService, 'handoffSummaryAction', {})
 markRemote(HubBotSettingsService, 'listRuns', {})
 markRemote(HubBotSettingsService, 'runDetail', {})

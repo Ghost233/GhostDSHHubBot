@@ -33,7 +33,7 @@ async function api(route, opts = {}) {
   }
   if (!token || requestToken !== token) throw new Error('unauthorized')
   const body = await res.json().catch(() => null)
-  if (!res.ok) throw new Error(body?.error ?? ('HTTP ' + res.status))
+  if (!res.ok) throw Object.assign(new Error(body?.error ?? ('HTTP ' + res.status)), { status: res.status })
   if (!body) throw new Error('服务返回的数据无法读取。')
   return body
 }
@@ -58,12 +58,23 @@ const fmtTime = iso => {
   return d.toLocaleString('zh-CN', { hour12: false })
 }
 const shortId = id => (id ?? '').slice(0, 12)
+const ownerLabel = owner => owner.role === 'chief' ? '总管 (L1)' : (owner.workspace ?? owner.id)
+const WORKSPACE_PAGE = 'owner-workspace'
+const workspaceHash = (ownerId, ticketId) => {
+  if (!ownerId) return '#' + WORKSPACE_PAGE
+  const params = new URLSearchParams({ ownerId })
+  if (ticketId) params.set('ticketId', ticketId)
+  return '#' + WORKSPACE_PAGE + '?' + params
+}
+const ticketHash = (id, ownerId) => ownerId ? workspaceHash(ownerId, id) : '#ticket-' + encodeURIComponent(id)
 
 /* ---------- 工作总览 ---------- */
 const NEEDS_ME = ['person/answer', 'person/confirm', 'person/review', 'blocked', 'failed']
 const PROGRESS = ['working', 'queued', 'idle']
 const TICKET_PAGE_SIZE = 20
 const ticketOperations = new Set()
+const timerOperations = new Set()
+const switchOperations = new Set()
 const openDetails = new Set()
 let boardKey = null
 let ownerKey = null
@@ -133,6 +144,7 @@ function ticketDetails(t) {
   if (t.authorization) box.append(detailRow('授权', t.authorization.actor + ' 经 ' + t.authorization.source + ' 于 ' + fmtTime(t.authorization.at)))
   if (t.deferred?.answer) box.append(detailRow('用户答复', t.deferred.answer))
   if (t.trigger) box.append(detailRow('Trigger', shortId(t.trigger.id) + (t.trigger.kind ? ' (' + t.trigger.kind + ')' : '')))
+  if (t.workerSession?.sessionId) box.append(detailRow('执行会话', t.workerSession.sessionId))
   for (const a of t.assignments ?? []) box.append(detailRow('Assignment', a.state + ' · ' + fmtTime(a.startedAt) + (a.endedAt ? ' → ' + fmtTime(a.endedAt) : '') + (a.endedReason ? ' (' + a.endedReason + ')' : '')))
   if (t.report) {
     box.append(detailRow('报告', t.report.summary ?? t.report.text))
@@ -153,9 +165,7 @@ function ticketDetails(t) {
 async function resolveTicket(ticket, resolution, message) {
   if (ticketOperations.has(ticket.id)) return
   ticketOperations.add(ticket.id)
-  const row = document.getElementById('ticket-' + ticket.id)
-  const buttons = row?.querySelectorAll('.row-actions button') ?? []
-  for (const button of buttons) button.disabled = true
+  setTicketActionsDisabled(ticket.id, true)
   try {
     const result = await api('tickets/resolve', { method: 'POST',
       body: { ticketId: ticket.id, resolution, message, ...(['confirm', 'reject', 'answer'].includes(resolution) && { requestId: ticket.deferred?.requestId }) } })
@@ -163,12 +173,19 @@ async function resolveTicket(ticket, resolution, message) {
     const messageText = result.outcome === 'queued' ? '决定已保存，等待处理。'
       : result.stage === 'person/confirm' ? '请求仍在等待确认。' : labels[resolution]
     showNotice(messageText)
-    await refresh()
+    await refreshAfterAction()
   } catch (error) {
     showError(error)
   } finally {
     ticketOperations.delete(ticket.id)
-    for (const button of buttons) button.disabled = false
+    setTicketActionsDisabled(ticket.id, false)
+  }
+}
+
+function setTicketActionsDisabled(id, disabled) {
+  for (const prefix of ['', 'workspace-']) {
+    const row = document.getElementById(prefix + 'ticket-' + id)
+    for (const button of row?.querySelectorAll('.row-actions button') ?? []) button.disabled = disabled
   }
 }
 
@@ -207,6 +224,7 @@ function lazyTicketDetails(ticket) {
     content.replaceChildren(el('p', { role: 'status', class: 'quiet' }, text('正在读取详情…')))
     try {
       const detail = await api('tickets/detail?ticketId=' + encodeURIComponent(ticket.id))
+      if (detail.id !== ticket.id || detail.owner !== ticket.owner) throw new Error('工单记录不匹配。')
       content.replaceChildren(ticketDetails(detail))
       loadedDetail = true
     } catch (error) {
@@ -228,8 +246,8 @@ function lazyTicketDetails(ticket) {
   return details
 }
 
-function ticketRow(t) {
-  const row = el('article', { class: 'ticket-row', id: 'ticket-' + t.id, tabindex: '-1', 'data-stage': t.stage })
+function ticketRow(t, prefix = '') {
+  const row = el('article', { class: 'ticket-row', id: prefix + 'ticket-' + t.id, tabindex: '-1', 'data-stage': t.stage })
   const head = el('div', { class: 'ticket-head' },
     el('span', { class: 'owner-label' }, text(t.ownerLabel ?? t.owner)),
     el('span', { class: 'badge' }, text(t.stageText ?? t.stage)),
@@ -240,6 +258,9 @@ function ticketRow(t) {
   if (prompt) row.append(el('p', { class: 'pending-confirm' }, text(prompt)))
   if (t.attentionReason) row.append(el('p', { class: 'warn-text small' }, text(t.attentionReason)))
   if (t.report && t.stage === 'person/review') row.append(el('p', { class: 'report-preview' }, text(t.report.summary)))
+  if (t.workerSession?.sessionId && PROGRESS.includes(t.stage)) {
+    row.append(el('p', { class: 'quiet small' }, text('执行会话 ' + t.workerSession.sessionId)))
+  }
   if (t.deferred?.status === 'pending') {
     const target = t.deferred.target?.sessionId
     row.append(el('p', { class: 'quiet small' }, text('截止时间 ' + fmtTime(t.deferred.expiresAt) + (target ? ' · 目标会话 ' + target : ''))))
@@ -250,14 +271,17 @@ function ticketRow(t) {
     row.append(el('p', { class: 'quiet small' }, text([deliveryLabels[delivery?.state], delivery?.reason ?? t.deferred?.reason].filter(Boolean).join(' · '))))
   }
   const actions = ticketActions(t)
-  if (actions) row.append(actions)
+  if (actions) {
+    if (ticketOperations.has(t.id)) for (const button of actions.querySelectorAll('button')) button.disabled = true
+    row.append(actions)
+  }
   const session = ['person/review', 'blocked', 'failed'].includes(t.stage) ? ownerSessionLink(t.owner, t.ownerSessionId) : null
   if (session) row.append(session)
   row.append(lazyTicketDetails(t))
   return row
 }
 
-function renderStageGroups(box, stages, byStage, empty) {
+function renderStageGroups(box, stages, byStage, empty, prefix = '') {
   box.replaceChildren()
   for (const stage of stages) {
     const rows = byStage.get(stage) ?? []
@@ -269,9 +293,9 @@ function renderStageGroups(box, stages, byStage, empty) {
     function appendPage() {
       const page = rows.slice(offset, offset + TICKET_PAGE_SIZE)
       for (const ticket of page) {
-        const pinned = $('#focused-ticket')
-        if (pinned?.firstElementChild?.id === 'ticket-' + ticket.id) pinned.remove()
-        group.insertBefore(ticketRow(ticket), more)
+        const pinned = document.getElementById(prefix + 'focused-ticket')
+        if (pinned?.firstElementChild?.id === prefix + 'ticket-' + ticket.id) pinned.remove()
+        group.insertBefore(ticketRow(ticket, prefix), more)
       }
       offset += page.length
       more.hidden = offset >= rows.length
@@ -336,7 +360,7 @@ function openHandoffSummary(owner) {
     if (mode === 'stop' && !window.confirm('确认停止原负责人会话当前处理，等它空闲后携摘要更换？')) return
     await api('owners/switch', { method: 'POST', body: { action: 'request', ...source, mode, summary: current() } })
     closeEditor()
-    await refresh()
+    await refreshAfterAction()
   }
   const wait = button('携摘要更换', () => start('wait'))
   const stop = button('停止后携摘要更换', () => start('stop'))
@@ -370,14 +394,19 @@ function ownerSwitchControls(owner, operation) {
   const actionButton = (label, request) => {
     const button = el('button', { class: 'btn', type: 'button' }, text(label))
     button.addEventListener('click', async () => {
+      if (switchOperations.has(owner.id)) return
       if (request.mode === 'stop' && !window.confirm('确认停止原负责人会话当前处理，等它空闲后更换？')) return
-      const buttons = [...controls.querySelectorAll('button')]
+      switchOperations.add(owner.id)
+      const buttons = controls.querySelectorAll('button')
       for (const item of buttons) item.disabled = true
       try {
         await api('owners/switch', { method: 'POST', body: { ownerId: owner.id, ...request } })
-        await refresh()
+        await refreshAfterAction()
       } catch (error) { showError(error) }
-      finally { for (const item of buttons) item.disabled = false }
+      finally {
+        switchOperations.delete(owner.id)
+        for (const item of buttons) item.disabled = false
+      }
     })
     return button
   }
@@ -405,9 +434,9 @@ function renderOwners(owners, switches) {
   ownerBox.replaceChildren()
   if (!owners.length) ownerBox.append(el('p', { class: 'quiet' }, text('暂无负责人。')))
   for (const owner of owners) {
-    const label = owner.role === 'chief' ? '总管 (L1)' : (owner.workspace ?? owner.id)
     const status = owner.recycled ? '已回收' : owner.sessionId ? null : '未绑定'
-    const entry = el('article', { class: 'owner-entry', 'data-owner-id': owner.id }, el('strong', {}, text(label)))
+    const link = el('a', { href: workspaceHash(owner.id) }, text(ownerLabel(owner)))
+    const entry = el('article', { class: 'owner-entry', 'data-owner-id': owner.id }, el('strong', {}, link))
     if (status) entry.append(el('span', { class: 'quiet small' }, text(status)))
     const session = ownerSessionLink(owner.id, owner.sessionId)
     if (session) entry.append(session)
@@ -428,24 +457,11 @@ function renderBoard(overview) {
   if (boardKey !== nextBoardKey) {
     boardKey = nextBoardKey
     ticketIndex = new Map(tickets.map(ticket => [ticket.id, ticket]))
-    const byStage = new Map()
-    for (const ticket of tickets) {
-      const group = byStage.get(ticket.stage) ?? []
-      group.push(ticket)
-      byStage.set(ticket.stage, group)
-    }
+    const byStage = groupTickets(tickets)
     renderStageGroups($('#needs-me'), NEEDS_ME, byStage, '暂无待处理事项。')
     renderStageGroups($('#by-stage'), PROGRESS, byStage, '暂无进行中或排队的任务。')
-    if ($('#ticket-history').open) renderHistory(byStage)
-    const outcomes = $('#outcomes')
-    const results = tickets.filter(ticket => ticket.report)
-      .sort((a, b) => String(b.report.at ?? b.updatedAt ?? '').localeCompare(String(a.report.at ?? a.updatedAt ?? '')))
-      .slice(0, 12)
-    outcomes.replaceChildren()
-    for (const ticket of results) outcomes.append(el('p', { class: 'result-line' },
-      el('a', { href: '#ticket-' + encodeURIComponent(ticket.id) }, text(ticket.report.summary || ticket.message || ticket.id)),
-      el('span', { class: 'quiet small' }, text(ticket.ownerLabel ?? ticket.owner))))
-    if (!results.length) outcomes.append(el('p', { class: 'quiet' }, text('暂无结果。')))
+    renderHistory(byStage)
+    renderResults($('#outcomes'), tickets)
     $('#focused-ticket')?.remove()
     if (focusedTicket) revealTicket(focusedTicket, false)
   }
@@ -454,11 +470,13 @@ function renderBoard(overview) {
   if (ownerKey !== nextOwnerKey) {
     ownerKey = nextOwnerKey
     renderOwners(owners, new Map(switches.map(operation => [operation.ownerId, operation])))
+    workspaceOwners = owners
+    renderWorkspacePicker()
   }
   const nextTimerKey = JSON.stringify([timers, owners])
   if (timerKey !== nextTimerKey) {
     timerKey = nextTimerKey
-    renderTimers(timers, owners)
+    renderTimers($('#timers'), timers, owners)
     const next = timers.filter(timer => timer.status === 'pending' && timer.fireAt)
       .sort((a, b) => a.fireAt.localeCompare(b.fireAt))[0]
     $('#next-wake').replaceChildren(el('p', { class: 'quiet' }, text(next
@@ -469,37 +487,65 @@ function renderBoard(overview) {
   if (intakeKey !== nextIntakeKey) { intakeKey = nextIntakeKey; renderIntake(overview.intake) }
 }
 
-function renderHistory(byStage) {
-  if (!byStage) {
-    byStage = new Map()
-    for (const ticket of ticketIndex.values()) {
-      const group = byStage.get(ticket.stage) ?? []
-      group.push(ticket)
-      byStage.set(ticket.stage, group)
-    }
+function groupTickets(tickets) {
+  const byStage = new Map()
+  for (const ticket of tickets) {
+    const group = byStage.get(ticket.stage) ?? []
+    group.push(ticket)
+    byStage.set(ticket.stage, group)
   }
-  const stages = [...byStage.keys()].filter(stage => !NEEDS_ME.includes(stage) && !PROGRESS.includes(stage))
-  renderStageGroups($('#history-tickets'), stages, byStage, '暂无任务历史。')
+  return byStage
 }
 
-function revealTicket(id, moveFocus) {
-  let row = document.getElementById('ticket-' + id)
+function renderResults(box, tickets, ownerId) {
+  const results = tickets.filter(ticket => ticket.report)
+    .sort((a, b) => String(b.report.at ?? b.updatedAt ?? '').localeCompare(String(a.report.at ?? a.updatedAt ?? '')))
+    .slice(0, 12)
+  box.replaceChildren()
+  for (const ticket of results) {
+    const link = el('a', { href: ticketHash(ticket.id, ownerId) }, text(ticket.report.summary || ticket.message || ticket.id))
+    const label = ownerId ? fmtTime(ticket.report.at ?? ticket.updatedAt) : (ticket.ownerLabel ?? ticket.owner)
+    box.append(el('p', { class: 'result-line' }, link, el('span', { class: 'quiet small' }, text(label))))
+  }
+  if (!results.length) box.append(el('p', { class: 'quiet' }, text('暂无结果。')))
+}
+
+function renderHistory(byStage, prefix = '') {
+  const box = document.getElementById(prefix + 'history-tickets')
+  if (!document.getElementById(prefix + 'ticket-history').open) {
+    box.replaceChildren()
+    return
+  }
+  const stages = [...byStage.keys()].filter(stage => !NEEDS_ME.includes(stage) && !PROGRESS.includes(stage))
+  renderStageGroups(box, stages, byStage, '暂无任务历史。', prefix)
+}
+
+function ensureHistory(index, prefix = '') {
+  if (!document.getElementById(prefix + 'history-tickets').childElementCount) renderHistory(groupTickets(index.values()), prefix)
+}
+
+function revealTicket(id, moveFocus, index = ticketIndex, prefix = '') {
+  let row = document.getElementById(prefix + 'ticket-' + id)
+  const history = document.getElementById(prefix + 'ticket-history')
   if (!row) {
-    const ticket = ticketIndex.get(id)
+    const ticket = index.get(id)
     if (!ticket) {
       if (moveFocus) showError(new Error('找不到工单 ' + id))
       return
     }
-    const history = $('#ticket-history')
     history.open = true
-    const pinned = $('#focused-ticket')
-    row = ticketRow(ticket)
-    const entry = el('div', { id: 'focused-ticket' }, row)
-    if (pinned) pinned.replaceWith(entry)
-    else history.append(entry)
+    ensureHistory(index, prefix)
+    row = document.getElementById(prefix + 'ticket-' + id)
+    if (!row) {
+      const pinned = document.getElementById(prefix + 'focused-ticket')
+      row = ticketRow(ticket, prefix)
+      const entry = el('div', { id: prefix + 'focused-ticket' }, row)
+      if (pinned) pinned.replaceWith(entry)
+      else history.append(entry)
+    }
   }
-  const history = row.closest('#ticket-history')
-  if (history) history.open = true
+  if (history.contains(row)) history.open = true
+  openDetails.add(id)
   row.querySelector('details[data-ticket-details]').open = true
   if (moveFocus) {
     row.focus({ preventScroll: true })
@@ -562,8 +608,7 @@ function renderTriggerDetail(trigger) {
   return details
 }
 
-function renderTimers(timers, owners) {
-  const box = $('#timers')
+function renderTimers(box, timers, owners, ownerId) {
   box.replaceChildren()
   if (!timers.length) box.append(el('p', { class: 'quiet' }, text('暂无提醒。')))
   const states = { pending: '待触发', paused: '已暂停', firing: '正在提交', fired: '已建任务', cancelled: '已取消', failed: '失败' }
@@ -575,9 +620,12 @@ function renderTimers(timers, owners) {
     const repeat = schedule && (schedule.frequency === 'daily' ? '每日' : '每周' + ('一二三四五六日'[schedule.weekday - 1] ?? ''))
     const cadence = repeat ? repeat + ' ' + schedule.time + '（上海时间）' : null
     const time = schedule ? (timer.status === 'cancelled' ? null : '下次计划 ' + new Date(timer.fireAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })) : fmtTime(timer.fireAt)
-    const row = el('div', { class: 'ticket-row' }, el('strong', {}, text(timer.message)),
+    const row = el('div', { class: 'ticket-row', 'data-timer-id': timer.id }, el('strong', {}, text(timer.message)),
       el('p', { class: 'quiet small' }, text([label, cadence, time, states[timer.status], timer.late ? '已迟到' : null].filter(Boolean).join(' · '))))
-    if (timer.delivery?.ticketId) row.append(el('p', { class: 'quiet small' }, text('任务 ' + timer.delivery.ticketId)))
+    if (timer.delivery?.ticketId) {
+      const id = timer.delivery.ticketId
+      row.append(el('p', { class: 'small' }, el('a', { href: ticketHash(id, ownerId) }, text('查看工单 ' + id))))
+    }
     const delivery = ({ queued: '待投递', sent: '已接管', failed: '投递失败' })[timer.delivery?.state]
     if (delivery) row.append(el('p', { class: 'quiet small' }, text(delivery)))
     if (timer.delivery?.workerSession?.sessionId) row.append(el('p', { class: 'quiet small' }, text('会话 ' + timer.delivery.workerSession.sessionId)))
@@ -586,13 +634,19 @@ function renderTimers(timers, owners) {
     for (const [action, name] of actions) {
       const button = el('button', { class: 'btn', type: 'button' }, text(name))
       button.addEventListener('click', async () => {
+        if (timerOperations.has(timer.id)) return
         if (action === 'cancel' && !window.confirm('取消提醒「' + timer.message + '」？')) return
-        button.disabled = true
+        timerOperations.add(timer.id)
+        const buttons = row.querySelectorAll('button')
+        for (const item of buttons) item.disabled = true
         try {
           await api('timers/manage', { method: 'POST', body: { id: timer.id, action } })
-          await refresh()
+          await refreshAfterAction()
         } catch (error) { showError(error) }
-        finally { button.disabled = false }
+        finally {
+          timerOperations.delete(timer.id)
+          for (const item of buttons) item.disabled = false
+        }
       })
       row.append(button)
     }
@@ -604,30 +658,28 @@ const RUN_STATUS = { silent: '未通知', waiting: '待发送或汇总', sent: '
 const RUN_RESULT = { result: '有结果', failure: '执行失败', blocked: '需要介入' }
 let runQueryVersion = 0
 
-function renderRun(run) {
+function renderRun(run, workspace) {
   const name = run.source.kind === 'github' ? [run.source.repo, run.source.issueNumber && '#' + run.source.issueNumber].filter(Boolean).join(' ') || 'GitHub'
     : '提醒 ' + (run.source.timerId ?? '')
   const summary = el('summary', {}, text([fmtTime(run.createdAt), name, RUN_STATUS[run.status], RUN_RESULT[run.result?.kind]].filter(Boolean).join(' · ')))
-  const task = el('a', { href: '#ticket-' + encodeURIComponent(run.ticketId) }, text('查看工单 ' + shortId(run.ticketId)))
+  const task = el('a', { href: ticketHash(run.ticketId, workspace?.ownerId) }, text('查看工单 ' + shortId(run.ticketId)))
   const facts = el('div', { class: 'ticket-details' }, task)
   if (run.source.url) facts.append(el('p', {}, el('a', { href: run.source.url, target: '_blank', rel: 'noreferrer' }, text('GitHub 来源'))))
   if (run.source.fireAt) facts.append(detailRow('计划时间', fmtTime(run.source.fireAt)))
   if (run.workerSession?.sessionId) facts.append(detailRow('执行会话', run.workerSession.sessionId))
   if (run.reason) facts.append(detailRow('未通知原因', run.reason))
   const history = el('div', { class: 'ticket-details' })
-  const row = el('details', { class: 'ticket-row' }, summary, facts, history)
+  const row = el('details', { class: 'ticket-row', 'data-run-id': run.id }, summary, facts, history)
   row.addEventListener('toggle', async () => {
     if (!row.open) return
     history.replaceChildren(el('p', { class: 'quiet' }, text('正在读取明细…')))
     try {
       const detail = await api('runs/detail?id=' + encodeURIComponent(run.id))
+      if (detail.id !== run.id || (workspace && detail.ownerId !== workspace.ownerId)) throw new Error('运行记录不匹配。')
       history.replaceChildren(
         ...(detail.lastProgressAt ? [detailRow('上次记录进展', fmtTime(detail.lastProgressAt))] : []),
         ...(detail.results ?? []).map(result => detailRow(RUN_RESULT[result.kind] ?? result.kind, fmtTime(result.at))),
-        ...(detail.notifications ?? []).map(notice => {
-          const state = notice.channelAccepted ? '通道已接受' : (QUEUE_TEXT[notice.state] ?? '无发送记录')
-          return detailRow(notice.channel ?? '通知', [state, notice.acceptedAt && fmtTime(notice.acceptedAt), notice.id].filter(Boolean).join(' · '))
-        }),
+        ...(detail.notifications ?? []).map(notice => renderRunNotification(notice, workspace)),
       )
     } catch (error) {
       history.replaceChildren(el('p', { role: 'alert' }, text(error.message)))
@@ -648,12 +700,239 @@ async function loadRuns(offset = 0) {
   try {
     const page = await api('runs?' + filters)
     if (version !== runQueryVersion) return
-    list.replaceChildren(...page.runs.map(renderRun))
+    list.replaceChildren(...page.runs.map(run => renderRun(run)))
     if (!page.runs.length) list.append(el('p', { class: 'quiet' }, text('暂无符合条件的运行。')))
     if (offset) list.append(el('button', { class: 'btn', type: 'button', onclick: () => void loadRuns(Math.max(0, offset - 20)) }, text('上一页')))
     if (page.nextOffset !== null) list.append(el('button', { class: 'btn', type: 'button', onclick: () => void loadRuns(page.nextOffset) }, text('下一页')))
   } catch (error) {
     if (version === runQueryVersion) list.replaceChildren(el('p', { role: 'alert' }, text(error.message)))
+  }
+}
+
+function renderNotificationTickets(detail, workspace) {
+  const tickets = detail.tickets.filter(ticket => !workspace || workspace.tickets.has(ticket.ticketId))
+  if (!tickets.length) return el('p', { class: 'quiet' }, text('暂无关联工单。'))
+  return el('ul', { class: 'notification-tickets' }, ...tickets.map(ticket => el('li', {},
+    el('a', { href: ticketHash(ticket.ticketId, workspace?.ownerId) }, text('查看工单 ' + ticket.ticketId)))))
+}
+
+function renderRunNotification(notice, workspace) {
+  const state = notice.channelAccepted ? '通道已接受' : (QUEUE_TEXT[notice.state] ?? '无发送记录')
+  const fact = detailRow(notice.channel ?? '通知', [state, notice.acceptedAt && fmtTime(notice.acceptedAt), notice.id].filter(Boolean).join(' · '))
+  if (!workspace || !notice.id || ['held', 'missing'].includes(notice.state)) return fact
+  const content = el('div')
+  const details = el('details', {}, el('summary', {}, text('查看通知索引')), content)
+  details.addEventListener('toggle', async () => {
+    if (!details.open) return
+    content.replaceChildren(el('p', { class: 'quiet', role: 'status' }, text('正在读取通知索引…')))
+    try {
+      const detail = await api('notifications/detail?id=' + encodeURIComponent(notice.id))
+      if (detail.id !== notice.id) throw new Error('通知记录不匹配。')
+      content.replaceChildren(renderNotificationTickets(detail, workspace))
+    } catch (error) {
+      content.replaceChildren(el('p', { role: 'alert' }, text(error.message)))
+    }
+  })
+  return el('div', {}, fact, details)
+}
+
+/* ---------- 负责人工作区 ---------- */
+let workspaceOwners = []
+let activeWorkspace = null
+
+function readWorkspaceRoute() {
+  const hash = location.hash.slice(1)
+  if (hash !== WORKSPACE_PAGE && !hash.startsWith(WORKSPACE_PAGE + '?')) return null
+  const params = new URLSearchParams(hash.slice(WORKSPACE_PAGE.length + 1))
+  return { ownerId: params.get('ownerId') || null, ticketId: params.get('ticketId') || null }
+}
+
+function isCurrentWorkspace(workspace) {
+  return workspace === activeWorkspace && readWorkspaceRoute()?.ownerId === workspace.ownerId
+}
+
+function renderWorkspacePicker() {
+  const picker = $('#workspace-select')
+  const ownerId = activeWorkspace?.ownerId
+  const placeholder = el('option', { value: '' }, text('请选择负责人'))
+  const options = workspaceOwners.map(owner => el('option', { value: owner.id }, text(ownerLabel(owner))))
+  if (ownerId && !workspaceOwners.some(owner => owner.id === ownerId)) {
+    options.push(el('option', { value: ownerId }, text(ownerId)))
+  }
+  picker.replaceChildren(placeholder, ...options)
+  picker.value = ownerId ?? ''
+  picker.disabled = options.length === 0
+  if (activeWorkspace && !ownerId) {
+    renderWorkspaceStatus(options.length ? '请选择负责人。' : '暂无负责人。')
+  }
+}
+
+function renderWorkspaceStatus(message, failed = false) {
+  const status = $('#workspace-status')
+  status.replaceChildren()
+  if (message) status.append(el('p', { role: failed ? 'alert' : 'status', class: 'quiet' }, text(message)))
+  if (failed) status.append(el('button', { type: 'button', class: 'btn', onclick: () => void refreshOwnerWorkspace(true) }, text('重试')))
+}
+
+function clearWorkspaceContent() {
+  $('#workspace-content').hidden = true
+  $('#workspace-ticket-history').open = false
+  $('#workspace-focused-ticket')?.remove()
+  for (const section of ['session', 'needs', 'progress', 'results', 'history-tickets', 'timers', 'runs']) {
+    document.getElementById('workspace-' + section).replaceChildren()
+  }
+}
+
+function createWorkspaceView({ ownerId, ticketId }) {
+  return { ownerId, ticketId, tickets: new Map(), keys: {}, runOffset: 0, loaded: false }
+}
+
+function updateWorkspaceRoute(route) {
+  if (!route && !activeWorkspace) return false
+  if (route && activeWorkspace?.ownerId === route.ownerId) {
+    if (activeWorkspace.ticketId === route.ticketId) return false
+    activeWorkspace.ticketId = route.ticketId
+    $('#workspace-focused-ticket')?.remove()
+    if (route.ticketId && activeWorkspace.loaded) {
+      revealTicket(route.ticketId, true, activeWorkspace.tickets, 'workspace-')
+    }
+    return true
+  }
+  activeWorkspace = route ? createWorkspaceView(route) : null
+  clearWorkspaceContent()
+  renderWorkspaceStatus()
+  renderWorkspacePicker()
+  document.querySelector('dialog[data-handoff-editor]')?.remove()
+  if (activeWorkspace?.ownerId) void refreshOwnerWorkspace()
+  return true
+}
+
+async function refreshOwnerWorkspace(force = false) {
+  const workspace = activeWorkspace
+  if (!workspace?.ownerId || !isCurrentWorkspace(workspace) || (workspace.request && !force)) return
+  const request = {}
+  workspace.request = request
+  if (!workspace.loaded) renderWorkspaceStatus('正在读取负责人工作区…')
+  try {
+    const data = await api('owners/workspace', { method: 'POST', body: { ownerId: workspace.ownerId } })
+    if (!isCurrentWorkspace(workspace) || workspace.request !== request) return
+    if (data.owner?.id !== workspace.ownerId) throw new Error('负责人记录不匹配。')
+    renderWorkspace(workspace, data)
+    renderWorkspaceStatus()
+  } catch (error) {
+    if (error.message === 'unauthorized' || !isCurrentWorkspace(workspace) || workspace.request !== request) return
+    if (error.status === 404) {
+      clearWorkspaceContent()
+      activeWorkspace = createWorkspaceView(workspace)
+      renderWorkspaceStatus('找不到负责人 ' + workspace.ownerId + '。', true)
+    } else {
+      renderWorkspaceStatus((workspace.loaded ? '刷新负责人工作区失败：' : '无法读取负责人工作区：') + error.message, true)
+    }
+  } finally {
+    if (workspace.request === request) workspace.request = null
+  }
+}
+
+function renderWorkspace(workspace, data) {
+  const { ownerId, keys } = workspace
+  const { owner } = data
+  const operation = data.switchOperation?.ownerId === ownerId ? data.switchOperation : null
+  const sessionKey = JSON.stringify([owner, operation])
+  if (keys.session !== sessionKey) {
+    renderWorkspaceSession(owner, operation)
+    keys.session = sessionKey
+  }
+  $('#workspace-content').hidden = false
+  const tickets = data.tickets.filter(ticket => ticket.owner === ownerId)
+  const ticketKey = JSON.stringify(tickets)
+  if (keys.tickets !== ticketKey) {
+    const byStage = groupTickets(tickets)
+    workspace.tickets = new Map(tickets.map(ticket => [ticket.id, ticket]))
+    renderStageGroups($('#workspace-needs'), NEEDS_ME, byStage, '暂无待处理事项。', 'workspace-')
+    renderStageGroups($('#workspace-progress'), PROGRESS, byStage, '暂无进行中或排队的任务。', 'workspace-')
+    renderResults($('#workspace-results'), tickets, ownerId)
+    $('#workspace-focused-ticket')?.remove()
+    renderHistory(byStage, 'workspace-')
+    if (workspace.ticketId) revealTicket(workspace.ticketId, !workspace.loaded, workspace.tickets, 'workspace-')
+    keys.tickets = ticketKey
+  }
+  const timers = data.timers.filter(timer => timer.ownerId === ownerId)
+  const timerKey = JSON.stringify(timers)
+  if (keys.timers !== timerKey) {
+    renderTimers($('#workspace-timers'), timers, [owner], ownerId)
+    keys.timers = timerKey
+  }
+  if (!workspace.runOffset && !workspace.runRequest) {
+    renderWorkspaceRuns(workspace, { runs: data.runs, nextOffset: data.nextRunOffset }, 0)
+  }
+  workspace.loaded = true
+}
+
+function renderWorkspaceSession(owner, operation) {
+  const box = $('#workspace-session')
+  const current = owner.recycled ? '已回收' : (owner.sessionId ?? '未绑定')
+  box.replaceChildren(detailRow('负责人', ownerLabel(owner)), detailRow('负责人 ID', owner.id))
+  if (owner.workspace && owner.role === 'chief') box.append(detailRow('责任仓库', owner.workspace))
+  if (owner.cwd) box.append(detailRow('工作目录', owner.cwd))
+  box.append(detailRow('当前会话', current))
+  const session = ownerSessionLink(owner.id, owner.recycled ? null : owner.sessionId)
+  if (session) box.append(session)
+  const controls = ownerSwitchControls(owner, operation)
+  if (operation) {
+    const history = el('div', { class: 'workspace-switch' }, el('h4', { class: 'q' }, text('更换进度')),
+      detailRow('原会话', operation.oldSessionId ?? '—'),
+      detailRow('新会话', (operation.newSessionCreatedAt || operation.committedAt) ? operation.newSessionId : '—'),
+      detailRow('更新时间', fmtTime(operation.updatedAt)))
+    if (controls) history.append(controls)
+    box.append(history)
+  } else if (controls) {
+    controls.classList.add('workspace-switch')
+    box.append(controls)
+  }
+}
+
+function renderWorkspaceRuns(workspace, page, offset) {
+  const runs = page.runs.filter(run => run.ownerId === workspace.ownerId)
+  const key = JSON.stringify([offset, runs, page.nextOffset])
+  if (workspace.keys.runs === key) return
+  workspace.keys.runs = key
+  workspace.runOffset = offset
+  if (!offset) workspace.runLimit = page.nextOffset ?? runs.length
+  const list = $('#workspace-runs')
+  const expanded = new Set([...list.querySelectorAll('details[data-run-id][open]')].map(row => row.dataset.runId))
+  list.replaceChildren(...runs.map(run => {
+    const row = renderRun(run, workspace)
+    row.open = expanded.has(run.id)
+    return row
+  }))
+  if (!runs.length) list.append(el('p', { class: 'quiet' }, text('暂无运行记录。')))
+  const pager = el('div', { class: 'run-filters workspace-run-pager' })
+  const status = el('p', { class: 'quiet workspace-run-status', hidden: '' })
+  const button = (label, target) => el('button', { type: 'button', class: 'btn',
+    onclick: () => void loadWorkspaceRuns(workspace, target, pager, status) }, text(label))
+  if (offset) pager.append(button('上一页', Math.max(0, offset - workspace.runLimit)))
+  if (page.nextOffset != null) pager.append(button('下一页', page.nextOffset))
+  if (pager.childElementCount) list.append(pager, status)
+}
+
+async function loadWorkspaceRuns(workspace, offset, pager, status) {
+  if (!isCurrentWorkspace(workspace) || workspace.runRequest) return
+  workspace.runRequest = pager
+  const buttons = pager.querySelectorAll('button')
+  for (const button of buttons) button.disabled = true
+  status.setAttribute('role', 'status')
+  status.hidden = false
+  status.textContent = '正在读取运行记录…'
+  try {
+    const query = new URLSearchParams({ ownerId: workspace.ownerId, limit: workspace.runLimit, offset })
+    const page = await api('runs?' + query)
+    if (isCurrentWorkspace(workspace) && pager.isConnected) renderWorkspaceRuns(workspace, page, offset)
+  } catch (error) {
+    status.setAttribute('role', 'alert')
+    status.textContent = '无法读取运行记录：' + error.message
+  } finally {
+    workspace.runRequest = null
+    for (const button of buttons) button.disabled = false
   }
 }
 
@@ -956,7 +1235,15 @@ function renderConnections(view) {
 }
 
 $('#ticket-history').addEventListener('toggle', event => {
-  if (event.target === event.currentTarget && event.currentTarget.open) renderHistory()
+  if (event.target === event.currentTarget && event.currentTarget.open) ensureHistory(ticketIndex)
+})
+$('#workspace-ticket-history').addEventListener('toggle', event => {
+  if (event.target === event.currentTarget && event.currentTarget.open && activeWorkspace) {
+    ensureHistory(activeWorkspace.tickets, 'workspace-')
+  }
+})
+$('#workspace-select').addEventListener('change', event => {
+  location.hash = workspaceHash(event.currentTarget.value)
 })
 for (const id of ['run-status', 'run-source']) $('#' + id).addEventListener('change', () => void loadRuns())
 $('#run-refresh').addEventListener('click', () => void loadRuns())
@@ -972,9 +1259,7 @@ $('#notification-form').addEventListener('submit', async event => {
   result.replaceChildren(el('p', { role: 'status' }, text('正在读取通知索引…')))
   try {
     const detail = await api('notifications/detail?id=' + encodeURIComponent(id))
-    const entries = detail.tickets.map(ticket => el('li', {},
-      el('a', { href: '#ticket-' + encodeURIComponent(ticket.ticketId), style: 'display:block;overflow-wrap:anywhere' }, text('查看工单 ' + ticket.ticketId))))
-    result.replaceChildren(el('ul', {}, ...entries))
+    result.replaceChildren(renderNotificationTickets(detail))
   } catch (error) {
     result.replaceChildren(el('p', { role: 'alert' }, text(error.message)))
   } finally { button.disabled = false }
@@ -1003,6 +1288,10 @@ function showTokenGate(message) {
   boardKey = ownerKey = timerKey = intakeKey = recentKey = settingsKey = connectionKey = null
   ticketIndex.clear()
   openDetails.clear()
+  runQueryVersion += 1
+  workspaceOwners = []
+  if (!updateWorkspaceRoute(null)) renderWorkspacePicker()
+  document.querySelector('dialog[data-handoff-editor]')?.remove()
   $('#token-gate').hidden = false
   $('#navigation').hidden = true
   $('#connection-status').hidden = true
@@ -1010,7 +1299,7 @@ function showTokenGate(message) {
   $('#refreshed').textContent = ''
   for (const page of pages) page.hidden = true
   for (const id of ['needs-me', 'by-stage', 'outcomes', 'owners', 'next-wake', 'history-tickets', 'timers',
-    'health', 'intake', 'triggers', 'run-list', 'connection-content', 'settings-content']) $('#' + id).replaceChildren()
+    'health', 'intake', 'triggers', 'run-list', 'notification-index', 'connection-content', 'settings-content']) $('#' + id).replaceChildren()
   $('#focused-ticket')?.remove()
   const err = $('#token-error')
   err.hidden = !message
@@ -1019,10 +1308,11 @@ function showTokenGate(message) {
 
 function updatePage(focus = false) {
   if (!loaded) return
+  const route = readWorkspaceRoute()
   let hash = location.hash.slice(1)
   try { hash = decodeURIComponent(hash) } catch { /* use the literal fragment */ }
   const ticketId = hash.startsWith('ticket-') ? hash.slice(7) : null
-  const next = navigation.some(tab => tab.dataset.page === hash) ? hash : 'board'
+  const next = route ? WORKSPACE_PAGE : navigation.some(tab => tab.dataset.page === hash) ? hash : 'board'
   for (const page of pages) page.hidden = page.id !== next
   for (const tab of navigation) {
     tab.classList.toggle('is-active', tab.dataset.page === next)
@@ -1033,8 +1323,9 @@ function updatePage(focus = false) {
   const changed = next !== activePage || ticketId !== focusedTicket
   activePage = next
   focusedTicket = ticketId
+  const workspaceChanged = updateWorkspaceRoute(route)
   if (ticketId && changed) revealTicket(ticketId, true)
-  else if (focus && changed) window.scrollTo(0, 0)
+  else if (focus && (changed || workspaceChanged) && !route?.ticketId) window.scrollTo(0, 0)
 }
 
 function renderLoadState(message, failed = false) {
@@ -1053,6 +1344,10 @@ function refresh({ reloadSettings = false } = {}) {
     if (refreshRequest === request) refreshRequest = null
   })
   return request.promise
+}
+
+async function refreshAfterAction() {
+  await Promise.all([refresh(), refreshOwnerWorkspace(true)])
 }
 
 async function refreshPanel(requestToken) {
@@ -1112,5 +1407,14 @@ $('#board').addEventListener('click', event => {
   const link = event.target.closest('a[href^="#ticket-"]')
   if (link && location.hash === link.hash && focusedTicket) revealTicket(focusedTicket, true)
 })
-setInterval(() => { if (token) void refresh().catch(() => {}) }, REFRESH_MS)
+$('#owner-workspace').addEventListener('click', event => {
+  const link = event.target.closest('a')
+  if (link?.hash !== location.hash || !activeWorkspace?.ticketId || !isCurrentWorkspace(activeWorkspace)) return
+  revealTicket(activeWorkspace.ticketId, true, activeWorkspace.tickets, 'workspace-')
+})
+setInterval(() => {
+  if (!token) return
+  void refresh().catch(() => {})
+  void refreshOwnerWorkspace()
+}, REFRESH_MS)
 boot()

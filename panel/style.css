@@ -69,6 +69,23 @@ main { max-width: 1180px; margin: 0 auto; padding: 20px 24px 48px; }
 .owner-entry, .result-line { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; }
 .owner-entry strong, .result-line a { flex: 1 1 7em; min-width: 0; }
 .run-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.workspace-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin-bottom: 16px; }
+.workspace-toolbar .page-title { margin: 0 auto 0 0; }
+.workspace-toolbar label { color: var(--dsh-fg-dim); }
+#workspace-select {
+  max-width: 100%; min-width: min(12em, 100%); padding: 5px 10px; font: inherit;
+  background: var(--dsh-bg-raised); color: var(--dsh-fg);
+  border: 1px solid var(--dsh-border); border-radius: var(--dsh-radius);
+}
+#workspace-status:empty { display: none; }
+#workspace-status { overflow-wrap: anywhere; }
+.workspace-session { margin-bottom: 16px; }
+.workspace-switch { border-top: 1px solid var(--dsh-border); margin-top: 10px; padding-top: 10px; }
+#workspace-session .detail-label { min-width: 6em; }
+.workspace-switch .run-filters, .workspace-run-pager { margin-top: 8px; }
+.workspace-switch [role="alert"], .workspace-run-status[role="alert"] { color: var(--dsh-danger); }
+.notification-tickets a { overflow-wrap: anywhere; }
+.ticket-row[data-timer-id] > .btn + .btn { margin-inline-start: 6px; }
 .load-state { margin-bottom: 14px; }
 .load-state p { margin: 3px 0; }
 .load-state [role="alert"] { color: var(--dsh-danger); }
@@ -187,5 +204,7 @@ dialog[data-handoff-editor]::backdrop { background: rgba(0, 0, 0, 0.45); }
   .connection-status { margin-left: 0; }
   .refreshed { display: none; }
   .overview-card { padding-inline: 12px; }
+  .workspace-toolbar .page-title { flex-basis: 100%; }
+  #workspace-select { flex: 1 1 10em; min-width: 0; }
   .data-table { table-layout: fixed; overflow-wrap: anywhere; }
 }

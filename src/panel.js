@@ -538,6 +538,18 @@ function excerpt(text, limit) {
   return typeof text === 'string' && text.length > limit ? text.slice(0, limit) + '…' : text
 }
 
+function projectOwner(owner) {
+  return {
+    id: owner.id, role: owner.role, kind: owner.kind, workspace: owner.workspace ?? null, cwd: owner.cwd,
+    sessionId: owner.sessionId ?? null, status: owner.status, transient: owner.transient === true, recycled: owner.recycled === true,
+    createdAt: owner.createdAt ?? null, updatedAt: owner.updatedAt ?? null,
+  }
+}
+
+function compareTicketStage(a, b) {
+  return (OVERVIEW_STAGES.get(a.stage) ?? OVERVIEW_STAGES.size) - (OVERVIEW_STAGES.get(b.stage) ?? OVERVIEW_STAGES.size)
+}
+
 function projectTicket(ticket, { trigger, owner, findAnswer, compact, listDir }) {
   const stage = normalizeStage(ticket.stage)
   const message = ticket.routedMessage ?? (typeof trigger?.message === 'string' ? trigger.message : null)
@@ -594,6 +606,35 @@ function readStoredRow(store, table, id) {
 }
 
 /**
+ * Read compact tickets for one stable owner and attach the scoped management records.
+ * `runs` is the existing run page with `runs` and `nextOffset`.
+ */
+export function readOwnerWorkspace({ store, registry, ownerId, timers, runs, switchOperation }) {
+  const registered = registry.get(ownerId)
+  if (!registered) return null
+  const owner = projectOwner(registered)
+  const rows = store.db.prepare(`
+    SELECT ticket.value, trigger.value AS triggerValue FROM ticket
+    LEFT JOIN trigger ON trigger.id = json_extract(ticket.value, '$.triggerId')
+    WHERE json_extract(ticket.value, '$.owner') = ?
+    ORDER BY ticket.rowid
+  `).all(ownerId)
+  const tickets = rows.map(({ value, triggerValue }) => projectTicket(JSON.parse(value), {
+    trigger: triggerValue ? JSON.parse(triggerValue) : null,
+    owner,
+    findAnswer: id => readStoredRow(store, 'outbox', id),
+    compact: true,
+  })).sort(compareTicketStage)
+  return {
+    owner, tickets,
+    timers: timers.filter(timer => timer.ownerId === ownerId),
+    runs: runs.runs.filter(run => run.ownerId === ownerId),
+    nextRunOffset: runs.nextOffset,
+    switchOperation: switchOperation?.ownerId === ownerId ? switchOperation : null,
+  }
+}
+
+/**
  * The shared Overview lists tickets in priority order, retaining arrival order within each stage.
  * Polling clients request compact ticket previews and load complete reports and artifacts by ID.
  * @param {{ store: import('./store.js').Store, registry: import('./registry.js').OwnerRegistry,
@@ -604,11 +645,7 @@ export function buildOverview({ store, registry, health, now, listDir = listDirC
   const readAll = table => store.db.prepare('SELECT value FROM ' + table + ' ORDER BY rowid').all().map(r => JSON.parse(String(r.value)))
   const triggerRows = readAll('trigger')
   const triggers = new Map(triggerRows.map(t => [t.id, t]))
-  const owners = registry.list().map(o => ({
-    id: o.id, role: o.role, kind: o.kind, workspace: o.workspace ?? null, cwd: o.cwd,
-    sessionId: o.sessionId ?? null, status: o.status, transient: o.transient === true, recycled: o.recycled === true,
-    createdAt: o.createdAt ?? null, updatedAt: o.updatedAt ?? null,
-  }))
+  const owners = registry.list().map(projectOwner)
   const ownerById = new Map(owners.map(o => [o.id, o]))
   const outboxRows = readAll('outbox')
   const answersById = new Map(outboxRows.filter(row => row.kind === 'deferred-answer').map(row => [row.id, row]))
@@ -626,7 +663,7 @@ export function buildOverview({ store, registry, health, now, listDir = listDirC
       ticketByTriggerId.set(row.trigger.id, row)
     }
   }
-  tickets.sort((a, b) => (OVERVIEW_STAGES.get(a.stage) ?? OVERVIEW_STAGES.size) - (OVERVIEW_STAGES.get(b.stage) ?? OVERVIEW_STAGES.size))
+  tickets.sort(compareTicketStage)
   const replyFor = indexMessageReplies(store, triggers, ticketTriggers)
   const generatedAt = (now ?? (() => new Date().toISOString()))()
   const nowMs = Date.parse(generatedAt) || Date.now()
