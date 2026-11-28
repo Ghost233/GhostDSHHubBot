@@ -69,6 +69,10 @@ async function callerOwner(ctx, api, exec) {
   return owner
 }
 
+function requireCurrentBinding(api, owner) {
+  if (api.registry.findByCurrentSession(owner.sessionId)?.id !== owner.id) throw new Error('the calling session is no longer the current owner binding')
+}
+
 const OWNER_PRESETS = new Set(['hub-bot-owner', 'hub-bot-router'])
 
 /** Current bindings, remembered bindings, and v1 owner sessions recorded only by DSH. */
@@ -93,7 +97,7 @@ async function workerCwd(ctx, api, owner, sessionId, tool, signal) {
     throw new Error('session ' + sessionId + ' (cwd ' + cwd + ') is outside this owner’s subtree ' + owner.cwd)
   }
   if (await isOwnerSession(ctx, api, item, signal)) refuseOwnerTarget(sessionId, tool)
-  if (api.registry.findByCurrentSession(owner.sessionId)?.id !== owner.id) throw new Error('the calling session is no longer the current owner binding')
+  requireCurrentBinding(api, owner)
   return cwd
 }
 
@@ -183,7 +187,7 @@ export function apply(ctx) {
         const role = await isOwnerSession(ctx, api, item, signal) ? 'owner' : 'session'
         sessions.push({ sessionId: item.sessionId, cwd: norm(item.cwd), running: Boolean(item.running), role, ...(snippet !== undefined && { snippet }) })
       }
-      if (api.registry.findByCurrentSession(owner.sessionId)?.id !== owner.id) throw new Error('the calling session is no longer the current owner binding')
+      requireCurrentBinding(api, owner)
       return { sessions }
     },
   })
@@ -245,13 +249,14 @@ export function apply(ctx) {
       if (!isWithinCwd(norm(owner.cwd), cwd)) {
         throw new Error('create_session: cwd ' + cwd + ' is outside this owner\'s subtree ' + owner.cwd + ' — do NOT act across repos; call escalate with the reason instead')
       }
+      requireCurrentBinding(api, owner)
       if (args.ticketId !== undefined) mustOwnTicket(api, owner, args.ticketId)
       // Worker sessions use the deployment's default preset.
       const created = await ctx.sessionController.create({ cwd })
       const sessionId = created.sessionId ?? created.session?.id
       if (!sessionId) throw new Error('create_session: the controller returned no sessionId')
       if (args.ticketId !== undefined) {
-        if (api.registry.findByCurrentSession(owner.sessionId)?.id !== owner.id) throw new Error('the calling session is no longer the current owner binding')
+        requireCurrentBinding(api, owner)
         mustOwnTicket(api, owner, args.ticketId)
         api.tasks.bindWorkerSession(args.ticketId, { sessionId, cwd })
       }

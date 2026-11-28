@@ -84,7 +84,7 @@ function transcriptPage() {
  * `searchItems` 让内容搜索路径也返回命中项（与清单同样经 sessionCwd 复核责任边界）。
  * `agentId` 是调用方身份（dsh-agent 的 agent.id 即 SessionId）；`undefined` 表示 agent 上下文里没有 id。
  */
-function ownerToolsHarness(f, { agentId = f.ownerSessionId, extraSessions = [], searchItems = [], presets = {} } = {}) {
+function ownerToolsHarness(f, { agentId = f.ownerSessionId, extraSessions = [], searchItems = [], presets = {}, ensureCwd = async () => f.owner.cwd } = {}) {
   const tools = new Map()
   const pageRequests = []
   const prompts = []
@@ -94,7 +94,7 @@ function ownerToolsHarness(f, { agentId = f.ownerSessionId, extraSessions = [], 
     reflect: { get: () => api },
     systemPrompt: { section() {} },
     tools: { register: def => tools.set(def.name, def) },
-    workingDirectory: { ensure: async () => f.owner.cwd },
+    workingDirectory: { ensure: ensureCwd },
     sessionPersistence: { stat: async id => presets[id] ? { header: { agentPreset: presets[id] } } : undefined },
     sessionController: {
       // 目标会话在负责人 cwd 子树内 → 越界拒执不拦；责任边界判定是真实代码路径。
@@ -387,4 +387,22 @@ test('create_session checks ticket ownership before creating a worker', async ()
     await assert.rejects(tool.execute({ ticketId: 'missing-ticket' }, h.exec), /unknown ticket/)
     assert.equal(h.creates.length, 0)
   } finally { f.cleanup() }
+})
+
+test('create_session refuses a displaced owner after directory lookup', { timeout: 2000 }, async () => {
+  const f = fixture()
+  const lookupStarted = Promise.withResolvers()
+  const directory = Promise.withResolvers()
+  try {
+    const h = ownerToolsHarness(f, { ensureCwd() {
+      lookupStarted.resolve()
+      return directory.promise
+    } })
+    const creation = h.tools.get('create_session').execute({}, h.exec)
+    await lookupStarted.promise
+    f.registry.bindSession(f.owner.id, 'session-new-owner')
+    directory.resolve(f.owner.cwd)
+    await assert.rejects(creation, /no longer the current owner binding/)
+    assert.equal(h.creates.length, 0)
+  } finally { directory.resolve(f.owner.cwd); f.cleanup() }
 })
