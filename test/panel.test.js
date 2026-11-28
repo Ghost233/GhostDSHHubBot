@@ -16,7 +16,7 @@ import { resolveConfig } from '../src/config.js'
 import {
   SETTINGS_FILE, SettingsError,
   applySettingsPatch, applySettingsOverlay, loadSettingsOverlay, saveSettingsOverlay, mergeSettingsOverlay,
-  buildSettingsView, buildOverview, buildOutboxHealth, readMessageDetail, buildIntakePolicy,
+  buildSettingsView, buildOverview, buildOutboxHealth, readMessageDetail, readTicketDetail, buildIntakePolicy,
 } from '../src/panel.js'
 
 /** A fully resolved config with feishu/github sections on — the shape the panel mutates. */
@@ -211,6 +211,77 @@ test('overview answers the three questions from ticket faces: state / doing / ou
   }
 })
 
+test('Overview shows answers, confirmations, reviews, and attention before work in stable order', async () => {
+  const { router, registry, store, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Overview', cwd: '/repos/Overview' })
+    const first = await router.routeToOwner({ ownerId: owner.id, message: 'Started first' })
+    const queued = await router.routeToOwner({ ownerId: owner.id, message: 'Waiting for a slot' })
+    router.tasks.demote(queued.ticketId)
+    const review = await router.routeToOwner({ ownerId: owner.id, message: 'Ready for review' })
+    router.tasks.report({ ticketId: review.ticketId, summary: 'Ready' })
+    const confirm = await router.routeToOwner({ ownerId: owner.id, message: 'Needs confirmation' })
+    router.tasks.askConfirm({ ticketId: confirm.ticketId, question: 'Proceed?' })
+    const answer = await router.routeToOwner({ ownerId: owner.id, message: 'Needs an answer' })
+    router.tasks.ask({ ticketId: answer.ticketId, question: 'Which file?' })
+    const nextAnswer = await router.routeToOwner({ ownerId: owner.id, message: 'Needs another answer' })
+    router.tasks.ask({ ticketId: nextAnswer.ticketId, question: 'Which branch?' })
+    const attention = await router.routeToOwner({ ownerId: owner.id, message: 'Needs attention' })
+    router.tasks.fail({ ticketId: attention.ticketId, reason: 'Test failure' })
+
+    const overview = buildOverview({ store, registry, compact: true })
+    assert.deepEqual(overview.tickets.map(ticket => ticket.id), [
+      answer.ticketId, nextAnswer.ticketId, confirm.ticketId, review.ticketId, attention.ticketId, first.ticketId, queued.ticketId,
+    ])
+  } finally {
+    cleanup()
+  }
+})
+
+test('large Overview history keeps report previews and opens one full result on demand', async () => {
+  const { router, registry, store, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Results', cwd: '/repos/Results' })
+    const result = await router.routeToOwner({ ownerId: owner.id, message: 'Build the result' })
+    registry.bindSession(owner.id, 'session-current-owner')
+    const evidence = ('Verification log: ' + 'full result and artifacts. '.repeat(250)).trimEnd()
+    const report = { summary: 'Ready for review', evidence,
+      sections: { result: 'Success', changes: 'Artifacts', verification: evidence, risks: 'None' } }
+    router.tasks.report({ ticketId: result.ticketId, ...report })
+
+    // Seed retained records directly so the fixture can represent a long-running installation.
+    const insert = store.db.prepare('INSERT INTO ticket (id, value) VALUES (?, ?)')
+    store.db.exec('BEGIN')
+    for (let i = 0; i < 1000; i++) {
+      const id = 'historical-' + i
+      insert.run(id, JSON.stringify({ id, owner: owner.id, stage: 'done', report,
+        routedMessage: 'Completed task ' + i, assignments: [{ note: evidence }] }))
+    }
+    store.db.exec('COMMIT')
+
+    let directoryReads = 0
+    const listDir = () => { directoryReads += 1; return ['proof.txt'] }
+    const overview = buildOverview({ store, registry, compact: true, listDir })
+    assert.equal(overview.tickets.length, 1001)
+    assert.equal(overview.tickets[0].id, result.ticketId)
+    assert.equal(overview.tickets[0].report.summary, report.summary)
+    assert.equal(overview.tickets.at(-1).id, 'historical-999')
+    assert.ok(JSON.stringify(overview).length < 600_000, 'the list stays compact across retained results')
+    assert.equal(directoryReads, 0, 'directory is read when the report opens')
+
+    const detail = readTicketDetail({ store, registry, ticketId: result.ticketId, listDir })
+    assert.equal(detail.message, 'Build the result')
+    assert.equal(detail.report.sections.verification, evidence)
+    assert.equal(detail.report.evidence, evidence)
+    assert.deepEqual(detail.dirListing, ['proof.txt'])
+    assert.equal(detail.ownerSessionId, 'session-current-owner')
+    assert.equal(directoryReads, 1)
+    assert.equal(readTicketDetail({ store, registry, ticketId: 'missing' }), null)
+  } finally {
+    cleanup()
+  }
+})
+
 test('overview lists artifacts for working tickets too (round 45)', async () => {
   const { router, registry, store, cleanup } = fixture()
   try {
@@ -305,6 +376,28 @@ test('recent messages separate dispatch, legacy chat replies and replies to a si
     assert.equal(msg('old').replyUnlinked, true)
     assert.equal(msg('old').unprocessed, false)
     assert.equal(view.recentTriggers.find(t => t.ticketId === route.ticketId).reply, null)
+  } finally { cleanup() }
+})
+
+test('combined run notifications stay out of the legacy chat reply fallback', () => {
+  const { store, registry, cleanup } = fixture()
+  try {
+    const at = '2026-11-19T11:00:00.000Z'
+    const insert = store.db.prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)')
+    for (const chatId of ['batch-chat', 'legacy-chat']) {
+      insert.run(chatId, JSON.stringify({ id: chatId, kind: 'feishu', message: 'Question', at, source: { chatId } }), at)
+    }
+    const sent = () => '2026-11-19T11:01:00.000Z'
+    insertOutbox(store, { kind: 'reply', state: 'sent', to: 'feishu:chat:batch-chat', body: 'Runs summary',
+      ticketId: null, triggerId: null, notificationWindowMs: 60000 }, sent)
+    insertOutbox(store, { kind: 'reply', state: 'sent', to: 'feishu:chat:legacy-chat', body: 'Old reply' }, sent)
+
+    const overview = buildOverview({ store, registry, now: () => '2026-11-19T12:00:00.000Z', compact: true })
+    const batch = overview.recentTriggers.find(row => row.id === 'batch-chat')
+    assert.equal(batch.replyUnlinked, false)
+    assert.equal(batch.unprocessed, true)
+    assert.equal(overview.recentTriggers.find(row => row.id === 'legacy-chat').replyUnlinked, true)
+    assert.equal(readMessageDetail(store, 'batch-chat').replyUnlinked, false)
   } finally { cleanup() }
 })
 

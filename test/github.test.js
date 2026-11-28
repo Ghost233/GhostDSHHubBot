@@ -11,6 +11,8 @@ import { Router } from '../src/router.js'
 import { GitHubSource, watermarkPath, DSH_BADGE } from '../src/github.js'
 import { resolveConfig } from '../src/config.js'
 import { discardOutboxRows } from '../src/outbox.js'
+import { NotificationThrottle } from '../src/notifications.js'
+import { wordCount } from '../src/discipline.js'
 
 const REPO = 'Ghost233/DSH-Workflow'
 const REPO_CFG = { repo: REPO, workspace: 'DSH-Workflow', cwd: '/Volumes/home/DSH-Workflow', enabled: true }
@@ -144,6 +146,50 @@ test('background GitHub checks leave silent, accepted and failed notification ev
     assert.equal(reopened.source.router.runs.get(error.id).notification.discarded, true)
     assert.deepEqual(reopened.source.router.runs.list({ status: 'silent' }).map(row => row.id), [quiet.id])
   } finally { reopened?.store.close(); f.cleanup() }
+})
+
+test('explicit GitHub comments get a bounded immediate result with an exact notification index', async () => {
+  const f = fixture()
+  try {
+    f.router.notifications = new NotificationThrottle({ store: f.store, runs: f.router.runs, now: () => Date.parse(f.source.now()) })
+    const item = await f.source.handleCommentEvent(comment({ body: '@hub-bot 检查状态' }), REPO_CFG)
+    const sessionId = f.router.getTicket(item.ticketId).workerSession.sessionId
+    await f.router.reportBackground({ ticketId: item.ticketId, sessionId, summary: '确'.repeat(180) })
+    const record = f.router.runs.get('run-' + item.ticketId)
+    const row = f.outbox().find(item => item.id === record.notification.id)
+    assert.equal(row.state, 'recorded')
+    assert.equal(row.notificationWindowMs, undefined)
+    assert.ok(wordCount(row.body) <= 100)
+    assert.ok(row.body.includes(row.id))
+    assert.deepEqual(f.router.notifications.details(row.id).tickets.map(ticket => ticket.ticketId), [item.ticketId])
+    await f.source.deliverReplies()
+    assert.equal(f.posts.length, 1)
+    assert.equal(f.router.runs.get('run-' + item.ticketId).status, 'sent')
+  } finally { f.cleanup() }
+})
+
+test('a GitHub worker question creates an immediate audited notice at its original item', async () => {
+  const f = fixture()
+  try {
+    f.router.installDeferred(new DeferredRegistry({ store: f.store, tasks: f.router.tasks, now: f.source.now, owners: f.registry }))
+    const work = await f.source.handleIssueEvent(issue(), REPO_CFG)
+    await f.source.deliverReplies()
+    const sessionId = f.router.getTicket(work.ticketId).workerSession.sessionId
+    assert.equal(f.router.askWorker({ ticketId: work.ticketId, sessionId, question: 'A fixture question' }).stage, 'person/answer')
+    const questionId = f.router.getTicket(work.ticketId).deferred.requestId
+    const record = f.router.runs.get('run-' + work.ticketId)
+    assert.equal(record.status, 'waiting')
+    assert.ok(record.notification.id)
+    const row = f.outbox().find(item => item.id === record.notification.id)
+    assert.equal(row.to, 'github:' + REPO + ':42')
+    assert.equal(row.state, 'recorded')
+    assert.match(row.body, new RegExp(questionId))
+    assert.equal(row.notificationWindowMs, undefined)
+    await f.source.deliverReplies()
+    await f.source.deliverReplies()
+    assert.equal(f.posts.length, 2)
+    assert.equal(f.router.runs.get('run-' + work.ticketId).status, 'sent')
+  } finally { f.cleanup() }
 })
 
 test('an explicit GitHub comment receives a reply and progress keeps its ticket active', async () => {
@@ -726,6 +772,30 @@ test('repeated empty and failed lookups leave an ambiguous reply retryable witho
     assert.equal(readRow().state, 'sent')
     assert.equal(f.posts.length, 1)
   } finally { reopened?.store.close(); f.cleanup() }
+})
+
+test('a late exact GitHub receipt settles ordinary work held for manual retry', async () => {
+  const target = 'repos/' + REPO + '/issues/42/comments'
+  const f = fixture()
+  try {
+    const { insertOutbox, retryOutboxRows } = await import('../src/outbox.js')
+    const row = insertOutbox(f.store, { kind: 'reply', to: 'github:' + REPO + ':42', body: 'fixture ordinary', state: 'recorded', notificationWindowMs: 60_000 })
+    let posted
+    f.script['POST ' + target] = args => {
+      posted = comment({ id: 9001, body: args.find(arg => arg.startsWith('body=')).slice('body='.length) })
+      throw new Error('fixture timeout with ambiguous outcome')
+    }
+    for (let attempt = 0; attempt < 5; attempt++) await f.source.deliverReplies()
+    assert.equal(retryOutboxRows(f.store, [row.id], f.source.now), 1)
+    const read = () => f.outbox().find(item => item.id === row.id)
+    assert.equal(read().state, 'held')
+    assert.equal(read().notificationRetry, true)
+    assert.deepEqual(await f.source.handleCommentEvent(posted, REPO_CFG), { skipped: 'self-generated' })
+    assert.equal(read().state, 'sent')
+    assert.equal(read().notificationRetry, undefined)
+    assert.equal(read().requestId, row.requestId)
+    assert.equal(f.posts.length, 1)
+  } finally { f.cleanup() }
 })
 
 test('polling settles a failed ambiguous reply when its marker becomes visible', async () => {

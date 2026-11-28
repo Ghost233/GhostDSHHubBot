@@ -781,8 +781,10 @@ export class GitHubSource {
     const value = store.db.prepare('SELECT value FROM outbox WHERE id = ?').get(outboxId)?.value
     if (!value) return
     const row = JSON.parse(String(value))
-    if (row.state === 'recorded' || (row.state === 'failed' && row.originState === 'recorded')) {
-      updateOutboxRow(store, { ...row, state: 'sent', sentAt: this.now(), lastError: null })
+    if (row.state === 'recorded' || (row.state === 'failed' && row.originState === 'recorded')
+      || (row.state === 'held' && row.notificationRetry === true)) {
+      const { notificationRetry, notificationRetryAt, ...settled } = row
+      updateOutboxRow(store, { ...settled, state: 'sent', sentAt: this.now(), lastError: null })
     }
   }
 

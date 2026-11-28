@@ -12,7 +12,7 @@ function readToken() {
   if (fromUrl) {
     sessionStorage.setItem('hub-bot-token', fromUrl)
     url.searchParams.delete('token')
-    history.replaceState(null, '', url.pathname)
+    history.replaceState(null, '', url.pathname + url.search + url.hash)
     return fromUrl
   }
   return sessionStorage.getItem('hub-bot-token') ?? ''
@@ -20,18 +20,21 @@ function readToken() {
 let token = readToken()
 
 async function api(route, opts = {}) {
+  const requestToken = token
   const res = await fetch(API + route, {
     method: opts.method ?? 'GET',
-    headers: { 'x-hub-bot-token': token, ...(opts.body ? { 'content-type': 'application/json' } : {}) },
+    headers: { 'x-hub-bot-token': requestToken, ...(opts.body ? { 'content-type': 'application/json' } : {}) },
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   })
-  const body = await res.json().catch(() => ({}))
-  if (res.status === 401) {
+  if (res.status === 401 && requestToken === token) {
+    token = ''
     sessionStorage.removeItem('hub-bot-token')
     showTokenGate('token 无效，请重新输入。')
-    throw new Error('unauthorized')
   }
-  if (!res.ok) throw new Error(body.error ?? ('HTTP ' + res.status))
+  if (!token || requestToken !== token) throw new Error('unauthorized')
+  const body = await res.json().catch(() => null)
+  if (!res.ok) throw new Error(body?.error ?? ('HTTP ' + res.status))
+  if (!body) throw new Error('服务返回的数据无法读取。')
   return body
 }
 
@@ -56,18 +59,46 @@ const fmtTime = iso => {
 }
 const shortId = id => (id ?? '').slice(0, 12)
 
-/* ---------- 三问 ---------- */
-const STAGE_ORDER = ['person/confirm', 'person/answer', 'person/review', 'blocked', 'failed', 'working', 'queued', 'idle', 'done', 'canceled']
-const NEEDS_ME = new Set(['person/confirm', 'person/answer', 'person/review', 'blocked', 'failed'])
+/* ---------- 工作总览 ---------- */
+const NEEDS_ME = ['person/answer', 'person/confirm', 'person/review', 'blocked', 'failed']
+const PROGRESS = ['working', 'queued', 'idle']
+const TICKET_PAGE_SIZE = 20
+const ticketOperations = new Set()
+const openDetails = new Set()
+let boardKey = null
+let ownerKey = null
+let timerKey = null
+let intakeKey = null
+let recentKey = null
+let ticketIndex = new Map()
+let refreshRequest = null
+let loaded = false
+let activePage = null
+let focusedTicket = null
+
+function ownerSessionLink(ownerId, sessionId) {
+  return sessionId ? el('a', { href: '/?' + new URLSearchParams({ hubBotOwner: ownerId }), target: '_blank',
+    rel: 'noopener noreferrer', class: 'btn session-link', title: sessionId }, text('打开负责人会话')) : null
+}
+
+function renderConnectionStatus(health) {
+  const feishu = health.feishu ?? {}
+  const github = health.github ?? {}
+  const feishuState = !feishu.enabled ? '已关闭' : feishu.credentialState !== 'ok' ? '待绑定'
+    : feishu.wsState === 'connected' ? '已连接' : ['connecting', 'reconnecting'].includes(feishu.wsState) ? '连接中' : '未连接'
+  const githubState = !github.enabled ? '已关闭' : github.lastPollError ? '轮询失败'
+    : github.followed?.length ? '监听 ' + github.followed.length + ' 个仓库' : '暂无监听仓库'
+  $('#connection-status').textContent = '飞书 ' + feishuState + ' · GitHub ' + githubState
+}
 
 function healthProblems(health) {
   const items = []
   const feishu = health.feishu ?? {}
   // 未绑上时的待办：绑定流过期/失败优先说清「哪一步没走完」，否则才说凭据缺失/无效（同一件事不重复报）。
   if (feishu.enabled && feishu.credentialState !== 'ok') {
-    if (feishu.registration === 'expired') items.push('飞书绑定未完成（二维码已过期）— 到设置页重新生成二维码')
+    if (feishu.registration === 'expired') items.push('飞书绑定未完成（二维码已过期）— 到连接页重新生成二维码')
     else if (feishu.registration === 'failed') items.push('飞书绑定失败' + (feishu.registrationError ? '：' + feishu.registrationError : ''))
-    else items.push('飞书凭据' + (feishu.credentialState === 'missing' ? '缺失' : '无效') + ' — 到设置页重新扫码')
+    else items.push('飞书凭据' + (feishu.credentialState === 'missing' ? '缺失' : '无效') + ' — 到连接页重新扫码')
   }
   // 已绑定：只有真的连不上（failed/off）才算待办；connecting/reconnecting 是瞬时过程，保持安静不报警。
   if (feishu.enabled && feishu.credentialState === 'ok' && (feishu.wsState === 'failed' || feishu.wsState === 'off')) items.push('飞书长连接未建立')
@@ -86,7 +117,10 @@ function renderHealth(health) {
   box.replaceChildren()
   // 安静默认: 健康时不占空间
   box.hidden = items.length === 0
-  for (const item of items) box.append(el('div', { class: 'health-item' }, text('⚠ ' + item)))
+  for (const item of items) box.append(el('div', { class: 'health-item' }, text(item)))
+  if (items.length && (health.feishu?.enabled || health.github?.enabled)) {
+    box.append(el('a', { href: '#connections' }, text('查看连接状态')))
+  }
 }
 
 function detailRow(label, value) {
@@ -95,12 +129,15 @@ function detailRow(label, value) {
 
 function ticketDetails(t) {
   const box = el('div', { class: 'ticket-details' })
+  if (t.message) box.append(detailRow('原文', t.message))
   if (t.authorization) box.append(detailRow('授权', t.authorization.actor + ' 经 ' + t.authorization.source + ' 于 ' + fmtTime(t.authorization.at)))
   if (t.deferred?.answer) box.append(detailRow('用户答复', t.deferred.answer))
   if (t.trigger) box.append(detailRow('Trigger', shortId(t.trigger.id) + (t.trigger.kind ? ' (' + t.trigger.kind + ')' : '')))
   for (const a of t.assignments ?? []) box.append(detailRow('Assignment', a.state + ' · ' + fmtTime(a.startedAt) + (a.endedAt ? ' → ' + fmtTime(a.endedAt) : '') + (a.endedReason ? ' (' + a.endedReason + ')' : '')))
   if (t.report) {
-    box.append(detailRow('报告', t.report.summary))
+    box.append(detailRow('报告', t.report.summary ?? t.report.text))
+    if (t.report.evidence != null) box.append(detailRow('证据', typeof t.report.evidence === 'string'
+      ? t.report.evidence : JSON.stringify(t.report.evidence, null, 2)))
     if (t.report.sections) {
       box.append(detailRow('结果', t.report.sections.result))
       box.append(detailRow('变更', t.report.sections.changes))
@@ -113,159 +150,335 @@ function ticketDetails(t) {
   return box
 }
 
-function confirmActions(t) {
-  const wrap = el('span', { class: 'row-actions' })
-  const act = async resolution => {
-    const label = resolution === 'confirm' ? '确认' : '拒绝'
-    // 破坏性动作需确认 (spec 面板原则)
-    if (!window.confirm(label + '任务 ' + shortId(t.id) + '？\n' + (t.pendingConfirm?.text ?? ''))) return
-    await api('tickets/resolve', { method: 'POST', body: { ticketId: t.id, resolution, requestId: t.deferred?.requestId } })
+async function resolveTicket(ticket, resolution, message) {
+  if (ticketOperations.has(ticket.id)) return
+  ticketOperations.add(ticket.id)
+  const row = document.getElementById('ticket-' + ticket.id)
+  const buttons = row?.querySelectorAll('.row-actions button') ?? []
+  for (const button of buttons) button.disabled = true
+  try {
+    const result = await api('tickets/resolve', { method: 'POST',
+      body: { ticketId: ticket.id, resolution, message, ...(['confirm', 'reject', 'answer'].includes(resolution) && { requestId: ticket.deferred?.requestId }) } })
+    const labels = { confirm: '已确认', reject: '已拒绝', answer: '答复已保存', retry: '已登记重试' }
+    showNotice(result.stage === 'person/confirm' ? '请求仍在等待确认。' : labels[resolution])
     await refresh()
+  } catch (error) {
+    showError(error)
+  } finally {
+    ticketOperations.delete(ticket.id)
+    for (const button of buttons) button.disabled = false
   }
-  wrap.append(
-    el('button', { class: 'btn primary', onclick: () => void act('confirm').catch(showError) }, text('确认')),
-    el('button', { class: 'btn danger', onclick: () => void act('reject').catch(showError) }, text('拒绝')),
-  )
+}
+
+function ticketActions(ticket) {
+  if (ticket.stage === 'person/answer') {
+    return el('span', { class: 'row-actions' }, el('button', { class: 'btn', type: 'button', onclick: () => {
+      const message = window.prompt(ticket.question?.text ?? '回复')?.trim()
+      if (message) void resolveTicket(ticket, 'answer', message)
+    } }, text('回复')))
+  }
+  if (['blocked', 'failed'].includes(ticket.stage)) {
+    return el('span', { class: 'row-actions' }, el('button', { class: 'btn', type: 'button',
+      onclick: () => void resolveTicket(ticket, 'retry') }, text('重试任务')))
+  }
+  if (ticket.stage !== 'person/confirm') return null
+  const wrap = el('span', { class: 'row-actions' })
+  for (const [resolution, label, style] of [['confirm', '确认', 'primary'], ['reject', '拒绝', 'danger']]) {
+    wrap.append(el('button', { class: 'btn ' + style, type: 'button', onclick: () => {
+      if (window.confirm(label + '任务 ' + shortId(ticket.id) + '？\n' + (ticket.pendingConfirm?.text ?? ''))) {
+        void resolveTicket(ticket, resolution)
+      }
+    } }, text(label)))
+  }
   return wrap
 }
 
-function answerAction(t) {
-  return el('button', { class: 'btn', type: 'button', onclick: () => void (async () => {
-    const message = window.prompt(t.question?.text ?? '回复')?.trim()
-    if (!message) return
-    await api('tickets/resolve', { method: 'POST', body: { ticketId: t.id, resolution: 'answer', message, requestId: t.deferred?.requestId } })
-    await refresh()
-  })().catch(showError) }, text('回复'))
+function lazyTicketDetails(ticket) {
+  const content = el('div')
+  const details = el('details', { 'data-ticket-details': '' },
+    el('summary', {}, text(ticket.report ? '查看报告与详情' : '查看详情')), content)
+  let loadedDetail = false
+  let loadingDetail = false
+  async function loadDetail() {
+    if (loadedDetail || loadingDetail) return
+    loadingDetail = true
+    content.replaceChildren(el('p', { role: 'status', class: 'quiet' }, text('正在读取详情…')))
+    try {
+      const detail = await api('tickets/detail?ticketId=' + encodeURIComponent(ticket.id))
+      content.replaceChildren(ticketDetails(detail))
+      loadedDetail = true
+    } catch (error) {
+      content.replaceChildren(el('p', { role: 'alert' }, text('无法读取任务详情：' + error.message)),
+        el('button', { type: 'button', class: 'btn', onclick: loadDetail }, text('重试')))
+    } finally {
+      loadingDetail = false
+    }
+  }
+  details.addEventListener('toggle', () => {
+    if (details.open) {
+      openDetails.add(ticket.id)
+      void loadDetail()
+    } else {
+      openDetails.delete(ticket.id)
+    }
+  })
+  if (openDetails.has(ticket.id)) details.open = true
+  return details
 }
 
-function ticketRow(t, { actions } = {}) {
-  const row = el('div', { class: 'ticket-row' })
-  const head = el('div', { class: 'ticket-head' })
-  head.append(el('span', { class: 'owner-label' }, text(t.ownerLabel ?? t.owner)))
-  head.append(el('span', { class: 'message', title: esc(t.message ?? '') }, text(t.message ?? '(无原文)')))
+function ticketRow(t) {
+  const row = el('article', { class: 'ticket-row', id: 'ticket-' + t.id, tabindex: '-1', 'data-stage': t.stage })
+  const head = el('div', { class: 'ticket-head' },
+    el('span', { class: 'owner-label' }, text(t.ownerLabel ?? t.owner)),
+    el('span', { class: 'badge' }, text(t.stageText ?? t.stage)),
+    el('time', {}, text(fmtTime(t.updatedAt))))
   if (t.recoveryPending) head.append(el('span', { class: 'badge' }, text('恢复中')))
-  head.append(el('time', {}, text(fmtTime(t.updatedAt))))
-  if (actions) head.append(actions)
-  row.append(head)
-  if (t.pendingConfirm && t.stage === 'person/confirm') row.append(el('div', { class: 'pending-confirm' }, text('待确认：' + t.pendingConfirm.text)))
-  if (t.question && t.stage === 'person/answer') row.append(el('div', { class: 'pending-confirm' }, text('等您回复：' + t.question.text)))
+  row.append(head, el('div', { class: 'message' }, text(t.message ?? '(无原文)')))
+  const prompt = t.stage === 'person/answer' ? t.question?.text : t.stage === 'person/confirm' ? t.pendingConfirm?.text : null
+  if (prompt) row.append(el('p', { class: 'pending-confirm' }, text(prompt)))
+  if (t.attentionReason) row.append(el('p', { class: 'warn-text small' }, text(t.attentionReason)))
+  if (t.report && t.stage === 'person/review') row.append(el('p', { class: 'report-preview' }, text(t.report.summary)))
   if (t.deferred?.status === 'pending') {
     const target = t.deferred.target?.sessionId
     row.append(el('p', { class: 'quiet small' }, text('截止时间 ' + fmtTime(t.deferred.expiresAt) + (target ? ' · 目标会话 ' + target : ''))))
   }
-  const answerDelivery = t.deferred?.delivery
-  const answerStates = { queued: '答复待接管', sent: '答复已接管', failed: '答复投递失败', discarded: '已丢弃答复投递' }
-  if (answerStates[answerDelivery?.state] || t.deferred?.reason) {
-    const result = [answerStates[answerDelivery?.state], answerDelivery?.reason ?? t.deferred?.reason].filter(Boolean).join(' · ')
-    row.append(el('p', { class: 'quiet small' }, text(result)))
+  const delivery = t.deferred?.delivery
+  const deliveryLabels = { queued: '答复待接管', sent: '答复已接管', failed: '答复投递失败', discarded: '已丢弃答复投递' }
+  if (deliveryLabels[delivery?.state] || t.deferred?.reason) {
+    row.append(el('p', { class: 'quiet small' }, text([deliveryLabels[delivery?.state], delivery?.reason ?? t.deferred?.reason].filter(Boolean).join(' · '))))
   }
-  row.append(el('details', {}, el('summary', {}, text('详情')), ticketDetails(t)))
+  const actions = ticketActions(t)
+  if (actions) row.append(actions)
+  const session = ['person/review', 'blocked', 'failed'].includes(t.stage) ? ownerSessionLink(t.owner, t.ownerSessionId) : null
+  if (session) row.append(session)
+  row.append(lazyTicketDetails(t))
   return row
 }
 
-function renderBoard(overview) {
-  renderHealth(overview.health ?? {})
-  const tickets = overview.tickets ?? []
-
-  // Q1 有需要我的吗: person/* + blocked/failed — 每行直接给出它需要的动作
-  const needs = tickets.filter(t => NEEDS_ME.has(t.stage))
-  const needBox = $('#needs-me')
-  needBox.replaceChildren()
-  if (!needs.length) needBox.append(el('p', { class: 'quiet' }, text('没有 — 安静默认。')))
-  for (const t of needs) {
-    needBox.append(ticketRow(t, { actions: t.stage === 'person/confirm' ? confirmActions(t)
-      : t.stage === 'person/answer' ? answerAction(t) : undefined }))
-  }
-
-  // Q2 什么状态: 按阶段分组, 组头计数 = 列表长度 (诚实状态)
-  const groups = $('#by-stage')
-  groups.replaceChildren()
-  for (const stage of STAGE_ORDER) {
-    const list = tickets.filter(t => t.stage === stage)
-    if (!list.length) continue
-    const text0 = list[0].stageText ?? stage
-    const group = el('section', { class: 'stage-group' })
-    group.append(el('h3', {}, text(text0 + ' '), el('span', { class: 'count' }, text(String(list.length)))))
-    for (const t of list) {
-      const row = ticketRow(t, { actions: t.stage === 'person/confirm' ? confirmActions(t) : undefined })
-      row.id = 'ticket-' + t.id
-      group.append(row)
+function renderStageGroups(box, stages, byStage, empty) {
+  box.replaceChildren()
+  for (const stage of stages) {
+    const rows = byStage.get(stage) ?? []
+    if (!rows.length) continue
+    const group = el('section', { class: 'stage-group' }, el('h4', {}, text((rows[0].stageText ?? stage) + ' '),
+      el('span', { class: 'count' }, text(rows.length))))
+    let offset = 0
+    const more = el('button', { class: 'btn', type: 'button', onclick: appendPage })
+    function appendPage() {
+      const page = rows.slice(offset, offset + TICKET_PAGE_SIZE)
+      for (const ticket of page) {
+        const pinned = $('#focused-ticket')
+        if (pinned?.firstElementChild?.id === 'ticket-' + ticket.id) pinned.remove()
+        group.insertBefore(ticketRow(ticket), more)
+      }
+      offset += page.length
+      more.hidden = offset >= rows.length
+      more.textContent = '显示更多（剩余 ' + (rows.length - offset) + '）'
     }
-    groups.append(group)
+    group.append(more)
+    appendPage()
+    box.append(group)
   }
-  if (!groups.children.length) groups.append(el('p', { class: 'quiet' }, text('还没有任务。')))
-
-  // Q3 结果在哪: 等验收票的产物与目录清单
-  const review = tickets.filter(t => t.stage === 'person/review')
-  const outBox = $('#outcomes')
-  outBox.replaceChildren()
-  if (!review.length) outBox.append(el('p', { class: 'quiet' }, text('没有等验收的任务。')))
-  for (const t of review) outBox.append(ticketRow(t))
-
-  // 负责人注册表（观测面）：每个 owner 一行——身份/工作区/会话绑定/状态
-  const ownerBox = $('#owners')
-  ownerBox.replaceChildren()
-  const owners = overview.owners ?? []
-  if (!owners.length) {
-    ownerBox.append(el('p', { class: 'quiet' }, text('暂无负责人。')))
-  } else {
-    const table = el('table', { class: 'data-table' })
-    table.append(el('tr', {},
-      el('th', {}, text('负责人')), el('th', {}, text('工作区')), el('th', {}, text('会话')), el('th', {}, text('状态'))))
-    for (const o of owners) {
-      const label = o.role === 'chief' ? '总管 (L1)' : (o.workspace ?? o.id)
-      const kindText = o.transient ? '临时' : (o.kind === 'repo' ? '仓库' : o.kind)
-      table.append(el('tr', { class: o.recycled ? 'quiet' : '' },
-        el('td', {}, text(label), el('span', { class: 'quiet small' }, text(' · ' + kindText))),
-        el('td', { class: 'quiet small', title: o.cwd ?? '' }, text(o.cwd ?? '—')),
-        el('td', { class: 'quiet small' }, text(o.sessionId ? shortId(o.sessionId) + '…' : '未绑定')),
-        el('td', {}, text(o.recycled ? '已回收' : (o.status ?? '—')))))
-    }
-    ownerBox.append(table)
-  }
-
-  // 投喂口径（只读观测面）：飞书入口与负责人路由各自生效的受理口径/去重/队列状态
-  renderTimers(overview.timers, owners)
-  renderIntake(overview.intake)
-
-  // 最近触发（观测面）：渠道消息与处置——直读 trigger 表，异步加载不阻塞三问
-  const trigBox = $('#triggers')
-  trigBox.replaceChildren(el('p', { class: 'quiet small' }, text('加载中…')))
-  api('triggers?limit=15').then(({ triggers }) => {
-    trigBox.replaceChildren()
-    if (!triggers?.length) { trigBox.append(el('p', { class: 'quiet' }, text('暂无触发记录。'))); return }
-    const table = el('table', { class: 'data-table' })
-    table.append(el('tr', {},
-      el('th', {}, text('时间')), el('th', {}, text('渠道')), el('th', {}, text('内容')), el('th', {}, text('处置'))))
-    for (const t of triggers) {
-      const msg = String(t.message ?? '').replace(/\s+/g, ' ')
-      const message = el('td', { class: 'small', title: msg }, text(msg.length > 40 ? msg.slice(0, 40) + '…' : msg))
-      if (t.intakeCohort) message.append(renderCohort(t))
-      const ticket = tickets.find(ticket => ticket.trigger?.id === t.id)
-      const accepted = t.injectedAt || ticket?.lastDelivery?.state === 'sent'
-      table.append(el('tr', {},
-        el('td', { class: 'quiet small' }, text(fmtTime(t.at))),
-        el('td', { class: 'quiet small' }, text(t.kind ?? '—')),
-        message,
-        el('td', { class: 'quiet small' }, text(t.dropped ? '已丢弃' : accepted ? '已接管' : t.intakeDiscarded ? '已丢弃投递' : '已记录'))))
-    }
-    trigBox.append(table)
-  }).catch(() => trigBox.replaceChildren(el('p', { class: 'quiet small' }, text('触发记录加载失败。'))))
+  if (!box.childElementCount) box.append(el('p', { class: 'quiet' }, text(empty)))
 }
 
-function renderCohort(trigger) {
+const OWNER_SWITCH_STATES = {
+  waiting: '等待原会话空闲', preparing: '正在准备新会话', committed: '新会话已接管，等待归档',
+  'archive-failed': '旧会话归档失败', completed: '更换完成', failed: '更换失败', cancelled: '已取消更换',
+}
+
+function ownerSwitchControls(owner, operation) {
+  const controls = el('div', { class: 'run-filters' })
+  const busy = operation && ['waiting', 'preparing', 'committed', 'archive-failed'].includes(operation.status)
+  const actionButton = (label, request) => {
+    const button = el('button', { class: 'btn', type: 'button' }, text(label))
+    button.addEventListener('click', async () => {
+      if (request.mode === 'stop' && !window.confirm('确认停止原负责人会话当前处理，等它空闲后更换？')) return
+      const buttons = [...controls.querySelectorAll('button')]
+      for (const item of buttons) item.disabled = true
+      try {
+        await api('owners/switch', { method: 'POST', body: { ownerId: owner.id, ...request } })
+        await refresh()
+      } catch (error) { showError(error) }
+      finally { for (const item of buttons) item.disabled = false }
+    })
+    return button
+  }
+  if (owner.sessionId && !owner.recycled && !busy) {
+    const request = { action: 'request', expectedSessionId: owner.sessionId }
+    controls.append(actionButton('空闲后更换', { ...request, mode: 'wait' }), actionButton('停止后更换', { ...request, mode: 'stop' }))
+  }
+  if (operation) {
+    const { operationId, status } = operation
+    controls.append(el('span', { role: 'status', class: 'quiet small' }, text(OWNER_SWITCH_STATES[status] ?? status)))
+    if (operation.reason) controls.append(el('span', { role: 'alert' }, text(operation.reason)))
+    if (status === 'waiting') controls.append(actionButton('取消等待', { action: 'cancel', operationId }))
+    if (status === 'archive-failed') controls.append(actionButton('重试归档', { action: 'retry-archive', operationId }))
+    if (operation.committedAt) {
+      const query = new URLSearchParams({ hubBotOwner: owner.id, hubBotSwitch: operationId })
+      controls.append(el('a', { class: 'btn', href: '/?' + query, target: '_blank', rel: 'noopener noreferrer' }, text('打开原会话')))
+    }
+  }
+  return controls.childElementCount ? controls : null
+}
+
+function renderOwners(owners, switches) {
+  const ownerBox = $('#owners')
+  ownerBox.replaceChildren()
+  if (!owners.length) ownerBox.append(el('p', { class: 'quiet' }, text('暂无负责人。')))
+  for (const owner of owners) {
+    const label = owner.role === 'chief' ? '总管 (L1)' : (owner.workspace ?? owner.id)
+    const status = owner.recycled ? '已回收' : owner.sessionId ? null : '未绑定'
+    const entry = el('article', { class: 'owner-entry', 'data-owner-id': owner.id }, el('strong', {}, text(label)))
+    if (status) entry.append(el('span', { class: 'quiet small' }, text(status)))
+    const session = ownerSessionLink(owner.id, owner.sessionId)
+    if (session) entry.append(session)
+    const controls = ownerSwitchControls(owner, switches.get(owner.id))
+    if (controls) entry.append(controls)
+    ownerBox.append(entry)
+  }
+}
+
+function renderBoard(overview) {
+  const health = overview.health ?? {}
+  renderHealth(health)
+  renderConnectionStatus(health)
+  const tickets = overview.tickets ?? []
+  const owners = overview.owners ?? []
+  const timers = overview.timers ?? []
+  const nextBoardKey = JSON.stringify(tickets)
+  if (boardKey !== nextBoardKey) {
+    boardKey = nextBoardKey
+    ticketIndex = new Map(tickets.map(ticket => [ticket.id, ticket]))
+    const byStage = new Map()
+    for (const ticket of tickets) {
+      const group = byStage.get(ticket.stage) ?? []
+      group.push(ticket)
+      byStage.set(ticket.stage, group)
+    }
+    renderStageGroups($('#needs-me'), NEEDS_ME, byStage, '暂无待处理事项。')
+    renderStageGroups($('#by-stage'), PROGRESS, byStage, '暂无进行中或排队的任务。')
+    if ($('#ticket-history').open) renderHistory(byStage)
+    const outcomes = $('#outcomes')
+    const results = tickets.filter(ticket => ticket.report)
+      .sort((a, b) => String(b.report.at ?? b.updatedAt ?? '').localeCompare(String(a.report.at ?? a.updatedAt ?? '')))
+      .slice(0, 12)
+    outcomes.replaceChildren()
+    for (const ticket of results) outcomes.append(el('p', { class: 'result-line' },
+      el('a', { href: '#ticket-' + encodeURIComponent(ticket.id) }, text(ticket.report.summary || ticket.message || ticket.id)),
+      el('span', { class: 'quiet small' }, text(ticket.ownerLabel ?? ticket.owner))))
+    if (!results.length) outcomes.append(el('p', { class: 'quiet' }, text('暂无结果。')))
+    $('#focused-ticket')?.remove()
+    if (focusedTicket) revealTicket(focusedTicket, false)
+  }
+  const switches = overview.ownerSwitches ?? []
+  const nextOwnerKey = JSON.stringify([owners, switches])
+  if (ownerKey !== nextOwnerKey) {
+    ownerKey = nextOwnerKey
+    renderOwners(owners, new Map(switches.map(operation => [operation.ownerId, operation])))
+  }
+  const nextTimerKey = JSON.stringify([timers, owners])
+  if (timerKey !== nextTimerKey) {
+    timerKey = nextTimerKey
+    renderTimers(timers, owners)
+    const next = timers.filter(timer => timer.status === 'pending' && timer.fireAt)
+      .sort((a, b) => a.fireAt.localeCompare(b.fireAt))[0]
+    $('#next-wake').replaceChildren(el('p', { class: 'quiet' }, text(next
+      ? next.message + ' · ' + fmtTime(next.fireAt) : '暂无计划中的提醒。')),
+      el('a', { href: '#timers-page' }, text('管理提醒')))
+  }
+  const nextIntakeKey = JSON.stringify(overview.intake?.sources)
+  if (intakeKey !== nextIntakeKey) { intakeKey = nextIntakeKey; renderIntake(overview.intake) }
+}
+
+function renderHistory(byStage) {
+  if (!byStage) {
+    byStage = new Map()
+    for (const ticket of ticketIndex.values()) {
+      const group = byStage.get(ticket.stage) ?? []
+      group.push(ticket)
+      byStage.set(ticket.stage, group)
+    }
+  }
+  const stages = [...byStage.keys()].filter(stage => !NEEDS_ME.includes(stage) && !PROGRESS.includes(stage))
+  renderStageGroups($('#history-tickets'), stages, byStage, '暂无任务历史。')
+}
+
+function revealTicket(id, moveFocus) {
+  let row = document.getElementById('ticket-' + id)
+  if (!row) {
+    const ticket = ticketIndex.get(id)
+    if (!ticket) {
+      if (moveFocus) showError(new Error('找不到工单 ' + id))
+      return
+    }
+    const history = $('#ticket-history')
+    history.open = true
+    const pinned = $('#focused-ticket')
+    row = ticketRow(ticket)
+    const entry = el('div', { id: 'focused-ticket' }, row)
+    if (pinned) pinned.replaceWith(entry)
+    else history.append(entry)
+  }
+  const history = row.closest('#ticket-history')
+  if (history) history.open = true
+  row.querySelector('details[data-ticket-details]').open = true
+  if (moveFocus) {
+    row.focus({ preventScroll: true })
+    row.scrollIntoView({ block: 'center' })
+  }
+}
+
+
+async function refreshRecentTriggers() {
+  const box = $('#triggers')
+  try {
+    const { triggers } = await api('triggers?limit=15')
+    const acceptedIds = new Set()
+    for (const ticket of ticketIndex.values()) {
+      if (ticket.trigger && ticket.lastDelivery?.state === 'sent') acceptedIds.add(ticket.trigger.id)
+    }
+    const nextKey = JSON.stringify(triggers.map(row => [row.id, row.injectedAt, row.dropped, row.intakeCohort, row.intakeDiscarded, acceptedIds.has(row.id)]))
+    if (recentKey === nextKey) return
+    recentKey = nextKey
+    box.replaceChildren()
+    if (!triggers.length) box.append(el('p', { class: 'quiet' }, text('暂无触发记录。')))
+    for (const trigger of triggers) {
+      const msg = String(trigger.message ?? trigger.title ?? '').replace(/\s+/g, ' ')
+      const disposition = trigger.dropped ? '已丢弃' : trigger.injectedAt || acceptedIds.has(trigger.id) ? '已接管'
+        : trigger.intakeDiscarded ? '已丢弃投递' : '已记录'
+      const row = el('article', { class: 'event-entry' },
+        el('div', { class: 'quiet small' }, text([trigger.kind, disposition, fmtTime(trigger.at)].filter(Boolean).join(' · '))),
+        el('div', {}, text(msg.length > 100 ? msg.slice(0, 100) + '…' : msg)))
+      row.append(renderTriggerDetail(trigger))
+      box.append(row)
+    }
+  } catch (error) {
+    if (error.message === 'unauthorized') return
+    recentKey = null
+    box.replaceChildren(el('p', { role: 'alert' }, text('触发记录加载失败：' + error.message)),
+      el('button', { class: 'btn', type: 'button', onclick: refreshRecentTriggers }, text('重试')))
+  }
+}
+
+function renderTriggerDetail(trigger) {
   const content = el('div', { class: 'quiet small' })
-  const details = el('details', {}, el('summary', {}, text('合并来信 · ' + trigger.intakeCohort.mergedCount)), content)
+  const caption = trigger.intakeCohort ? '合并来信 · ' + trigger.intakeCohort.mergedCount : '查看原文及回复'
+  const details = el('details', {}, el('summary', {}, text(caption)), content)
   details.addEventListener('toggle', async () => {
     if (!details.open) return
     content.replaceChildren(text('加载中…'))
     try {
       const detail = await api('triggers/detail?triggerId=' + encodeURIComponent(trigger.id))
+      content.replaceChildren(detailRow('原文', detail.message ?? '—'))
+      if (detail.reply) content.append(detailRow('回复 · ' + (QUEUE_TEXT[detail.reply.state] ?? detail.reply.state), detail.reply.text))
+      if (detail.dropped) content.append(detailRow('丢弃原因', detail.dropped))
+      if (detail.replyUnlinked) content.append(el('p', {}, text('回复未关联')))
       const entries = detail.intake?.cohort?.messages ?? []
-      const list = el('ul', {}, ...entries.map(item => el('li', {}, text([item.triggerId, item.message, ...item.ticketIds].filter(Boolean).join(' · ')))))
-      content.replaceChildren(list)
+      if (entries.length) content.append(el('ul', {}, ...entries.map(item => el('li', {},
+        text([item.triggerId, item.message, ...item.ticketIds].filter(Boolean).join(' · '))))))
     } catch (error) {
-      content.replaceChildren(text(error.message))
+      content.replaceChildren(el('p', { role: 'alert' }, text('无法读取触发详情：' + error.message)))
     }
   })
   return details
@@ -273,10 +486,7 @@ function renderCohort(trigger) {
 
 function renderTimers(timers, owners) {
   const box = $('#timers')
-  const available = Array.isArray(timers)
-  $('#timers-title').hidden = !available
   box.replaceChildren()
-  if (!available) return
   if (!timers.length) box.append(el('p', { class: 'quiet' }, text('暂无提醒。')))
   const states = { pending: '待触发', paused: '已暂停', firing: '正在提交', fired: '已建任务', cancelled: '已取消', failed: '失败' }
   for (const timer of timers) {
@@ -432,7 +642,7 @@ function saveBar(section, collect) {
       save.disabled = false
     }
   })
-  cancel.addEventListener('click', () => void refresh())
+  cancel.addEventListener('click', () => void refresh({ reloadSettings: true }).catch(showError))
   bar.append(save, cancel)
   return bar
 }
@@ -450,7 +660,7 @@ function listField(value) {
 const readList = area => area.value.split('\n').map(s => s.trim()).filter(Boolean)
 
 function renderSettings(view) {
-  const page = $('#settings')
+  const page = $('#settings-content')
   page.replaceChildren()
 
   // 总管模型（用户可配）：目录来自 models/catalog；null = 跟随部署默认。改选即时对 L1 会话生效。
@@ -496,6 +706,68 @@ function renderSettings(view) {
     })
   }).catch(error => { mHint.textContent = '模型目录加载失败：' + String(error?.message ?? error) })
   page.append(mSection)
+
+  // GitHub
+  const github = view.github ?? {}
+  const gSection = el('section', { class: 'setting-block' })
+  gSection.append(el('h3', {}, text('GitHub')))
+  const gEnabled = el('input', { type: 'checkbox' })
+  gEnabled.checked = github.enabled === true
+  const gInterval = el('input', { type: 'number', min: '30', step: '1', style: 'width:7em' })
+  gInterval.value = String(Math.round((github.intervalMs ?? 300000) / 1000))
+  const gList = listField(github.loginAllowlist)
+  gSection.append(el('label', { class: 'inline' }, gEnabled, text(' 轮询监听')))
+  gSection.append(el('label', {}, text('轮询间隔（秒，最小 30）')), gInterval)
+  gSection.append(el('label', {}, text('login 白名单（每行一个；空 = 启动时解析为本人）')), gList)
+  const gBar = saveBar('github', () => ({
+    enabled: gEnabled.checked,
+    intervalMs: Number(gInterval.value) * 1000,
+    loginAllowlist: readList(gList),
+  }))
+  gSection.append(gBar)
+  watchDirty(gBar, gEnabled, gInterval, gList)
+  page.append(gSection)
+
+  // 并发
+  const cSection = el('section', { class: 'setting-block' })
+  cSection.append(el('h3', {}, text('并发')))
+  const slots = el('input', { type: 'number', min: '1', step: '1', style: 'width:5em' })
+  slots.value = String(view.concurrency?.slotsPerOwner ?? 3)
+  cSection.append(el('label', {}, text('每负责人执行槽（working 上限）')), slots)
+  const cBar = saveBar('concurrency', () => ({ slotsPerOwner: Number(slots.value) }))
+  cSection.append(cBar)
+  watchDirty(cBar, slots)
+  page.append(cSection)
+
+  // 安全 (危险命令黑名单 — 命中转确认, spec「Policy」安全兜底)
+  const secSection = el('section', { class: 'setting-block' })
+  secSection.append(el('h3', {}, text('安全')))
+  secSection.append(el('p', { class: 'status-line' }, text('命中黑名单的注入不直接执行：票转等您确认，确认后才注入（在总览确认）。留空 = 关闭兜底。')))
+  const secList = listField(view.security?.dangerousPatterns)
+  secSection.append(el('label', {}, text('危险命令黑名单（每行一个模式，大小写不敏感子串匹配）')), secList)
+  const secBar = saveBar('security', () => ({ dangerousPatterns: readList(secList) }))
+  secSection.append(secBar)
+  watchDirty(secBar, secList)
+  page.append(secSection)
+
+  // 汇报
+  const rSection = el('section', { class: 'setting-block' })
+  rSection.append(el('h3', {}, text('定时汇报')))
+  const rAuto = el('input', { type: 'checkbox' })
+  rAuto.checked = view.reporting?.auto === true
+  const rInterval = el('input', { type: 'number', min: '1', step: '1', style: 'width:7em' })
+  rInterval.value = String(Math.round((view.reporting?.intervalMs ?? 60000) / 1000))
+  rSection.append(el('label', { class: 'inline' }, rAuto, text(' 定时汇总自动汇报')))
+  rSection.append(el('label', {}, text('间隔（秒）')), rInterval)
+  const rBar = saveBar('reporting', () => ({ auto: rAuto.checked, intervalMs: Number(rInterval.value) * 1000 }))
+  rSection.append(rBar)
+  watchDirty(rBar, rAuto, rInterval)
+  page.append(rSection)
+}
+
+function renderConnections(view) {
+  const page = $('#connection-content')
+  page.replaceChildren()
 
   // 飞书 bot 管理块（唯一总 bot）：三态——已绑定（名片+连接+权限，二维码收起）/ 未绑定（预告+权限+扫码）/ 失效。
   const feishu = view.feishu ?? {}
@@ -577,7 +849,7 @@ function renderSettings(view) {
     scanBtn.addEventListener('click', async () => {
       if (bound && !confirm('重新注册会创建新应用并覆盖现有凭据，当前绑定即失效。继续？')) return
       scanBtn.disabled = true
-      try { await api('feishu/register', { method: 'POST', body: {} }); setTimeout(() => void refresh(), 2000) }
+      try { await api('feishu/register', { method: 'POST', body: {} }); setTimeout(() => void refresh().catch(showError), 2000) }
       catch (error) { showError(error); scanBtn.disabled = false }
     })
     fSection.append(scanBtn)
@@ -585,18 +857,11 @@ function renderSettings(view) {
     page.append(fSection)
   }
 
-  // GitHub
   const github = view.github ?? {}
-  const gSection = el('section', { class: 'setting-block' })
-  gSection.append(el('h3', {}, text('GitHub')))
-  const gEnabled = el('input', { type: 'checkbox' })
-  gEnabled.checked = github.enabled === true
-  const gInterval = el('input', { type: 'number', min: '30', step: '1', style: 'width:7em' })
-  gInterval.value = String(Math.round((github.intervalMs ?? 300000) / 1000))
-  const gList = listField(github.loginAllowlist)
-  gSection.append(el('label', { class: 'inline' }, gEnabled, text(' 轮询监听')))
-  gSection.append(el('label', {}, text('轮询间隔（秒，最小 30）')), gInterval)
-  gSection.append(el('label', {}, text('login 白名单（每行一个；空 = 启动时解析为本人）')), gList)
+  const gSection = el('section', { class: 'setting-block' }, el('h3', {}, text('GitHub')))
+  if (!github.enabled) gSection.append(el('p', { class: 'status-line' }, text('GitHub 入口已关闭。')))
+  if (github.status?.lastPollError) gSection.append(el('p', { role: 'alert', class: 'warn-text' },
+    text('最近轮询失败：' + github.status.lastPollError)))
   // 监听清单跟随 owner 注册表（只读）：注册了 repo 负责人即自动监听其 origin 仓库，无需在此配置。
   const followed = github.followed ?? []
   if (followed.length) {
@@ -609,106 +874,165 @@ function renderSettings(view) {
   }
   const resolveErrors = Object.entries(github.resolveErrors ?? {})
   if (resolveErrors.length) gSection.append(el('p', { class: 'hint' }, text('解析失败：' + resolveErrors.map(([k, v]) => k + ' ' + v).join('；'))))
-  const gBar = saveBar('github', () => ({
-    enabled: gEnabled.checked,
-    intervalMs: Number(gInterval.value) * 1000,
-    loginAllowlist: readList(gList),
-  }))
-  gSection.append(gBar)
-  watchDirty(gBar, gEnabled, gInterval, gList)
   page.append(gSection)
-
-  // 并发
-  const cSection = el('section', { class: 'setting-block' })
-  cSection.append(el('h3', {}, text('并发')))
-  const slots = el('input', { type: 'number', min: '1', step: '1', style: 'width:5em' })
-  slots.value = String(view.concurrency?.slotsPerOwner ?? 3)
-  cSection.append(el('label', {}, text('每负责人执行槽（working 上限）')), slots)
-  const cBar = saveBar('concurrency', () => ({ slotsPerOwner: Number(slots.value) }))
-  cSection.append(cBar)
-  watchDirty(cBar, slots)
-  page.append(cSection)
-
-  // 安全 (危险命令黑名单 — 命中转确认, spec「Policy」安全兜底)
-  const secSection = el('section', { class: 'setting-block' })
-  secSection.append(el('h3', {}, text('安全')))
-  secSection.append(el('p', { class: 'status-line' }, text('命中黑名单的注入不直接执行：票转等您确认，确认后才注入（三问页可裁决）。留空 = 关闭兜底。')))
-  const secList = listField(view.security?.dangerousPatterns)
-  secSection.append(el('label', {}, text('危险命令黑名单（每行一个模式，大小写不敏感子串匹配）')), secList)
-  const secBar = saveBar('security', () => ({ dangerousPatterns: readList(secList) }))
-  secSection.append(secBar)
-  watchDirty(secBar, secList)
-  page.append(secSection)
-
-  // 汇报
-  const rSection = el('section', { class: 'setting-block' })
-  rSection.append(el('h3', {}, text('定时汇报')))
-  const rAuto = el('input', { type: 'checkbox' })
-  rAuto.checked = view.reporting?.auto === true
-  const rInterval = el('input', { type: 'number', min: '1', step: '1', style: 'width:7em' })
-  rInterval.value = String(Math.round((view.reporting?.intervalMs ?? 60000) / 1000))
-  rSection.append(el('label', { class: 'inline' }, rAuto, text(' 定时汇总自动汇报')))
-  rSection.append(el('label', {}, text('间隔（秒）')), rInterval)
-  const rBar = saveBar('reporting', () => ({ auto: rAuto.checked, intervalMs: Number(rInterval.value) * 1000 }))
-  rSection.append(rBar)
-  watchDirty(rBar, rAuto, rInterval)
-  page.append(rSection)
 }
 
-$('#run-history').addEventListener('toggle', () => { if ($('#run-history').open) void loadRuns() })
+$('#ticket-history').addEventListener('toggle', event => {
+  if (event.target === event.currentTarget && event.currentTarget.open) renderHistory()
+})
 for (const id of ['run-status', 'run-source']) $('#' + id).addEventListener('change', () => void loadRuns())
 $('#run-refresh').addEventListener('click', () => void loadRuns())
+$('#notification-form').addEventListener('submit', async event => {
+  event.preventDefault()
+  const form = event.currentTarget
+  const input = $('#notification-id')
+  const id = input.value.trim()
+  if (!id) return
+  const button = form.querySelector('button[type=submit]')
+  const result = $('#notification-index')
+  button.disabled = true
+  result.replaceChildren(el('p', { role: 'status' }, text('正在读取通知索引…')))
+  try {
+    const detail = await api('notifications/detail?id=' + encodeURIComponent(id))
+    const entries = detail.tickets.map(ticket => el('li', {},
+      el('a', { href: '#ticket-' + encodeURIComponent(ticket.ticketId), style: 'display:block;overflow-wrap:anywhere' }, text('查看工单 ' + ticket.ticketId))))
+    result.replaceChildren(el('ul', {}, ...entries))
+  } catch (error) {
+    result.replaceChildren(el('p', { role: 'alert' }, text(error.message)))
+  } finally { button.disabled = false }
+})
 
 /* ---------- boot ---------- */
-function showError(error) {
-  const bar = el('div', { class: 'toast error' }, text(String(error?.message ?? error)))
+const pages = [...document.querySelectorAll('.page')]
+const navigation = [...document.querySelectorAll('[data-page]')]
+let settingsKey = null
+let connectionKey = null
+
+function showNotice(message, kind = 'status') {
+  const bar = el('div', { class: 'toast' + (kind === 'alert' ? ' error' : ''), role: kind }, text(message))
   document.body.append(bar)
   setTimeout(() => bar.remove(), 6000)
 }
 
+function showError(error) {
+  if (error?.message !== 'unauthorized') showNotice(String(error?.message ?? error), 'alert')
+}
+
 function showTokenGate(message) {
+  loaded = false
+  activePage = null
+  focusedTicket = null
+  boardKey = ownerKey = timerKey = intakeKey = recentKey = settingsKey = connectionKey = null
+  ticketIndex.clear()
+  openDetails.clear()
   $('#token-gate').hidden = false
-  $('#board').hidden = true
-  $('#settings').hidden = true
+  $('#navigation').hidden = true
+  $('#connection-status').hidden = true
+  $('#load-state').hidden = true
+  $('#refreshed').textContent = ''
+  for (const page of pages) page.hidden = true
+  for (const id of ['needs-me', 'by-stage', 'outcomes', 'owners', 'next-wake', 'history-tickets', 'timers',
+    'health', 'intake', 'triggers', 'run-list', 'connection-content', 'settings-content']) $('#' + id).replaceChildren()
+  $('#focused-ticket')?.remove()
   const err = $('#token-error')
   err.hidden = !message
-  if (message) err.textContent = message
+  err.textContent = message ?? ''
 }
 
-async function refresh() {
-  const [overview, settings] = await Promise.all([api('overview'), api('settings')])
-  renderBoard(overview)
-  renderSettings(settings)
-  $('#refreshed').textContent = '刷新于 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false })
+function updatePage(focus = false) {
+  if (!loaded) return
+  let hash = location.hash.slice(1)
+  try { hash = decodeURIComponent(hash) } catch { /* use the literal fragment */ }
+  const ticketId = hash.startsWith('ticket-') ? hash.slice(7) : null
+  const next = navigation.some(tab => tab.dataset.page === hash) ? hash : 'board'
+  for (const page of pages) page.hidden = page.id !== next
+  for (const tab of navigation) {
+    tab.classList.toggle('is-active', tab.dataset.page === next)
+    if (tab.dataset.page === next) tab.setAttribute('aria-current', 'page')
+    else tab.removeAttribute('aria-current')
+  }
+  if (next === 'run-history' && next !== activePage) void loadRuns()
+  const changed = next !== activePage || ticketId !== focusedTicket
+  activePage = next
+  focusedTicket = ticketId
+  if (ticketId && changed) revealTicket(ticketId, true)
+  else if (focus && changed) window.scrollTo(0, 0)
 }
 
-async function boot() {
+function renderLoadState(message, failed = false) {
+  $('#load-state').hidden = !message
+  $('#load-message').textContent = message ?? ''
+  $('#load-message').setAttribute('role', failed ? 'alert' : 'status')
+  $('#retry-load').hidden = !failed
+}
+
+function refresh({ reloadSettings = false } = {}) {
+  if (reloadSettings) settingsKey = null
+  if (refreshRequest?.token === token) return refreshRequest.promise
+  const request = { token }
+  refreshRequest = request
+  request.promise = refreshPanel(request.token).finally(() => {
+    if (refreshRequest === request) refreshRequest = null
+  })
+  return request.promise
+}
+
+async function refreshPanel(requestToken) {
+  const [board, settings] = await Promise.allSettled([api('overview'), api('settings')])
+  if (!token || requestToken !== token) throw new Error('unauthorized')
+  if (board.status === 'fulfilled') {
+    renderBoard(board.value)
+    loaded = true
+    $('#navigation').hidden = false
+    $('#connection-status').hidden = false
+    updatePage()
+    $('#refreshed').textContent = '刷新于 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false })
+    void refreshRecentTriggers()
+  }
+  if (settings.status === 'fulfilled') {
+    const view = settings.value
+    const nextSettingsKey = JSON.stringify([view.chief, view.concurrency, view.security, view.reporting,
+      view.github?.enabled, view.github?.intervalMs, view.github?.loginAllowlist])
+    if (settingsKey !== nextSettingsKey) {
+      settingsKey = nextSettingsKey
+      renderSettings(view)
+    }
+    const nextConnectionKey = JSON.stringify([view.feishu, view.github?.enabled, view.github?.followed,
+      view.github?.resolveErrors, view.github?.status?.lastPollError])
+    if (connectionKey !== nextConnectionKey) {
+      connectionKey = nextConnectionKey
+      renderConnections(view)
+    }
+  }
+  const error = board.status === 'rejected' ? board.reason : settings.status === 'rejected' ? settings.reason : null
+  if (error) {
+    renderLoadState((loaded ? '刷新失败，页面保留上次数据：' : '加载失败：') + error.message, true)
+    throw error
+  }
+  renderLoadState()
+}
+
+function boot() {
   if (!token) { showTokenGate(); return }
   $('#token-gate').hidden = true
-  $('#board').hidden = false
-  $('#settings').hidden = true
-  try {
-    await refresh()
-  } catch (error) {
-    if (error.message !== 'unauthorized') showError(error)
-    return
-  }
-  setInterval(() => void refresh().catch(() => {}), REFRESH_MS)
+  renderLoadState('正在加载 Hub Bot…')
+  void refresh().catch(() => {})
 }
 
 $('#token-form').addEventListener('submit', event => {
   event.preventDefault()
-  token = $('#token-input').value.trim()
+  const input = $('#token-input')
+  token = input.value.trim()
+  if (!token) { showTokenGate('请输入管理 token。'); return }
+  input.value = ''
   sessionStorage.setItem('hub-bot-token', token)
-  void boot()
+  boot()
 })
-
-for (const tab of document.querySelectorAll('.tab')) {
-  tab.addEventListener('click', () => {
-    for (const other of document.querySelectorAll('.tab')) other.classList.toggle('is-active', other === tab)
-    $('#board').hidden = tab.dataset.tab !== 'board'
-    $('#settings').hidden = tab.dataset.tab !== 'settings'
-  })
-}
-
-void boot()
+$('#retry-load').addEventListener('click', () => void refresh().catch(() => {}))
+window.addEventListener('hashchange', () => updatePage(true))
+$('#board').addEventListener('click', event => {
+  const link = event.target.closest('a[href^="#ticket-"]')
+  if (link && location.hash === link.hash && focusedTicket) revealTicket(focusedTicket, true)
+})
+setInterval(() => { if (token) void refresh().catch(() => {}) }, REFRESH_MS)
+boot()

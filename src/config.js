@@ -14,7 +14,7 @@ import { DEFAULT_DANGEROUS_PATTERNS, validateDangerousPatterns } from './securit
 import { DEFAULT_FEISHU_CREDENTIAL_REF, isFeishuCredentialRef } from './feishu-credentials.js'
 
 /** The configuration keys this plugin understands. Anything else is rejected so typos cannot pass silently. */
-const KNOWN_KEYS = new Set(['stateDir', 'homeRepo', 'devApi', 'reporting', 'feishu', 'github', 'concurrency', 'security', 'deferred', 'chief', 'workspaces'])
+const KNOWN_KEYS = new Set(['stateDir', 'homeRepo', 'devApi', 'reporting', 'feishu', 'github', 'concurrency', 'security', 'deferred', 'notifications', 'chief', 'workspaces'])
 
 /** The keys the scheduled auto-summary understands (#67 定时汇总自动汇报 — OFF by default). */
 const KNOWN_REPORTING_KEYS = new Set(['auto', 'intervalMs'])
@@ -158,6 +158,18 @@ export function resolveConfig(config) {
     }
   }
   resolved.reporting = reporting
+  if (raw.notifications !== undefined) {
+    const notifications = raw.notifications
+    if (notifications === null || typeof notifications !== 'object' || Array.isArray(notifications)
+      || Object.keys(notifications).some(key => key !== 'windowMs')) {
+      throw new ConfigError('hub-bot config.notifications accepts only windowMs')
+    }
+    const { windowMs } = notifications
+    if (windowMs !== undefined && (!Number.isSafeInteger(windowMs) || windowMs <= 0)) {
+      throw new ConfigError('hub-bot config.notifications.windowMs must be a positive integer')
+    }
+    if (windowMs !== undefined) resolved.notifications = { windowMs }
+  }
   // 飞书入口 (#68): OFF unless explicitly enabled; the allowlist is the ONLY authorization boundary (spec「安全」).
   const feishu = { enabled: false }
   if (raw.feishu !== undefined) {

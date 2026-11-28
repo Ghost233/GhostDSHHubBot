@@ -33,7 +33,7 @@ import { resolveConfig } from './config.js'
 const PKG_VERSION = createRequire(import.meta.url)('../package.json').version
 import {
   SETTINGS_FILE, applySettingsOverlay, applySettingsPatch, loadSettingsOverlay, mergeSettingsOverlay,
-  saveSettingsOverlay, buildOverview, buildOutboxHealth, buildSettingsView, feishuSelfTestMarker, readMessageDetail,
+  saveSettingsOverlay, buildOverview, buildOutboxHealth, buildSettingsView, feishuSelfTestMarker, readMessageDetail, readTicketDetail,
 } from './panel.js'
 import { discardOutboxRows, retryOutboxRows } from './outbox.js'
 import { Store, SCHEMA_VERSION } from './store.js'
@@ -47,6 +47,8 @@ import { TimerService } from './timers.js'
 import { buildOwnerFacts, formatOwnerFacts, listOwnerFactIndex, readOwnerFactDetail } from './owner-facts.js'
 import { DeferredRegistry } from './deferred.js'
 import { SILENCE_REASONS } from './runs.js'
+import { OwnerSwitch } from './owner-switch.js'
+import { NotificationThrottle } from './notifications.js'
 
 export const name = 'hub-bot'
 export const inject = ['sessionController', 'sessionPersistence', 'webServer']
@@ -97,6 +99,9 @@ export const Config = z.object({
       'ask-user': z.number().description('用户问题的期限。'),
     }),
   }),
+  notifications: z.object({
+    windowMs: z.number().description('同一接收位置的普通结果通知间隔（毫秒，默认 60000）。'),
+  }).description('普通后台结果汇总。'),
   reporting: z.object({
     auto: z.boolean().description('定时汇总自动汇报开关（默认关）。'),
     intervalMs: z.number().description('汇总间隔毫秒（默认 60000）。'),
@@ -249,6 +254,56 @@ export function apply(ctx, rawConfig) {
   const placer = new WorkspacePlacer({ workspaceController: safeGetService(ctx, 'workspaceController'), homeRepo: config.homeRepo, workspaces: config.workspaces, logger: ctx.logger, registryList: () => safeGetService(ctx, 'workspaceRegistry')?.list?.() ?? [], archivedList: () => { try { return safeGetService(ctx, 'workspaceRegistry')?.archivedSessionIds ?? [] } catch { return [] } } })
   const hub = new Hub({ store, config, sessions, onSystemProblem: p => ctx.logger.warn('hub-bot system problem: %s (ticket %s, row %s)', p.reason, p.ticketId, p.rowId), placer })
   const chief = hub.registry.ensureChief({ cwd: config.homeRepo, workspace: basename(config.homeRepo) })
+  const ownerSwitch = new OwnerSwitch({
+    store, registry: hub.registry, now: hub.router.now,
+    withAdmission: (ownerId, work) => hub.router.withOwnerAdmission(ownerId, work),
+    buildFacts: ({ ownerId }) => formatOwnerFacts(buildOwnerFacts({ store, ownerId, isArchived: id => sessions.isArchived(id) })),
+    sessions: {
+      async status({ sessionId }) {
+        try {
+          const state = await sessionController.state({ sessionId }, deadline(5000))
+          const queued = state.queue?.some(entry => entry.placement === 'queued' || entry.placement === 'steering')
+          return state.running || queued || state.pendingInput?.length ? 'busy' : 'idle'
+        } catch (error) {
+          if (error?.code === 'session/not-found' || error?.name === 'ApiSessionNotFound') return 'missing'
+          throw error
+        }
+      },
+      async create({ owner, sessionId }) {
+        const ws = await (owner.role === 'chief' ? placer.chiefWorkspace() : placer.ownerWorkspace(owner))
+        const agentPreset = owner.role === 'chief' ? 'hub-bot-router' : 'hub-bot-owner'
+        const existing = await ctx.sessionPersistence.stat?.(sessionId, { signal: deadline(5000) })
+        if (existing) {
+          if (existing.header?.agentPreset !== agentPreset || existing.header?.cwd !== (ws?.path ?? owner.cwd)) {
+            throw new Error('Proposed owner session does not match its stored preset and workspace.')
+          }
+          return { sessionId, agentPreset }
+        }
+        return sessions.create({ ...(ws ? { workspaceId: ws.workspaceId } : { cwd: owner.cwd }), sessionId, agentPreset })
+      },
+      prompt: sessions.prompt,
+      cancel: sessions.cancel,
+      isArchived: sessions.isArchived,
+      async archive({ sessionId }) {
+        const controller = safeGetService(ctx, 'workspaceController')
+        if (!controller?.archiveSession) throw new Error('此 DSH 实例暂时无法归档会话。')
+        const result = await controller.archiveSession({ sessionId, stopActivity: false })
+        if (!result?.archivedSessionIds?.includes(sessionId)) throw new Error('宿主未确认旧会话已归档。')
+      },
+    },
+    recordChange: operation => hub.router.publishOwnerSwitchProgress(operation),
+  })
+  hub.router.ownerSwitch = ownerSwitch
+  const ownerSwitchAction = request => {
+    if (request != null && (typeof request !== 'object' || Array.isArray(request))) {
+      throw new HttpError(400, 'An owner switch request must be an object.')
+    }
+    const { action, ownerId, expectedSessionId, operationId, mode } = request ?? {}
+    return hub.router.ownerSwitchAction({ action, ownerId, expectedSessionId, operationId, mode })
+  }
+  const notificationThrottle = new NotificationThrottle({ store, runs: hub.router.runs,
+    now: () => Date.parse(hub.router.now()), windowMs: config.notifications?.windowMs })
+  hub.router.notifications = notificationThrottle
   hub.router.installDeferred(new DeferredRegistry({
     store, tasks: hub.tasks, now: hub.router.now, ...config.deferred,
     owners: {
@@ -289,8 +344,12 @@ export function apply(ctx, rawConfig) {
   }
 
   const overview = async () => ({
-    ...buildOverview({ store, registry: hub.registry, health: await buildHealth() }),
+    ...buildOverview({ store, registry: hub.registry, health: await buildHealth(), compact: true }),
     timers: timers.list(),
+    ownerSwitches: [...ownerSwitch.list().reduce((latest, operation) => {
+      if (!latest.has(operation.ownerId)) latest.set(operation.ownerId, operation)
+      return latest
+    }, new Map()).values()],
   })
   ctx.inject(['tools'], scope => {
     scope.tools.register({
@@ -379,6 +438,7 @@ export function apply(ctx, rawConfig) {
         oneOf: [{ required: ['fireAt'] }, { required: ['schedule'] }],
         properties: {
           ownerId: textProperty, fireAt: textProperty, message: textProperty, triggerRef: textProperty,
+          notifyAtFire: { type: 'boolean', description: '用户明确要求到点发提醒时设为 true。有原飞书来源时立即发到原聊天。' },
           schedule: {
             type: 'object', required: ['frequency', 'time'], additionalProperties: false,
             properties: {
@@ -390,7 +450,7 @@ export function apply(ctx, rawConfig) {
         },
       },
       output: timerResult,
-      async execute({ ownerId, fireAt, schedule, message, triggerRef }, exec) {
+      async execute({ ownerId, fireAt, schedule, message, triggerRef, notifyAtFire }, exec) {
         const manager = managerFor(exec, ownerId)
         let origin, authorization
         if (triggerRef) {
@@ -403,7 +463,7 @@ export function apply(ctx, rawConfig) {
           if (!isFeishu || !withinOwner) throw new Error('The Feishu source for this reminder cannot be verified.')
           origin = { kind: 'feishu', triggerId: trigger.id, chatId: trigger.source.chatId, actor: sender }
         }
-        return { timer: timers.create({ ownerId: ownerId ?? manager.id, createdBy: exec.agent.id, fireAt, schedule, message, origin, authorization }) }
+        return { timer: timers.create({ ownerId: ownerId ?? manager.id, createdBy: exec.agent.id, fireAt, schedule, message, origin, authorization, notifyAtFire }) }
       },
     }, managerTool)
     scope.tools.register({
@@ -468,10 +528,18 @@ export function apply(ctx, rawConfig) {
     }
   })().catch(error => ctx.logger.warn('hub-bot workspace warmup failed (non-fatal): %s', error?.message ?? error))
   void hub.router.tick().catch(error => ctx.logger.warn('hub-bot delivery resume failed: %s', error?.message ?? error))
+  const tickOwnerSwitches = () => {
+    void ownerSwitch.tick().catch(error => ctx.logger.warn('hub-bot owner switch tick failed: %s', error?.message ?? error))
+  }
+  tickOwnerSwitches()
   const deliveryTimer = setInterval(() => {
     void timers.tick().catch(error => ctx.logger.warn('hub-bot timer tick failed: %s', error?.message ?? error))
     void hub.router.tick().catch(error => ctx.logger.warn('hub-bot delivery tick failed: %s', error?.message ?? error))
     void hub.router.autoReportTick().catch(error => ctx.logger.warn('hub-bot auto-report tick failed: %s', error?.message ?? error))
+    tickOwnerSwitches()
+    try { notificationThrottle.flush() } catch (error) {
+      ctx.logger.warn('hub-bot notification flush failed: %s', error?.message ?? error)
+    }
     if (config.feishu.enabled && feishu.credentialState === 'ok') {
       void feishu.deliverReplies().catch(error => ctx.logger.warn('hub-bot feishu reply tick failed: %s', error?.message ?? error))
     }
@@ -640,6 +708,9 @@ export function apply(ctx, rawConfig) {
     modelCatalog: forwardDep('modelCatalog'),
     overview: forwardDep('overview'),
     messageDetail: forwardDep('messageDetail'),
+    ticketDetail: forwardDep('ticketDetail'),
+    notificationDetail: forwardDep('notificationDetail'),
+    ownerSwitchAction: forwardDep('ownerSwitchAction'),
     listRuns: forwardDep('listRuns'),
     runDetail: forwardDep('runDetail'),
     timerAction,
@@ -683,6 +754,9 @@ export function apply(ctx, rawConfig) {
     },
     overview,
     messageDetail: triggerId => readMessageDetail(store, triggerId),
+    ticketDetail: ticketId => readTicketDetail({ store, registry: hub.registry, ticketId }),
+    notificationDetail: id => notificationThrottle.details(id),
+    ownerSwitchAction,
     listRuns,
     runDetail: id => hub.router.runs.get(id),
     resolveTicket: request => resolveTicket(request),
@@ -880,9 +954,9 @@ export function apply(ctx, rawConfig) {
 
   // 死信重投（健康警告条的操作闭环 turn 110）: {id} 单条 / {all:true} 全部。
   const retryOutbox = body => {
-    if (body?.all === true) return { retried: retryOutboxRows(store, null) }
+    if (body?.all === true) return { retried: retryOutboxRows(store, null, hub.router.now) }
     const id = requireString(body, 'id')
-    const retried = retryOutboxRows(store, [id])
+    const retried = retryOutboxRows(store, [id], hub.router.now)
     if (retried === 0) throw new HttpError(404, 'no failed outbox row "' + id + '"')
     return { retried }
   }
@@ -957,6 +1031,7 @@ export function apply(ctx, rawConfig) {
           json(res, 200, await waitIdle(await readBody(req)))
         } else if (route === 'deliver' && method === 'POST') {
           await hub.router.tick()
+          notificationThrottle.flush()
           const autoReport = await hub.router.autoReportTick({ force: true })
           json(res, 200, { delivered: true, autoReport })
         } else if (route === 'transcript' && method === 'GET') {
@@ -1006,6 +1081,21 @@ export function apply(ctx, rawConfig) {
         } else if (route === 'overview' && method === 'GET') {
           // 三问视图数据 (#73): 票面 + 注册表 + 健康快照, 一次取齐
           json(res, 200, await overview())
+        } else if (route === 'owners/switch' && method === 'POST') {
+          try { json(res, 200, ownerSwitchAction(await readBody(req))) } catch (error) {
+            if (!['OwnerSwitchError', 'RouterError'].includes(error?.name)) throw error
+            throw new HttpError(error.code === 'owner-switch-not-found' ? 404 : 400, error.message)
+          }
+        } else if (route === 'tickets/detail' && method === 'GET') {
+          const ticketId = requireString(Object.fromEntries(url.searchParams), 'ticketId')
+          const detail = readTicketDetail({ store, registry: hub.registry, ticketId })
+          if (!detail) throw new HttpError(404, 'Unknown ticket.')
+          json(res, 200, detail)
+        } else if (route === 'notifications/detail' && method === 'GET') {
+          const id = requireString(Object.fromEntries(url.searchParams), 'id')
+          const detail = notificationThrottle.details(id)
+          if (!detail) throw new HttpError(404, 'Unknown notification.')
+          json(res, 200, detail)
         } else if (route === 'timers/manage' && method === 'POST') {
           json(res, 200, timerAction(await readBody(req)))
         } else if (route === 'settings' && method === 'GET') {
