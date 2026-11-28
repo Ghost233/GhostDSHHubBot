@@ -5,7 +5,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync, statSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, statSync, openSync, closeSync, readFileSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Store } from '../src/store.js'
@@ -400,6 +400,80 @@ test('overview skips directory listings for recycled owners (目录已删除)', 
     assert.equal(called, 0, 'recycled owner 的目录已删除，不读')
   } finally {
     cleanup()
+  }
+})
+
+test('S02 regression: saving a new overlay replaces the settings file instead of rewriting the inode a reader holds', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-settings-'))
+  let fd = null
+  try {
+    // 设置写入必须是「整文件替换」(temp file + rename)：并发读取者手里已打开的句柄要一直看到完整的旧快照。
+    const previous = { reporting: { auto: true, intervalMs: 60000 }, github: { enabled: false, loginAllowlist: ['ghost'] } }
+    const next = { reporting: { auto: false, intervalMs: 90000 }, github: { enabled: true, loginAllowlist: ['ghost', 'hub-bot-app'] } }
+    saveSettingsOverlay(dir, previous)
+    fd = openSync(join(dir, SETTINGS_FILE), 'r')
+    saveSettingsOverlay(dir, next)
+    const heldText = readFileSync(fd, 'utf8')
+    assert.doesNotThrow(() => JSON.parse(heldText), '已打开句柄读到的仍是完整 JSON — 保存不能原地截断同一个 inode')
+    assert.deepEqual(JSON.parse(heldText), previous, '已打开句柄看到的是完整的上一版快照，不是新内容或截断内容')
+    assert.deepEqual(loadSettingsOverlay(dir), next, '新路径加载到的是新设置')
+    assert.equal(statSync(join(dir, SETTINGS_FILE)).mode & 0o777, 0o600, '替换后的新文件仍是 owner-only 0600')
+  } finally {
+    if (fd !== null) closeSync(fd)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('S02 regression: a failed settings write keeps the previous file and the in-memory config unchanged', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-settings-'))
+  try {
+    // 持久化失败必须是「整体回退」：上一份有效文件还在、内存里的 config 一点没变、临时文件不残留。
+    // 失败注入走 saveSettingsOverlay 的 io 替身（同 workspaces.js 的 mkdir 替身约定），不 mock 模块。
+    const previous = { reporting: { auto: true, intervalMs: 60000 }, github: { enabled: false, loginAllowlist: ['ghost'] } }
+    const config = baseConfig()
+    applySettingsOverlay(config, previous)
+    saveSettingsOverlay(dir, previous)
+    const snapshot = structuredClone(config)
+    const failingIo = {
+      renameSync: () => {
+        const error = new Error('EACCES: simulated rename failure')
+        error.code = 'EACCES'
+        throw error
+      },
+    }
+    assert.throws(
+      () => applySettingsPatch(config, { reporting: { auto: false, intervalMs: 90000 } }, applied => {
+        saveSettingsOverlay(dir, mergeSettingsOverlay(previous, applied), failingIo)
+      }),
+      /simulated rename failure/,
+      '持久化失败必须抛给调用方，不能吞掉变成半成功',
+    )
+    assert.deepEqual(config, snapshot, '写入失败后内存里的配置保持原样（不能先改内存再写盘）')
+    assert.deepEqual(loadSettingsOverlay(dir), previous, '下一次加载拿到的仍是最后一份有效设置')
+    assert.deepEqual(readdirSync(dir), [SETTINGS_FILE], '失败路径不能留下临时文件')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('S02 regression: an accepted settings change survives a reopen of the state dir', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-settings-'))
+  try {
+    // 正常路径：写盘 → 重新加载（等价于重启）→ 覆盖层原样重放，改动不会随进程消失。
+    const config = baseConfig()
+    const patch = { reporting: { auto: true, intervalMs: 120000 }, github: { loginAllowlist: ['ghost', 'hub-bot-app'] } }
+    applySettingsPatch(config, patch, applied => {
+      saveSettingsOverlay(dir, mergeSettingsOverlay(loadSettingsOverlay(dir), applied))
+    })
+    assert.equal(config.reporting.auto, true, '内存里立即生效')
+    const reopened = baseConfig()
+    applySettingsOverlay(reopened, loadSettingsOverlay(dir))
+    assert.equal(reopened.reporting.auto, true, '重开后 reporting.auto 保持')
+    assert.equal(reopened.reporting.intervalMs, 120000, '重开后 reporting.intervalMs 保持')
+    assert.deepEqual(reopened.github.loginAllowlist, ['ghost', 'hub-bot-app'], '重开后 github.loginAllowlist 保持')
+    assert.equal(statSync(join(dir, SETTINGS_FILE)).mode & 0o777, 0o600, '落盘文件仍是 owner-only 0600')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
   }
 })
 

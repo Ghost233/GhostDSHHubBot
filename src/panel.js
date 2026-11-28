@@ -5,12 +5,14 @@
  *  1. Settings write-back — the panel patches a WHITELIST of settings (concurrency, reporting, feishu/github
  *     switches and allowlists). The patch mutates the live resolved config (every reader — Router slots,
  *     auto-report tick, Source policy — reads these same objects), and the validated patch is persisted as an
- *     overlay file under stateDir (0600, like the credentials file). At boot the overlay replays onto the
- *     profile config, so panel changes survive restarts without the plugin ever editing the profile.
+ *     overlay file under stateDir (0600, like the credentials file) by writing a same-directory temp file and
+ *     renaming it over the target — an already-open reader keeps the complete previous snapshot instead of
+ *     observing a truncated in-place rewrite. At boot the overlay replays onto the profile config, so panel
+ *     changes survive restarts without the plugin ever editing the profile.
  *  2. The 三问 overview — assembled from ticket FACES (stageText 朗读, report facts, authorization) plus the
  *     owner registry; the panel never invents state the tickets do not carry (诚实状态: 计数 = 列表长度).
  */
-import { readFileSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, renameSync, unlinkSync, chmodSync } from 'node:fs'
 import { join } from 'node:path'
 import { STAGE_TEXT } from './tasks.js'
 import { validateChiefModel } from './config.js'
@@ -197,10 +199,46 @@ export function loadSettingsOverlay(stateDir) {
   }
 }
 
-/** Persists the settings overlay owner-only (0600) — it can carry allowlists, like the credentials file. */
-export function saveSettingsOverlay(stateDir, overlay) {
+/** 原子替换时临时文件的序号：同进程内保证临时名唯一，并发写不会互相踩到同一个临时文件。 */
+let settingsTempSeq = 0
+
+/**
+ * Persists the settings overlay owner-only (0600) — it can carry allowlists, like the credentials file.
+ *
+ * 写入是「整文件替换」：先把完整内容写进同目录的临时文件，再 rename 覆盖目标。rename 换的是目录项
+ * （新 inode），已经打开旧文件的读者继续看到完整的上一版快照，绝不会读到被截断的一半内容。
+ * 任何一步失败都会清掉临时文件并抛出：目标文件与内存里的配置都保持原样，不出现半成功。
+ *
+ * @param {string} stateDir - state 目录（不存在则创建）。
+ * @param {object} overlay - 已通过 applySettingsPatch 校验的覆盖层。
+ * @param {{ writeFileSync?: (path: string, text: string, options?: { mode?: number }) => void,
+ *   chmodSync?: (path: string, mode: number) => void,
+ *   renameSync?: (from: string, to: string) => void,
+ *   unlinkSync?: (path: string) => void }} [io] 测试替身；缺省用 node:fs 的同名同步函数。
+ */
+export function saveSettingsOverlay(stateDir, overlay, io = {}) {
+  const write = io.writeFileSync ?? writeFileSync
+  const chmod = io.chmodSync ?? chmodSync
+  const rename = io.renameSync ?? renameSync
+  const unlink = io.unlinkSync ?? unlinkSync
   mkdirSync(stateDir, { recursive: true })
-  writeFileSync(join(stateDir, SETTINGS_FILE), JSON.stringify(overlay, null, 2) + '\n', { mode: 0o600 })
+  const target = join(stateDir, SETTINGS_FILE)
+  // 临时文件必须与目标同目录：跨文件系统的 rename 会退化成「拷贝 + 删除」，原子性就没了。
+  settingsTempSeq += 1
+  const tmp = join(stateDir, '.' + SETTINGS_FILE + '.' + process.pid + '.' + settingsTempSeq)
+  try {
+    write(tmp, JSON.stringify(overlay, null, 2) + '\n', { mode: 0o600 })
+    // writeFileSync 的 mode 会被 umask 削掉，显式 chmod 才保证替换后的文件仍是 owner-only 0600。
+    chmod(tmp, 0o600)
+    rename(tmp, target)
+  } catch (error) {
+    try {
+      unlink(tmp)
+    } catch {
+      // 临时文件可能根本没建起来；清理失败不能掩盖原始错误。
+    }
+    throw error
+  }
 }
 
 /** A capped directory listing for the 结果在哪 view; null when the directory cannot be read. */
