@@ -135,6 +135,132 @@ test('Feishu registration acknowledgement and asynchronous write failure are sep
   assert.deepEqual(JSON.parse(JSON.stringify((await settings.read()).feishu.status)), failed)
 })
 
+test('only a complete own-session history can rule out an in-flight prompt receipt', async t => {
+  const homeRepo = await mkdtemp(join(tmpdir(), 'hub-bot-prompt-receipts-'))
+  const Context = contexts.at(-1)[1]
+  const root = new Context()
+  const sessionId = 'session-receipt-fixture'
+  const release = Promise.withResolvers()
+  const message = request => ({ source: { kind: 'user', rpcId: request } })
+  const events = [
+    { seq: 0, type: 'user/message', data: message('inherited') },
+    { seq: 1, type: 'agent/inbox/spliced', data: { inserted: [message('admitted')] } },
+    { seq: 2, type: 'user/message', data: { ...message('continued'), source: { kind: 'retry', rpcId: 'continued' } } },
+  ]
+  const reads = []
+  let reportCount = events.length
+  let closes = 0
+  root.provide('sessionController', { async prompt() { return release.promise } })
+  root.provide('sessionPersistence', {
+    async flush() {},
+    async stat() { return { eventCount: reportCount } },
+    async open(id, access) {
+      assert.equal(id, sessionId)
+      assert.equal(access, 'read')
+      return { id, inheritedEventCount: 1,
+        async read(offset, count) { reads.push(offset); return { events: events.slice(offset, offset + count) } },
+        async close() { closes++ },
+      }
+    },
+  })
+  root.provide('webServer', { host: '127.0.0.1', port: 3199 })
+  const mounted = root.plugin(plugin, { homeRepo, stateDir: join(homeRepo, 'state'), workspaces: { enabled: false } })
+  t.after(async () => { release.resolve({ accepted: true }); await mounted.dispose(); await rm(homeRepo, { recursive: true, force: true }) })
+  await mounted
+  const hub = root.reflect.get('hubBot', false)
+  const receipt = requestId => hub.sessions.hasPromptReceipt({ sessionId, requestId })
+  assert.equal(await receipt('admitted'), true)
+  assert.equal(await receipt('continued'), true)
+  assert.equal(await receipt('inherited'), false)
+  assert.deepEqual(reads, [1, 1, 1])
+  assert.equal(closes, 3)
+  reportCount += 100
+  assert.equal(await receipt('incomplete'), undefined)
+  reportCount = events.length
+  const pending = hub.sessions.prompt({ sessionId, requestId: 'still-in-flight', text: 'fixture' })
+  assert.equal(await receipt('still-in-flight'), undefined)
+  assert.equal(reads.length, 4)
+  release.resolve({ accepted: true })
+  await pending
+  assert.equal(await receipt('still-in-flight'), false)
+})
+
+test('authenticated handoff summary previews the exact source and carries only the confirmed edit', async t => {
+  const homeRepo = await mkdtemp(join(tmpdir(), 'hub-bot-handoff-summary-host-'))
+  const Context = contexts.at(-1)[1]
+  const root = new Context()
+  const token = 'fixture-handoff-token'
+  const oldSession = 'fixture-old-summary-owner'
+  const creations = [], pages = [], prompts = []
+  let handle
+  root.provide('sessionController', {
+    async state({ sessionId }) {
+      if (sessionId === oldSession || creations.some(row => row.sessionId === sessionId)) return { running: false, queue: [], pendingInput: [] }
+      throw Object.assign(Error('Fixture session unavailable'), { code: 'session/not-found' })
+    },
+    async page(request) {
+      pages.push(request)
+      return { hasMore: true, records: [
+        { event: { type: 'user/message', seq: 33, data: { message: { content: [{ type: 'text', text: '旧讨论：选择验收范围' }] } } } },
+        { event: { type: 'system/message', seq: 34, data: { message: { content: [{ type: 'text', text: '不应出现在草稿的系统文本' }] } } } },
+        { event: { type: 'assistant/message', seq: 35, data: { message: { content: [{ type: 'text', text: '此前讨论了两个方案' }, { type: 'tool-call', arguments: '不应出现在草稿的工具参数' }] } } } },
+      ] }
+    },
+    async create(request) { creations.push(request); return request },
+    async prompt(input) { prompts.push(input); return { accepted: true } },
+  })
+  root.provide('sessionPersistence', { async flush() {} })
+  root.provide('webServer', { host: '127.0.0.1', port: 3199, register(entry) {
+    handle = entry.handler
+    return () => { handle = undefined }
+  } })
+  const mounted = root.plugin(plugin, { homeRepo, stateDir: join(homeRepo, 'state'), workspaces: { enabled: false }, devApi: { token } })
+  t.after(async () => { await mounted.dispose(); await rm(homeRepo, { recursive: true, force: true }) })
+  await mounted
+  await setImmediate()
+  const hub = root.reflect.get('hubBot', false)
+  const settings = root.reflect.get('hubBotSettings', false)
+  const owner = hub.registry.create({ kind: 'dir', cwd: homeRepo })
+  hub.registry.bindSession(owner.id, oldSession)
+  const source = { ownerId: owner.id, expectedSessionId: oldSession }
+  async function request(path, body, authenticated = true) {
+    const req = Readable.from([Buffer.from(JSON.stringify(body))])
+    Object.assign(req, { url: '/hub-bot/api/' + path, method: 'POST',
+      headers: { host: '127.0.0.1:3199', ...(authenticated && { 'x-hub-bot-token': token }) } })
+    let status, value
+    await handle(req, { writeHead(code) { status = code }, end(payload) { value = JSON.parse(payload) } })
+    return { status, value }
+  }
+  const generate = { ...source, action: 'generate' }
+  assert.equal((await request('owners/handoff-summary', generate, false)).status, 401)
+  assert.equal((await request('owners/handoff-summary', { ...generate, expectedSessionId: 'other-fixture' })).status, 400)
+  assert.equal(pages.length, 0)
+  const draft = (await request('owners/handoff-summary', generate)).value
+  assert.equal(draft.status, 'draft')
+  assert.equal(draft.sourceSessionId, oldSession)
+  assert.equal(draft.sourceThroughSeq, 35)
+  assert.match(draft.text, /#33.*选择验收范围/)
+  assert.doesNotMatch(draft.text, /系统文本|工具参数/)
+  assert.deepEqual(pages, [{ address: { kind: 'session', sessionId: oldSession }, maxMessages: 16 }])
+  const reference = value => ({ draftId: value.draftId, revision: value.revision })
+  const replace = { action: 'request', mode: 'wait', ...source }
+  assert.equal((await request('owners/switch', { ...replace, summary: reference(draft) })).status, 400)
+  const text = '用户确认携带的编辑摘要'
+  const edited = await settings.handoffSummaryAction({ ...source, ...reference(draft), action: 'edit', text })
+  const confirmed = await settings.handoffSummaryAction({ ...source, ...reference(edited), action: 'confirm' })
+  const accepted = await request('owners/switch', { ...replace, summary: reference(confirmed) })
+  assert.equal(accepted.status, 200)
+  await hub.router.ownerSwitch.tick()
+  const bootstrap = prompts.find(row => row.requestId === accepted.value.initializationRequestId)
+  assert.ok(bootstrap)
+  assert.equal(bootstrap.sessionId, accepted.value.newSessionId)
+  assert.match(bootstrap.content[0].text, /负责人事实/)
+  assert.ok(bootstrap.content[0].text.includes(text))
+  assert.doesNotMatch(bootstrap.content[0].text, /此前讨论了两个方案/)
+  assert.equal(hub.registry.get(owner.id).sessionId, bootstrap.sessionId)
+  assert.equal(pages.length, 1)
+})
+
 test('Feishu explicit switch and the management panel share a durable owner operation', async t => {
   const homeRepo = await mkdtemp(join(tmpdir(), 'hub-bot-owner-switch-host-'))
   const Context = contexts.at(-1)[1]

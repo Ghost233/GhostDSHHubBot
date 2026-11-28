@@ -166,8 +166,19 @@ export class HubBotSettingsService extends TypertRemoteService {
     try {
       return await this.deps.ownerSwitchAction(request ?? {})
     } catch (error) {
-      if (error?.status === 400 || ['OwnerSwitchError', 'RouterError'].includes(error?.name)) {
+      if (error?.status === 400 || ['OwnerSwitchError', 'HandoffSummaryError', 'RouterError'].includes(error?.name)) {
         throw new RemoteError('owner-switch/' + (error.code ?? 'invalid'), error.message, {})
+      }
+      throw error
+    }
+  }
+
+  async handoffSummaryAction(request) {
+    try {
+      return await this.deps.handoffSummaryAction(request)
+    } catch (error) {
+      if (error?.status === 400 || error?.name === 'HandoffSummaryError') {
+        throw new RemoteError('handoff-summary/' + (error.code ?? 'invalid'), error.message, {})
       }
       throw error
     }
@@ -239,6 +250,7 @@ markRemote(HubBotSettingsService, 'messageDetail', {})
 markRemote(HubBotSettingsService, 'ticketDetail', {})
 markRemote(HubBotSettingsService, 'notificationDetail', {})
 markRemote(HubBotSettingsService, 'ownerSwitchAction', {})
+markRemote(HubBotSettingsService, 'handoffSummaryAction', {})
 markRemote(HubBotSettingsService, 'listRuns', {})
 markRemote(HubBotSettingsService, 'runDetail', {})
 markRemote(HubBotSettingsService, 'timerAction', {})

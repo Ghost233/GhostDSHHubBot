@@ -48,6 +48,7 @@ import { buildOwnerFacts, formatOwnerFacts, listOwnerFactIndex, readOwnerFactDet
 import { DeferredRegistry } from './deferred.js'
 import { SILENCE_REASONS } from './runs.js'
 import { OwnerSwitch } from './owner-switch.js'
+import { HandoffSummaryRegistry } from './handoff-summary.js'
 import { NotificationThrottle } from './notifications.js'
 
 export const name = 'hub-bot'
@@ -174,6 +175,10 @@ function optionalString(body, key) {
 /** One AbortSignal that fires after ms. */
 const deadline = ms => AbortSignal.timeout(ms)
 
+// A previous plugin mount may still be waiting for the Host to admit a prompt.
+const PROMPT_ADMISSIONS = Symbol.for('dsh-hub-bot:prompt-admissions')
+const promptAdmissions = globalThis[PROMPT_ADMISSIONS] ??= new Map()
+
 /** Constant-time token comparison; both sides are hashed first so length never leaks. */
 function tokenMatches(presented, expected) {
   const hash = value => createHash('sha256').update(String(value)).digest()
@@ -204,6 +209,7 @@ export function apply(ctx, rawConfig) {
   // access then throws "cannot get required service in inactive context" on every call. The captured service
   // object itself stays alive and usable regardless of the context state marker.
   const sessionController = ctx.sessionController
+  const promptKey = (sessionId, requestId) => JSON.stringify([store.stateDir, sessionId, requestId])
 
   // The Sessions port of src/router.js over the real sessionController. prompt uses queue mode: an owner Session
   // is event-driven — an injected message wakes it exactly like a person typing (spec「核心原则」2).
@@ -220,12 +226,56 @@ export function apply(ctx, rawConfig) {
       const stored = await ctx.sessionPersistence.stat(sessionId, { signal: deadline(10_000) })
       return { cwd: item.cwd, agentPreset: stored?.header?.agentPreset ?? item.projections?.values?.agentPreset }
     },
+    async hasPromptReceipt({ sessionId, requestId }) {
+      const persistence = ctx.sessionPersistence
+      const key = promptKey(sessionId, requestId)
+      if (promptAdmissions.has(key) || typeof persistence.open !== 'function') return undefined
+      const signal = deadline(7000)
+      let reader
+      try {
+        const snapshot = await persistence.stat?.(sessionId, { signal })
+        reader = await persistence.open(sessionId, 'read', { signal })
+        const firstOwn = reader.inheritedEventCount
+        if (reader.id !== sessionId || !Number.isSafeInteger(firstOwn) || firstOwn < 0) return undefined
+        const budget = 8192
+        const size = 256
+        const start = Math.max(firstOwn, Number.isSafeInteger(snapshot?.eventCount) ? snapshot.eventCount - budget : firstOwn)
+        for (let offset = start; offset < start + budget; offset += size) {
+          const { events } = await reader.read(offset, size, { signal })
+          for (const event of events) {
+            const messages = event.type === 'agent/inbox/spliced' ? event.data.inserted
+              : event.type === 'user/message' ? [event.data.message ?? event.data] : []
+            if (messages.some(message => {
+              const { source } = message
+              return (source?.kind === 'user' || source?.kind === 'retry') && source.rpcId === requestId
+            })) return true
+          }
+          if (events.length < size) {
+            const complete = start === firstOwn && !(snapshot?.eventCount > offset + events.length)
+            return complete && !promptAdmissions.has(key) ? false : undefined
+          }
+        }
+        return undefined
+      } catch {
+        return undefined
+      } finally {
+        await reader?.close().catch(() => {})
+      }
+    },
     prompt: async ({ sessionId, requestId, text, content }) => {
-      const value = await sessionController.prompt({
-        requestId, sessionId, mode: 'queue', content: content ?? [{ type: 'text', text }],
-      }, deadline(30_000))
-      await ctx.sessionPersistence.flush()
-      return value
+      const key = promptKey(sessionId, requestId)
+      promptAdmissions.set(key, (promptAdmissions.get(key) ?? 0) + 1)
+      try {
+        const value = await sessionController.prompt({
+          requestId, sessionId, mode: 'queue', content: content ?? [{ type: 'text', text }],
+        }, deadline(30_000))
+        await ctx.sessionPersistence.flush()
+        return value
+      } finally {
+        const remaining = promptAdmissions.get(key) - 1
+        if (remaining > 0) promptAdmissions.set(key, remaining)
+        else promptAdmissions.delete(key)
+      }
     },
     // Wake coalescing (#67): digests flush once the owner Session goes idle, so one wake = one outward message.
     isRunning: async sessionId => {
@@ -254,8 +304,46 @@ export function apply(ctx, rawConfig) {
   const placer = new WorkspacePlacer({ workspaceController: safeGetService(ctx, 'workspaceController'), homeRepo: config.homeRepo, workspaces: config.workspaces, logger: ctx.logger, registryList: () => safeGetService(ctx, 'workspaceRegistry')?.list?.() ?? [], archivedList: () => { try { return safeGetService(ctx, 'workspaceRegistry')?.archivedSessionIds ?? [] } catch { return [] } } })
   const hub = new Hub({ store, config, sessions, onSystemProblem: p => ctx.logger.warn('hub-bot system problem: %s (ticket %s, row %s)', p.reason, p.ticketId, p.rowId), placer })
   const chief = hub.registry.ensureChief({ cwd: config.homeRepo, workspace: basename(config.homeRepo) })
-  const ownerSwitch = new OwnerSwitch({
+  const handoffSummaries = new HandoffSummaryRegistry({
     store, registry: hub.registry, now: hub.router.now,
+    async readTranscript({ sessionId, maxBytes }) {
+      const page = await sessionController.page({ address: { kind: 'session', sessionId }, maxMessages: 16 }, deadline(10000))
+      const excerpts = []
+      let throughSeq = null
+      for (const record of page.records ?? []) {
+        const event = record.event ?? record
+        if (Number.isSafeInteger(event.seq) && event.seq >= 0) throughSeq = Math.max(throughSeq ?? 0, event.seq)
+        if (!['user/message', 'assistant/message'].includes(event.type)) continue
+        const message = event.data?.message
+        const parts = Array.isArray(message?.content) ? message.content : []
+        const text = parts.filter(part => part?.type === 'text' && typeof part.text === 'string')
+          .slice(0, 3).map(part => part.text.slice(0, 320)).join(' ').replace(/\s+/gu, ' ').trim()
+        if (!text) continue
+        const role = event.type === 'user/message' ? '用户' : '助手'
+        const seq = Number.isSafeInteger(event.seq) && event.seq >= 0 ? '#' + event.seq + ' ' : ''
+        const excerpt = Array.from(text).slice(0, 200).join('')
+        excerpts.push(seq + role + '：' + excerpt + (excerpt === text ? '' : '…'))
+      }
+      const selected = excerpts.slice(-8)
+      while (selected.length && Buffer.byteLength(selected.join('\n')) > maxBytes) selected.shift()
+      return { text: selected.join('\n'), source: { sessionId, throughSeq, hasMore: page.hasMore === true } }
+    },
+    async summarize({ transcript, maxBytes }) {
+      const lines = transcript.split('\n')
+      const heading = '旧会话近期讨论摘记'
+      while (lines.length && Buffer.byteLength([heading, ...lines].join('\n')) > maxBytes) lines.shift()
+      return lines.length && lines.some(Boolean) ? [heading, ...lines].join('\n') : ''
+    },
+  })
+  const handoffSummaryAction = async request => {
+    if (!request || typeof request !== 'object' || Array.isArray(request)) throw new HttpError(400, 'A handoff summary request is required.')
+    const { action, ownerId, expectedSessionId, draftId, revision, text } = request
+    if (!['list', 'get', 'generate', 'edit', 'confirm', 'discard'].includes(action)) throw new HttpError(400, 'Unknown handoff summary operation.')
+    const result = await handoffSummaries[action]({ ownerId, expectedSessionId, draftId, revision, text })
+    return result ?? null
+  }
+  const ownerSwitch = new OwnerSwitch({
+    store, registry: hub.registry, now: hub.router.now, handoffSummaries,
     withAdmission: (ownerId, work) => hub.router.withOwnerAdmission(ownerId, work),
     buildFacts: ({ ownerId }) => formatOwnerFacts(buildOwnerFacts({ store, ownerId, isArchived: id => sessions.isArchived(id) })),
     sessions: {
@@ -298,8 +386,8 @@ export function apply(ctx, rawConfig) {
     if (request != null && (typeof request !== 'object' || Array.isArray(request))) {
       throw new HttpError(400, 'An owner switch request must be an object.')
     }
-    const { action, ownerId, expectedSessionId, operationId, mode } = request ?? {}
-    return hub.router.ownerSwitchAction({ action, ownerId, expectedSessionId, operationId, mode })
+    const { action, ownerId, expectedSessionId, operationId, mode, summary } = request ?? {}
+    return hub.router.ownerSwitchAction({ action, ownerId, expectedSessionId, operationId, mode, summary })
   }
   const notificationThrottle = new NotificationThrottle({ store, runs: hub.router.runs,
     now: () => Date.parse(hub.router.now()), windowMs: config.notifications?.windowMs })
@@ -711,6 +799,7 @@ export function apply(ctx, rawConfig) {
     ticketDetail: forwardDep('ticketDetail'),
     notificationDetail: forwardDep('notificationDetail'),
     ownerSwitchAction: forwardDep('ownerSwitchAction'),
+    handoffSummaryAction: forwardDep('handoffSummaryAction'),
     listRuns: forwardDep('listRuns'),
     runDetail: forwardDep('runDetail'),
     timerAction,
@@ -757,6 +846,7 @@ export function apply(ctx, rawConfig) {
     ticketDetail: ticketId => readTicketDetail({ store, registry: hub.registry, ticketId }),
     notificationDetail: id => notificationThrottle.details(id),
     ownerSwitchAction,
+    handoffSummaryAction,
     listRuns,
     runDetail: id => hub.router.runs.get(id),
     resolveTicket: request => resolveTicket(request),
@@ -1081,9 +1171,14 @@ export function apply(ctx, rawConfig) {
         } else if (route === 'overview' && method === 'GET') {
           // 三问视图数据 (#73): 票面 + 注册表 + 健康快照, 一次取齐
           json(res, 200, await overview())
+        } else if (route === 'owners/handoff-summary' && method === 'POST') {
+          try { json(res, 200, await handoffSummaryAction(await readBody(req))) } catch (error) {
+            if (error?.name !== 'HandoffSummaryError') throw error
+            throw new HttpError(400, error.message)
+          }
         } else if (route === 'owners/switch' && method === 'POST') {
           try { json(res, 200, ownerSwitchAction(await readBody(req))) } catch (error) {
-            if (!['OwnerSwitchError', 'RouterError'].includes(error?.name)) throw error
+            if (!['OwnerSwitchError', 'HandoffSummaryError', 'RouterError'].includes(error?.name)) throw error
             throw new HttpError(error.code === 'owner-switch-not-found' ? 404 : 400, error.message)
           }
         } else if (route === 'tickets/detail' && method === 'GET') {

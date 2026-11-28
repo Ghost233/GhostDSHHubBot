@@ -136,6 +136,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             codec: anyCodec('dsh-hub-bot#json-request'), strictCodec: anyCodec('dsh-hub-bot#json-request') }],
           result: anyCodec('dsh-hub-bot#json-result'),
         },
+        'hubBotSettings/handoffSummaryAction': {
+          service: 'hubBotSettings', description: 'Preview, edit or confirm an owner handoff summary.', invocation: { kind: 'direct' },
+          parameters: [{ name: 'request', source: 'json', description: 'Handoff summary operation',
+            codec: anyCodec('dsh-hub-bot#json-request'), strictCodec: anyCodec('dsh-hub-bot#json-request') }],
+          result: anyCodec('dsh-hub-bot#json-result'),
+        },
         'hubBotSettings/ownerSwitchAction': {
           service: 'hubBotSettings', description: 'Request, read or manage an owner switch.', invocation: { kind: 'direct' },
           parameters: [{ name: 'request', source: 'json', description: 'Owner switch operation',
@@ -395,6 +401,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       intakeFailed: '投递失败',
       intakeDiscarded: '已丢弃投递',
       timersSection: '提醒',
+      handoffSummary: '交接摘要', handoffGenerate: '生成草稿', handoffConfirm: '确认这版摘要', handoffConfirmed: '摘要已确认。',
+      handoffCarry: '携摘要更换', handoffDiscard: '放弃摘要', handoffClose: '关闭', handoffDraft: '交接摘要正文',
+      handoffSource: '来源会话', handoffEvent: '截至事件', handoffExpires: '有效至',
+      handoffHint: '请预览并编辑草稿。摘要补充讨论背景，任务状态和授权以当前记录为准。',
+      decisionQueued: '决定已保存，等待处理。', batchDecisionQueued: '{count} 条已保存，等待处理。',
       switchWait: '空闲后更换', switchStop: '停止后更换', switchStopConfirm: '确认停止原负责人会话当前处理，等它空闲后更换？',
       switchCancel: '取消等待', switchRetryArchive: '重试归档', switchOpenPrevious: '打开原会话',
       switchWaiting: '等待原会话空闲', switchPreparing: '正在准备新会话', switchCommitted: '新会话已接管，等待归档',
@@ -793,6 +804,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       intakeFailed: 'delivery failed',
       intakeDiscarded: 'delivery discarded',
       timersSection: 'Follow-ups',
+      handoffSummary: 'Handoff summary', handoffGenerate: 'Generate draft', handoffConfirm: 'Confirm this summary', handoffConfirmed: 'Summary confirmed.',
+      handoffCarry: 'Replace with summary', handoffDiscard: 'Discard summary', handoffClose: 'Close', handoffDraft: 'Handoff summary text',
+      handoffSource: 'Source session', handoffEvent: 'Through event', handoffExpires: 'Expires',
+      handoffHint: 'Review and edit the draft. The summary carries discussion context. Current records govern task status and authorization.',
+      decisionQueued: 'Decision saved and awaiting processing.', batchDecisionQueued: '{count} saved and awaiting processing.',
       switchWait: 'Replace when idle', switchStop: 'Stop and replace', switchStopConfirm: 'Stop the current owner turn and replace its session once it is idle?',
       switchCancel: 'Cancel waiting', switchRetryArchive: 'Retry archiving', switchOpenPrevious: 'Open previous session',
       switchWaiting: 'Waiting for current session to go idle', switchPreparing: 'Preparing a new session', switchCommitted: 'New session is current, awaiting archive',
@@ -1989,7 +2005,73 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           completed: 'switchCompleted', failed: 'switchFailed', cancelled: 'switchCancelled',
         };
 
+        function HandoffSummaryEditor({ owner, t, onClose, onRefresh }) {
+          var [draft, setDraft] = React.useState(null);
+          var [text, setText] = React.useState('');
+          var [busy, setBusy] = React.useState(true);
+          var [error, setError] = React.useState(null);
+          var [status, setStatus] = React.useState('');
+          var current = { ownerId: owner.id, expectedSessionId: owner.sessionId };
+          var send = async (action, fields = {}) => unwrap(await scoped.remote.hubBotSettings.handoffSummaryAction({ action, ...current, ...fields }));
+          function place(value) { setDraft(value); setText(value?.text ?? ''); }
+          React.useEffect(() => {
+            var mounted = true;
+            async function load() {
+              try {
+                var list = await send('list');
+                var item = list?.length ? await send('get', { draftId: list[0].draftId }) : null;
+                if (mounted) place(item);
+              } catch (failure) { if (mounted) setError(failure?.message ?? String(failure)); }
+              finally { if (mounted) setBusy(false); }
+            }
+            void load();
+            return () => { mounted = false; };
+          }, [owner.id, owner.sessionId]);
+          async function run(work) {
+            if (busy) return;
+            setBusy(true);
+            setError(null);
+            setStatus('');
+            try { await work(); } catch (failure) { setError(failure?.message ?? String(failure)); }
+            finally { setBusy(false); }
+          }
+          var confirmed = draft?.status === 'confirmed' && text === draft.text;
+          var version = draft && { draftId: draft.draftId, revision: draft.revision };
+          var button = (label, action) => h('button', { type: 'button', style: settingsButtonStyle, disabled: busy, onClick: () => void run(action) }, t(label));
+          async function confirmDraft() {
+            var saved = text !== draft.text ? await send('edit', { ...version, text }) : draft;
+            place(saved);
+            var reviewed = await send('confirm', { draftId: saved.draftId, revision: saved.revision });
+            place(reviewed);
+            setStatus(t('handoffConfirmed'));
+          }
+          async function start() {
+            if (!confirmed) return;
+            unwrap(await scoped.remote.hubBotSettings.ownerSwitchAction({ action: 'request', mode: 'wait', ...current, summary: version }));
+            onClose();
+            await onRefresh();
+          }
+          return h('div', { style: { flexBasis: '100%', minWidth: 0, padding: '8px 0' } },
+            h('p', { style: settingsHintStyle }, t('handoffHint')) ,
+            h('p', { style: Object.assign({}, settingsHintStyle, { overflowWrap: 'anywhere' }) },
+              t('handoffSource') + ' ' + (draft?.sourceSessionId ?? owner.sessionId)
+              + (draft ? ' · ' + new Date(draft.sourceReadAt).toLocaleString() : '')
+              + (draft?.sourceThroughSeq != null ? ' · ' + t('handoffEvent') + ' ' + draft.sourceThroughSeq : '')
+              + (draft ? ' · ' + t('handoffExpires') + ' ' + new Date(draft.expiresAt).toLocaleString() : '')) ,
+            draft ? h('textarea', { rows: 7, value: text, disabled: busy, 'aria-label': t('handoffDraft'),
+              onChange: event => setText(event.target.value), style: Object.assign({}, settingsInputStyle, { width: '100%', resize: 'vertical' }) }) : null,
+            h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '6px 8px' } },
+              button('handoffGenerate', async () => place(await send('generate'))),
+              draft && !confirmed ? button('handoffConfirm', confirmDraft) : null,
+              confirmed ? button('handoffCarry', start) : null,
+              draft ? button('handoffDiscard', async () => { await send('discard', version); onClose(); }) : null,
+              h('button', { type: 'button', style: settingsButtonStyle, onClick: onClose }, t('handoffClose'))),
+            status ? h('p', { role: 'status' }, status) : null,
+            error ? h('p', { role: 'alert', style: { overflowWrap: 'anywhere' } }, error) : null);
+        }
+
         function OwnerSwitchControls({ owner, operation, onRefresh, onOldSession, t }) {
+          var [expanded, setExpanded] = React.useState(false);
           var [busy, setBusy] = React.useState(false);
           var [error, setError] = React.useState(null);
           async function act(request) {
@@ -2009,6 +2091,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           return h('div', { style: { display: 'flex', gap: '6px 8px', flexWrap: 'wrap', alignItems: 'center' } },
             owner.sessionId && !owner.recycled && !pending ? button('switchWait', { ...newRequest, mode: 'wait' }) : null,
             owner.sessionId && !owner.recycled && !pending ? button('switchStop', { ...newRequest, mode: 'stop' }) : null,
+            owner.sessionId && !owner.recycled && !pending && !expanded ? h('button', { type: 'button', style: settingsButtonStyle,
+              onClick: () => setExpanded(true) }, t('handoffSummary')) : null,
+            owner.sessionId && !owner.recycled && !pending && expanded ? h(HandoffSummaryEditor, { key: owner.sessionId, owner, t,
+              onClose: () => setExpanded(false), onRefresh }) : null,
             operation ? h('span', { role: 'status', style: settingsHintStyle }, t(ownerSwitchLabels[operation.status] ?? 'switchFailed')) : null,
             operation?.status === 'waiting' ? button('switchCancel', { action: 'cancel', operationId: operation.operationId }) : null,
             operation?.status === 'archive-failed' ? button('switchRetryArchive', { action: 'retry-archive', operationId: operation.operationId }) : null,
@@ -2300,7 +2386,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 next.delete(tk.id);
                 return next;
               });
-              feedback.message = t(result.stage === 'person/confirm' ? 'ticketActionHeld' : successLabel);
+              feedback.message = t(result.outcome === 'queued' ? 'decisionQueued' : result.stage === 'person/confirm' ? 'ticketActionHeld' : successLabel);
             } catch (error) {
               feedback.message = t('resolveFailed');
               feedback.error = error?.message || String(error);
@@ -2316,9 +2402,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             var operation = { scope: 'needs', processed: 0, total };
             startTicketOperation(operation);
             var failures = [];
+            var queued = 0;
             for (var ticket of selectedConfirmations) {
               try {
-                await sendTicketResolution({ ticketId: ticket.id, resolution, ...decisionId(ticket) });
+                var result = await sendTicketResolution({ ticketId: ticket.id, resolution, ...decisionId(ticket) });
+                if (result.outcome === 'queued') queued += 1;
               } catch (error) {
                 failures.push({ id: ticket.id, ticket: ticket.message || ticket.id, error: error?.message || String(error) });
               }
@@ -2326,10 +2414,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               setTicketOperation(operation);
             }
             setSelected(new Map(failures.map(failure => [failure.id, selected.get(failure.id)])));
-            var succeeded = total - failures.length;
-            var message = failures.length
+            var succeeded = total - failures.length - queued;
+            var message = failures.length || queued
               ? fill(t('batchOutcome').replace('{failed}', String(failures.length)), succeeded)
               : fill(t(resolution === 'confirm' ? 'batchConfirmed' : 'batchRejected'), total);
+            if (queued) message += ' ' + fill(t('batchDecisionQueued'), queued);
             await finishTicketOperation('needs', { message, failures });
           }
 

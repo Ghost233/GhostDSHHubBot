@@ -14,6 +14,9 @@ import { Store } from '../src/store.js'
 import { OwnerRegistry } from '../src/registry.js'
 import { Router, RouterError, RECOVERY_NOTE } from '../src/router.js'
 import { DeferredRegistry } from '../src/deferred.js'
+import { OwnerSwitch } from '../src/owner-switch.js'
+import { FeishuSource } from '../src/feishu.js'
+import { TimerService } from '../src/timers.js'
 import { discardOutboxRows, deliverRecordedReplies } from '../src/outbox.js'
 import { NotificationThrottle } from '../src/notifications.js'
 
@@ -44,6 +47,370 @@ function fixture({ failSessions = [], config } = {}) {
   const advance = (ms) => { nowMs += ms }
   return { router, registry, store, calls, advance, cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }) } }
 }
+
+/** The production services share one database. Host sessions survive reopening it. */
+function handoffFixture({ ttlMs = 1000 } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-handoff-'))
+  let store
+  let nowMs = Date.parse('2026-11-15T00:00:00.000Z')
+  const now = () => new Date(nowMs).toISOString()
+  const ownerSession = 'handoff-original-owner'
+  const host = new Map([[ownerSession, { cwd: '/repos/fixture', agentPreset: 'hub-bot-owner', status: 'idle' }]])
+  const prompts = []
+  const sessions = {
+    create: async ({ owner, sessionId, cwd = owner?.cwd, agentPreset = owner && 'hub-bot-owner' }) => {
+      sessionId ??= 'handoff-created-' + host.size
+      if (!host.has(sessionId)) host.set(sessionId, { cwd, agentPreset, status: 'idle' })
+      return { sessionId, agentPreset }
+    },
+    status: async ({ sessionId }) => host.get(sessionId)?.status ?? 'missing',
+    isArchived: sessionId => host.get(sessionId)?.archived === true,
+    workerInfo: async sessionId => host.get(sessionId),
+    hasPromptReceipt: async ({ sessionId, requestId }) => host.has(sessionId)
+      ? prompts.some(prompt => prompt.sessionId === sessionId && prompt.requestId === requestId) : undefined,
+    archive: async ({ sessionId }) => { host.get(sessionId).archived = true },
+    prompt: async request => {
+      const { sessionId, requestId } = request
+      if (!host.has(sessionId)) throw Object.assign(new Error('Host session is missing'), { code: 'session/not-found' })
+      if (!prompts.some(prompt => prompt.sessionId === sessionId && prompt.requestId === requestId)) prompts.push(request)
+      return { accepted: true }
+    },
+  }
+  const open = () => {
+    store = new Store(dir)
+    const registry = new OwnerRegistry(store, { scratchRoot: join(dir, 'scratch') })
+    registry.ensureChief({ cwd: '/repos', workspace: 'Chief' })
+    const router = new Router({ store, registry, sessions, now })
+    const deferred = new DeferredRegistry({ store, tasks: router.tasks, now, ttlMs,
+      owners: { currentBinding: id => registry.get(id), isOwnerSession: id => registry.isOwnerSession(id) } })
+    router.installDeferred(deferred)
+    const ownerSwitch = new OwnerSwitch({ store, registry, sessions, now,
+      buildFacts: () => 'Fixture owner facts from SQLite.', withAdmission: (id, work) => router.withOwnerAdmission(id, work) })
+    router.ownerSwitch = ownerSwitch
+    const timers = new TimerService({ store, now: () => nowMs, getOwner: id => registry.get(id),
+      getTicket: id => router.getTicket(id), routeBackground: request => router.routeBackground(request) })
+    router.timerDeliveryState = (id, ref) => timers.deliveryState(id, ref)
+    return { router, registry, ownerSwitch, deferred, store, timers }
+  }
+  const initial = open()
+  const owner = initial.registry.create({ kind: 'repo', cwd: '/repos/fixture', workspace: 'Handoff fixture' })
+  initial.registry.bindSession(owner.id, ownerSession)
+  return { ...initial, owner, ownerSession, host, sessions, prompts, open, advance: ms => { nowMs += ms },
+    cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }) } }
+}
+
+function pausePreparation({ sessions, ownerSwitch }, operation, failure) {
+  const entered = Promise.withResolvers()
+  const paused = Promise.withResolvers()
+  const prompt = sessions.prompt
+  sessions.prompt = async request => {
+    if (request.requestId === operation.initializationRequestId) {
+      entered.resolve()
+      await paused.promise
+      if (failure) throw failure
+    }
+    return prompt(request)
+  }
+  const done = ownerSwitch.tick()
+  return { entered: Promise.race([entered.promise, done]), release: paused.resolve, done, restorePrompt: () => { sessions.prompt = prompt } }
+}
+
+test('a panel answer received during preparation resumes the new owner after SQLite reopens', async () => {
+  const env = handoffFixture()
+  const { router, owner, ownerSession, ownerSwitch, prompts, store, advance } = env
+  let preparing
+  try {
+    const { ticketId } = await router.routeToOwner({ ownerId: owner.id, message: 'Start fixture work.' })
+    const { requestId, expiresAt } = router.openQuestion({ ticketId, question: 'Which fixture?' }).deferred
+    const operation = router.ownerSwitchAction({ action: 'request', ownerId: owner.id, expectedSessionId: ownerSession })
+    preparing = pausePreparation(env, operation)
+    await preparing.entered
+    assert.equal(ownerSwitch.phaseFor(owner.id), 'preparing')
+    advance(900)
+    const receivedAt = router.now()
+    const answer = { ticketId, requestId, decision: 'answer', text: 'Use fixture A.', channel: 'panel' }
+    assert.deepEqual(await router.resolveDeferred(answer), { ticketId, requestId, stage: 'person/answer', outcome: 'queued', duplicate: false })
+    assert.equal(router.getTicket(ticketId).deferred.expiresAt, expiresAt)
+    await router.tick()
+    assert.equal(env.deferred.get(requestId).status, 'pending')
+    assert.deepEqual(prompts.filter(prompt => prompt.requestId === 'hub-bot-answer-' + requestId), [])
+
+    store.close() // Interrupt preparation while the Host request is in flight.
+    preparing.restorePrompt()
+    advance(1100)
+    const restarted = env.open()
+    await restarted.router.markRestart()
+    await restarted.router.tick()
+    assert.equal(restarted.deferred.get(requestId).status, 'pending')
+    await restarted.ownerSwitch.tick()
+    assert.equal(restarted.registry.get(owner.id).sessionId, operation.newSessionId)
+    preparing?.release() // The retired callback cannot advance the reopened operation.
+    await preparing?.done
+    env.sessions.archive = async () => { throw Error('Host failed to archive the old session') }
+    await restarted.ownerSwitch.tick()
+    assert.equal(restarted.ownerSwitch.get(operation).status, 'archive-failed')
+    await restarted.router.tick()
+    assert.equal((await restarted.router.resolveDeferred(answer)).duplicate, true)
+    await restarted.router.tick()
+    const request = restarted.deferred.get(requestId)
+    assert.equal(request.receivedAt, receivedAt)
+    assert.equal(request.expiresAt, expiresAt)
+    assert.equal(request.outcome.delivery.state, 'sent')
+    assert.deepEqual(prompts.filter(prompt => prompt.requestId === 'hub-bot-answer-' + requestId).map(prompt => prompt.sessionId), [operation.newSessionId])
+    assert.equal(prompts.filter(prompt => prompt.requestId === operation.initializationRequestId).length, 1)
+  } finally {
+    preparing?.release()
+    await preparing?.done
+    env.cleanup()
+  }
+})
+
+test('a timely Feishu answer survives preparation failure and a late competing cancellation', async () => {
+  const env = handoffFixture()
+  const { router, owner, ownerSession, ownerSwitch, prompts, store, advance } = env
+  let preparing
+  try {
+    const feishu = new FeishuSource({ store, router, now: router.now })
+    const receive = (id, text) => feishu.handleEvent({
+      message: { message_id: id, chat_id: 'fixture-chat', chat_type: 'p2p', message_type: 'text', content: JSON.stringify({ text }) },
+      sender: { sender_type: 'user', sender_id: { open_id: 'fixture-user' } },
+    })
+    const original = await receive('question-origin', 'Start work in the fixture.')
+    const { ticketId } = await router.routeToOwner({ ownerId: owner.id, triggerRef: original.triggerId, message: 'Start fixture work.' })
+    const { requestId, expiresAt } = router.openQuestion({ ticketId, question: 'Which fixture?' }).deferred
+    const operation = router.ownerSwitchAction({ action: 'request', ownerId: owner.id, expectedSessionId: ownerSession })
+    preparing = pausePreparation(env, operation, new Error('Host failed to load the replacement owner facts'))
+    await preparing.entered
+    advance(900)
+    const receivedAt = router.now()
+    const reply = '/hub-answer ' + requestId + ' answer Use fixture B.'
+    assert.equal((await receive('handoff-reply', reply)).queued, true)
+    assert.equal((await receive('handoff-reply', reply)).deduped, true)
+    await router.tick()
+    assert.equal(env.deferred.get(requestId).status, 'pending')
+    assert.equal((await router.resolveDeferred({ ticketId, requestId, decision: 'cancel', channel: 'panel' })).outcome, 'queued')
+    advance(200)
+    await assert.rejects(router.resolveDeferred({ ticketId, requestId, decision: 'cancel', channel: 'panel' }), { code: 'request-expired' })
+    assert.equal(env.deferred.get(requestId).status, 'pending')
+    const interim = router.listOutbox().find(row => row.id === 'out-decision-received-feishu-handoff-reply')
+    assert.match(interim?.body, /已排队/)
+    assert.equal(interim.to, 'feishu:chat:fixture-chat')
+    await router.tick()
+    assert.equal(env.deferred.get(requestId).status, 'pending')
+
+    preparing?.release()
+    await preparing?.done
+    assert.equal(ownerSwitch.get(operation).status, 'failed')
+    await router.tick()
+    await router.tick()
+    const request = env.deferred.get(requestId)
+    assert.equal(request.receivedAt, receivedAt)
+    assert.equal(request.expiresAt, expiresAt)
+    assert.equal(request.outcome.delivery.state, 'sent')
+    assert.deepEqual(prompts.filter(prompt => prompt.requestId === 'hub-bot-answer-' + requestId).map(prompt => prompt.sessionId), [ownerSession])
+    assert.equal(router.listOutbox().filter(row => row.id === 'out-decision-reply-feishu-handoff-reply').length, 1)
+    assert.equal(router.listOutbox().some(row => row.id === 'out-expiry-' + requestId), false)
+  } finally {
+    preparing?.release()
+    await preparing?.done
+    env.cleanup()
+  }
+})
+
+test('an admitted answer is not replayed after restart and a committed switch with archival failure', async () => {
+  const env = handoffFixture()
+  const { router, owner, ownerSession, ownerSwitch, sessions, prompts, store, host, advance } = env
+  const paused = Promise.withResolvers()
+  let delivering
+  try {
+    const { ticketId } = await router.routeToOwner({ ownerId: owner.id, message: 'Start fixture work.' })
+    const { requestId } = router.openQuestion({ ticketId, question: 'Which fixture?' }).deferred
+    const answerPrompt = 'hub-bot-answer-' + requestId
+    host.get(ownerSession).status = 'busy'
+    const operation = router.ownerSwitchAction({ action: 'request', ownerId: owner.id, expectedSessionId: ownerSession })
+    await ownerSwitch.tick()
+    assert.equal(ownerSwitch.phaseFor(owner.id), 'waiting')
+    assert.equal((await router.resolveDeferred({ ticketId, requestId, decision: 'answer', text: 'Use fixture C.', channel: 'panel' })).outcome, 'answered')
+    const entered = Promise.withResolvers()
+    const originalPrompt = sessions.prompt
+    sessions.prompt = async request => {
+      const result = await originalPrompt(request)
+      if (request.requestId !== answerPrompt) return result
+      entered.resolve()
+      await paused.promise
+      return result
+    }
+    delivering = router.tick()
+    await entered.promise
+    assert.deepEqual(prompts.filter(prompt => prompt.requestId === answerPrompt).map(prompt => prompt.sessionId), [ownerSession])
+    assert.equal(env.deferred.get(requestId).outcome.delivery.state, 'queued')
+    store.close() // Host admission survived. The local delivery receipt did not.
+    sessions.prompt = originalPrompt
+    host.get(ownerSession).status = 'idle'
+    advance(1100)
+    const restarted = env.open()
+    await restarted.router.markRestart()
+    await restarted.ownerSwitch.tick()
+    assert.equal(restarted.ownerSwitch.get(operation).status, 'committed')
+    assert.equal(restarted.registry.get(owner.id).sessionId, operation.newSessionId)
+    sessions.archive = async () => { throw Error('Host failed to archive the old session') }
+    await restarted.ownerSwitch.tick()
+    assert.equal(restarted.ownerSwitch.get(operation).status, 'archive-failed')
+    paused.resolve()
+    await delivering
+    await restarted.router.tick()
+    assert.equal(restarted.deferred.get(requestId).outcome.delivery.state, 'sent')
+    assert.deepEqual(prompts.filter(prompt => prompt.requestId === answerPrompt).map(prompt => prompt.sessionId), [ownerSession])
+    await restarted.router.tick()
+    assert.equal(prompts.filter(prompt => prompt.requestId === answerPrompt).length, 1)
+  } finally {
+    paused.resolve()
+    await delivering
+    env.cleanup()
+  }
+})
+
+test('the scheduled timer keeps its exact worker for a timely answer while the owner is preparing', async () => {
+  const env = handoffFixture({ ttlMs: 5000 })
+  const { router, owner, ownerSession, ownerSwitch, prompts, timers, advance } = env
+  let preparing
+  try {
+    const timer = timers.create({ ownerId: owner.id, createdBy: 'fixture-user', message: 'Check fixture.',
+      schedule: { frequency: 'daily', time: '08:01' } })
+    advance(Date.parse(timer.fireAt) - Date.parse(router.now()))
+    await timers.tick()
+    const occurrence = timers.get(timer.id).delivery
+    const worker = router.getTicket(occurrence.ticketId).workerSession.sessionId
+    assert.equal(occurrence.state, 'sent')
+    router.askWorker({ ticketId: occurrence.ticketId, sessionId: worker, question: 'Which file should I check?' })
+    const { requestId } = router.getTicket(occurrence.ticketId).deferred
+
+    const operation = router.ownerSwitchAction({ action: 'request', ownerId: owner.id, expectedSessionId: ownerSession })
+    preparing = pausePreparation(env, operation)
+    await preparing.entered
+    const answer = { requestId, ticketId: occurrence.ticketId, decision: 'answer', text: 'Use the fixture manifest.', channel: 'panel' }
+    assert.equal((await router.resolveDeferred(answer)).outcome, 'answered')
+    await router.tick()
+    assert.equal(ownerSwitch.phaseFor(owner.id), 'preparing')
+    assert.deepEqual(prompts.filter(prompt => prompt.requestId === 'hub-bot-answer-' + requestId).map(prompt => prompt.sessionId), [worker])
+    assert.equal(env.deferred.get(requestId).outcome.delivery.sessionId, worker)
+
+    preparing?.release()
+    await preparing?.done
+    await ownerSwitch.tick()
+    assert.equal(env.registry.get(owner.id).sessionId, operation.newSessionId)
+    assert.equal((await router.resolveDeferred(answer)).duplicate, true)
+    advance(Date.parse(timers.get(timer.id).fireAt) - Date.parse(router.now()))
+    await timers.tick()
+    const next = timers.get(timer.id).delivery
+    assert.notEqual(next.ticketId, occurrence.ticketId)
+    assert.equal(router.getTicket(next.ticketId).workerSession.sessionId, worker)
+    assert.equal(env.host.size, 3)
+    assert.equal(prompts.filter(prompt => prompt.requestId === 'hub-bot-answer-' + requestId).length, 1)
+  } finally {
+    preparing?.release()
+    await preparing?.done
+    env.cleanup()
+  }
+})
+
+test('a held approval keeps its exact action target and late or cancelled questions stay closed', async () => {
+  const env = handoffFixture()
+  const { router, owner, ownerSession, ownerSwitch, prompts, advance, deferred } = env
+  let preparing
+  try {
+    const startWork = message => router.routeToOwner({ ownerId: owner.id, message })
+    const approval = await startWork('Prepare the original confirmed destination.')
+    const action = { type: 'dangerous-inject', entry: 'follow-up', message: 'Run the previously authorized fixture action.' }
+    const { requestId: approvalId, target } = router.openQuestion({ ticketId: approval.ticketId, question: 'Approve the exact destination?', action }).deferred
+    assert.deepEqual(target, { ownerId: owner.id, sessionId: ownerSession })
+    const expired = await startWork('Start the expiring question.')
+    const { requestId: expiredId } = router.openQuestion({ ticketId: expired.ticketId, question: 'Which expiry fixture?' }).deferred
+    const cancelled = await startWork('Start the cancellable question.')
+    const { requestId: cancelledId } = router.openQuestion({ ticketId: cancelled.ticketId, question: 'Which cancellation fixture?' }).deferred
+    assert.equal((await router.resolveDeferred({ requestId: cancelledId, decision: 'cancel', channel: 'panel' })).outcome, 'cancelled')
+
+    const operation = router.ownerSwitchAction({ action: 'request', ownerId: owner.id, expectedSessionId: ownerSession })
+    preparing = pausePreparation(env, operation)
+    await preparing.entered
+    advance(900)
+    const receiptAt = router.now()
+    assert.equal((await router.resolveDeferred({ requestId: approvalId, decision: 'approve', channel: 'panel' })).outcome, 'queued')
+    assert.equal(deferred.get(approvalId).status, 'pending')
+    advance(200)
+    await assert.rejects(router.resolveDeferred({ requestId: expiredId, decision: 'answer', text: 'Too late.', channel: 'panel' }), { code: 'request-expired' })
+    await assert.rejects(router.resolveDeferred({ requestId: cancelledId, decision: 'answer', text: 'Already cancelled.', channel: 'panel' }), { code: 'request-closed' })
+    assert.equal(deferred.get(expiredId).status, 'expired')
+    assert.equal(deferred.get(cancelledId).status, 'cancelled')
+    assert.equal(deferred.get(approvalId).status, 'pending')
+
+    preparing?.release()
+    await preparing?.done
+    await ownerSwitch.tick()
+    assert.equal(env.registry.get(owner.id).sessionId, operation.newSessionId)
+    await router.tick()
+    await router.tick()
+    const approved = deferred.get(approvalId)
+    assert.deepEqual(approved.target, target)
+    assert.equal(approved.receivedAt, receiptAt)
+    assert.equal(approved.outcome.kind, 'fulfillment-failed')
+    assert.match(approved.outcome.reason, /original owner session/)
+    assert.equal(prompts.some(prompt => ['hub-bot-approved-' + approvalId, 'hub-bot-answer-' + expiredId, 'hub-bot-answer-' + cancelledId].includes(prompt.requestId)), false)
+    assert.equal(router.getTicket(approval.ticketId).stage, 'failed')
+  } finally {
+    preparing?.release()
+    await preparing?.done
+    env.cleanup()
+  }
+})
+
+test('retry on a new owner requires verified absence at the attempted recipient', async t => {
+  for (const [label, receipt] of [['verified absent', false], ['unavailable', undefined]]) {
+    await t.test(label, async () => {
+      const env = handoffFixture()
+      const { router, owner, ownerSession, sessions, prompts, store, advance } = env
+      try {
+        const { ticketId } = await router.routeToOwner({ ownerId: owner.id, message: 'Start fixture work.' })
+        const { requestId } = router.openQuestion({ ticketId, question: 'Which fixture?' }).deferred
+        const promptId = 'hub-bot-answer-' + requestId
+        await router.resolveDeferred({ ticketId, requestId, decision: 'answer', text: 'Use fixture D.', channel: 'panel' })
+        const prompt = sessions.prompt
+        sessions.prompt = async request => {
+          if (request.requestId === promptId) throw Error('The Host admission result was lost.')
+          return prompt(request)
+        }
+        await router.tick()
+        assert.equal(env.deferred.get(requestId).outcome.delivery.state, 'queued')
+        store.close()
+        sessions.prompt = prompt
+        const checked = []
+        sessions.hasPromptReceipt = async query => { checked.push(query); return receipt }
+        const restarted = env.open()
+        await restarted.router.markRestart()
+        const operation = restarted.router.ownerSwitchAction({ action: 'request', ownerId: owner.id, expectedSessionId: ownerSession })
+        await restarted.ownerSwitch.tick()
+        assert.equal(restarted.ownerSwitch.get(operation).status, 'committed')
+        for (const waitMs of [1000, 2000, 4000]) {
+          advance(waitMs)
+          await restarted.router.tick()
+        }
+        assert.ok(checked.length > 0)
+        assert.ok(checked.every(query => query.sessionId === ownerSession && query.requestId === promptId))
+        const delivery = restarted.deferred.get(requestId).outcome.delivery
+        if (receipt === false) {
+          assert.equal(delivery.state, 'sent')
+          assert.equal(delivery.sessionId, operation.newSessionId)
+          assert.deepEqual(prompts.filter(input => input.requestId === promptId).map(input => input.sessionId), [operation.newSessionId])
+        } else {
+          assert.equal(delivery.state, 'failed')
+          assert.match(delivery.reason, /could not be verified/)
+          assert.equal(restarted.router.getTicket(ticketId).stage, 'blocked')
+          assert.equal(prompts.some(input => input.requestId === promptId), false)
+        }
+      } finally { env.cleanup() }
+    })
+  }
+})
 
 test('an explicit chief switch fences same-chat messages around the durable control', async () => {
   const { router, registry, calls, advance, cleanup } = fixture()

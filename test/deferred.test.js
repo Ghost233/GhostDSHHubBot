@@ -314,6 +314,31 @@ test('a trusted in-window receipt survives a delayed dequeue and sets the real a
   } finally { env.cleanup() }
 })
 
+test('a late cancellation can reject without closing the pending request protected by a timely receipt', async () => {
+  const env = fixture({ ttlMs: 1000 })
+  let reopened
+  try {
+    const { input, ticket } = askForAnswer(env)
+    const original = env.registry.get(input.requestId)
+    const receivedAt = '2026-11-15T00:00:00.900Z'
+    env.clock.at = original.expiresAt
+    await assert.rejects(env.registry.resolve({ requestId: input.requestId, actor: REQUESTER, decision: 'cancel',
+      receivedAt: env.clock.at, hasTimelyReceipt: true }), { code: 'request-expired' })
+    assert.deepEqual(env.registry.get(input.requestId), original)
+    assert.equal(env.board.getTicket(ticket.id).stage, 'person/answer')
+    env.store.close()
+    reopened = new Store(env.store.stateDir)
+    const now = () => env.clock.at
+    const board = new TaskBoard({ store: reopened, now })
+    const registry = new DeferredRegistry({ store: reopened, tasks: board, now, ttlMs: 1000 })
+    const answered = await registry.resolve({ ...input, receivedAt })
+    assert.equal(answered.request.expiresAt, original.expiresAt)
+    assert.equal(answered.request.receivedAt, receivedAt)
+    assert.equal(answered.outcome.text, input.text)
+    assert.equal(board.getTicket(ticket.id).stage, 'working')
+  } finally { reopened?.close(); env.cleanup() }
+})
+
 test('registry write failures roll back phases and an unrecorded dispatch result cannot be retried', async () => {
   let calls = 0
   const env = fixture({ handlers: { fork: () => { calls += 1; return { dispatched: true } } } })
@@ -593,6 +618,28 @@ test('answer acceptance queues delivery and sent evidence survives a duplicate o
     assert.equal(env.board.getTicket(ticket.id).stage, 'working')
     assert.equal(closed.length, 1)
   } finally { env.cleanup() }
+})
+
+test('the attempted answer receiver survives reopen until an exact receipt settles it', async () => {
+  const env = fixture()
+  let reopened
+  try {
+    const { input, ticket } = askForAnswer(env)
+    await env.registry.resolve(input)
+    env.registry.noteAnswerDeliveryAttempt(input.requestId, 'fixture-original')
+    env.store.close()
+    reopened = new Store(env.store.stateDir)
+    const now = () => env.clock.at
+    const board = new TaskBoard({ store: reopened, now })
+    const registry = new DeferredRegistry({ store: reopened, tasks: board, now })
+    const attempted = { state: 'queued', attemptedSessionId: 'fixture-original' }
+    assert.deepEqual(registry.get(input.requestId).outcome.delivery, attempted)
+    assert.deepEqual(board.getTicket(ticket.id).deferred.outcome.delivery, attempted)
+    const { request } = registry.recordAnswerDelivery(input.requestId, { state: 'sent', sessionId: 'fixture-original' })
+    assert.deepEqual(request.outcome.delivery, { state: 'sent', sessionId: 'fixture-original', at: env.clock.at })
+    registry.noteAnswerDeliveryAttempt(input.requestId, 'fixture-later')
+    assert.deepEqual(registry.get(input.requestId), request)
+  } finally { reopened?.close(); env.cleanup() }
 })
 
 test('answer delivery failure blocks only the working run resumed by that answer', async () => {

@@ -78,7 +78,8 @@ function describeOwnerSwitch(operation) {
 export class Router {
   /**
    * @param {{ store: import('./store.js').Store, registry: import('./registry.js').OwnerRegistry,
-   *   sessions: { create: (request: any) => Promise<any>, prompt: (request: any) => Promise<any>, isRunning?: (sessionId: string) => Promise<boolean> },
+   *   sessions: { create: (request: any) => Promise<any>, prompt: (request: any) => Promise<any>, isRunning?: (sessionId: string) => Promise<boolean>,
+   *     hasPromptReceipt?: (address: { sessionId: string, requestId: string }) => Promise<boolean | undefined> },
    *   tasks?: import('./tasks.js').TaskBoard, runner?: import('./outbox.js').OutboxRunner,
    *   config?: { reporting?: { auto: boolean, intervalMs: number } },
    *   now?: () => string, ids?: { uuid: () => string },
@@ -137,10 +138,10 @@ export class Router {
     }
   }
 
-  ownerSwitchAction({ action, ownerId, expectedSessionId, operationId, mode, requestId } = {}) {
+  ownerSwitchAction({ action, ownerId, expectedSessionId, operationId, mode, requestId, summary } = {}) {
     if (!this.ownerSwitch) throw new RouterError('owner-switch-unavailable', '负责人更换暂不可用。')
     if (typeof ownerId !== 'string' || !ownerId.trim()) throw new RouterError('owner-switch-invalid', '需要指定负责人。')
-    if (action === 'request') return this.ownerSwitch.request({ ownerId, expectedSessionId, mode, requestId })
+    if (action === 'request') return this.ownerSwitch.request({ ownerId, expectedSessionId, mode, requestId, summary })
     if (action === 'status') return (operationId ? this.ownerSwitch.get({ ownerId, operationId }) : this.ownerSwitch.list({ ownerId })[0]) ?? null
     if (!['cancel', 'retry-archive'].includes(action) || typeof operationId !== 'string' || !operationId) {
       throw new RouterError('owner-switch-invalid', '需要指定更换操作编号。')
@@ -276,8 +277,7 @@ export class Router {
     return request.source.kind === 'feishu' && request.source.chatId === chatId && request.requester.actor === actor
   }
 
-  async resolveDeferred({ requestId, ticketId, decision, text, channel, actor, chatId, receivedAt }) {
-    const receipt = channel === 'panel' ? this.now() : receivedAt
+  #requestForDecision({ requestId, ticketId, channel, actor, chatId }) {
     const request = this.deferred?.get(requestId)
     if (!request || (ticketId !== undefined && ticketId !== request.ticketId)) {
       throw new RouterError('unknown-deferred', 'The decision does not identify this request.')
@@ -285,9 +285,16 @@ export class Router {
     if (channel !== 'panel' && !(channel === 'feishu' && this.#isOriginalFeishuSender(request, actor, chatId))) {
       throw new RouterError('deferred-actor-mismatch', 'The original sender must answer in the original Feishu chat, or use the authenticated panel.')
     }
-    if (channel === 'panel' && this.#isTimelyDecision(request, decision, text, receipt, Date.parse(receipt))) {
+    return request
+  }
+
+  async resolveDeferred({ requestId, ticketId, decision, text, channel, actor, chatId, receivedAt }) {
+    if (this.store.closed) throw new RouterError('deferred-stopped', 'Hub Bot stopped while processing this decision.')
+    const receipt = channel === 'panel' ? this.now() : receivedAt ?? this.now()
+    const request = this.#requestForDecision({ requestId, ticketId, channel, actor, chatId })
+    if (this.#isTimelyDecision(request, decision, text, receipt, Date.parse(this.now()))) {
       const row = insertOutbox(this.store, {
-        kind: 'deferred-decision', state: 'queued', to: 'owner:' + request.ownerId,
+        kind: 'deferred-decision', state: 'queued', to: 'deferred:' + requestId,
         requestId: 'hub-bot-panel-decision-' + this.ids.uuid(),
         panelDecision: { requestId, ticketId: request.ticketId, decision, text: text ?? null, receivedAt: receipt },
       }, () => Date.parse(receipt))
@@ -296,20 +303,32 @@ export class Router {
     return this.#applyDeferredDecision(request, { decision, text, receivedAt: receipt })
   }
 
-  #applyDeferredDecision(request, { decision, text, receivedAt }) {
-    return this.#serialized('owner:' + request.ownerId, async () => {
-      if (this.store.closed) throw new Error('Hub Bot stopped while processing this decision.')
+  #applyDeferredDecision(request, { decision, text, receivedAt }, rowId) {
+    const apply = async () => {
+      if (this.store.closed) throw new RouterError('deferred-stopped', 'Hub Bot stopped while processing this decision.')
       const { requestId } = request
       const ticket = this.tasks.getTicket(request.ticketId)
       if (!ticket?.authorization || ticket.deferred?.requestId !== requestId) {
         throw new RouterError('stale-deferred', 'This request is no longer the active decision for its task.')
       }
-      const workerUnavailable = decision === 'answer' && this.deferred.get(requestId)?.status === 'pending' && request.receiver.kind === 'worker'
+      const current = this.deferred.get(requestId)
+      const timely = this.#isTimelyDecision(current, decision, text, receivedAt, Date.parse(this.now()))
+      const preparing = request.receiver?.kind !== 'worker' && this.ownerSwitch?.phaseFor(request.ownerId) === 'preparing'
+      if (timely && (preparing || this.#receivedDecisions(requestId).get(requestId) !== rowId)) {
+        return { ticketId: ticket.id, requestId, stage: ticket.stage, outcome: 'queued', duplicate: false }
+      }
+      const workerUnavailable = decision === 'answer' && current?.status === 'pending' && request.receiver?.kind === 'worker'
         && !await this.#canReceiveWorkerAnswer(ticket, request.receiver.sessionId)
-      if (this.store.closed) throw new Error('Hub Bot stopped while processing this decision.')
-      const result = await this.deferred.resolve({ requestId, decision, text, actor: { actor: request.requester.actor }, workerUnavailable, receivedAt })
+      if (this.store.closed) throw new RouterError('deferred-stopped', 'Hub Bot stopped while processing this decision.')
+      const hasTimelyReceipt = current?.status === 'pending' && Date.parse(receivedAt) >= Date.parse(current.expiresAt)
+        && this.#receivedDecisions(requestId).has(requestId)
+      const result = await this.deferred.resolve({ requestId, decision, text, actor: { actor: request.requester.actor },
+        workerUnavailable, receivedAt, hasTimelyReceipt })
+      if (this.store.closed) throw new RouterError('deferred-stopped', 'Hub Bot stopped while processing this decision.')
       return { ticketId: ticket.id, requestId, stage: this.tasks.getTicket(ticket.id).stage, outcome: result.status, duplicate: result.duplicate }
-    })
+    }
+    return this.#serialized('owner:' + request.ownerId, () => request.receiver?.kind === 'worker'
+      ? apply() : this.withOwnerAdmission(request.ownerId, apply))
   }
 
   #applyPanelDecision(row) {
@@ -326,8 +345,8 @@ export class Router {
         const input = row.panelDecision
         const request = this.deferred?.get(input.requestId)
         if (!request || request.ticketId !== input.ticketId) throw new RouterError('unknown-deferred', 'This decision has no matching request.')
-        const result = await this.#applyDeferredDecision(request, input)
-        recorded()
+        const result = await this.#applyDeferredDecision(request, input, row.id)
+        if (result.outcome !== 'queued') recorded()
         return result
       } catch (error) {
         if (['TaskError', 'RouterError', 'DeferredError'].includes(error?.name)) recorded(error.code)
@@ -340,9 +359,10 @@ export class Router {
 
   #enqueueDeferredOutcome(request) {
     if (request.status === 'answered' && request.outcome.decision === 'answer') {
+      const worker = request.receiver?.kind === 'worker' ? request.receiver.sessionId : null
       this.runner.enqueue({
         id: 'out-answer-' + request.requestId, kind: 'deferred-answer', ticketId: request.ticketId, triggerId: request.source.triggerId,
-        to: 'owner:' + request.ownerId, requestId: 'hub-bot-answer-' + request.requestId,
+        to: worker ? 'session:' + worker : 'owner:' + request.ownerId, sessionId: worker, requestId: 'hub-bot-answer-' + request.requestId,
         body: '[您的答复 ' + request.ticketId + '] ' + request.outcome.text,
       })
     } else if (request.status === 'expired') {
@@ -360,6 +380,7 @@ export class Router {
     if (!this.#isBoundWorker(ticket, sessionId)) return false
     if (!this.sessions.workerInfo) return true
     const worker = await this.sessions.workerInfo(sessionId)
+    if (this.store.closed) return false
     const live = this.tasks.getTicket(ticket.id)
     const owner = live && this.registry.get(live.owner)
     return Boolean(owner && !owner.recycled && this.#isBoundWorker(live, sessionId) && worker?.cwd
@@ -367,11 +388,40 @@ export class Router {
   }
 
   #currentDeferredWork(ticketId, requestId) {
+    if (this.store.closed) return undefined
     const ticket = this.tasks.getTicket(ticketId)
     if (!requestId || ticket?.stage !== 'working' || ticket.deferred?.requestId !== requestId || !ticket.authorization) return undefined
     const revision = ticket.deferred.waitRevision
     if (typeof revision === 'number' && ticket.transitions?.length !== revision + 1) return undefined
     return ticket
+  }
+
+  async #admitDeferredPrompt(request, promptId, sessionId, send) {
+    const { requestId } = request
+    const attemptedSessionId = this.deferred.get(requestId)?.outcome?.delivery?.attemptedSessionId
+    if (attemptedSessionId && (attemptedSessionId !== sessionId || this.sessions.isArchived?.(sessionId))) {
+      // Host prompt IDs deduplicate within a session. A retry on a different session must first
+      // establish whether the previous session accepted it before the local receipt was written.
+      const admitted = await this.sessions.hasPromptReceipt?.({ sessionId: attemptedSessionId, requestId: promptId })
+      if (this.store.closed) return null
+      if (admitted === true) return { sessionId: attemptedSessionId }
+      if (admitted !== false) throw new RouterError('answer-receipt-unavailable', 'The previous answer delivery could not be verified.')
+    }
+    if (this.store.closed || !this.#currentDeferredWork(request.ticketId, requestId)) return null
+    if (this.sessions.isArchived?.(sessionId)) {
+      throw Object.assign(new Error('The answer receiver is archived.'), { permanent: true })
+    }
+    this.deferred.noteAnswerDeliveryAttempt(requestId, sessionId)
+    try {
+      return await send()
+    } catch (error) {
+      // A first attempt can clear a definitive rejection. A missing session on a retry cannot
+      // disprove acceptance of the earlier attempt.
+      if (!this.store.closed && attemptedSessionId !== sessionId && (isMissingSession(error) || error?.code === 'session/not-found')) {
+        this.deferred.noteAnswerDeliveryAttempt(requestId, null)
+      }
+      throw error
+    }
   }
 
   async #deliverDeferredAnswer(row) {
@@ -384,7 +434,7 @@ export class Router {
     if (deliveryState === 'sent') return
     if (deliveryState === 'failed') return inactive
     const skipped = () => {
-      if (request?.outcome?.decision === 'answer') this.deferred.recordAnswerDelivery(requestId, {
+      if (!this.store.closed && request?.outcome?.decision === 'answer') this.deferred.recordAnswerDelivery(requestId, {
         state: 'failed', reason: 'The task moved on before the answer could be delivered.',
       })
       return inactive
@@ -392,14 +442,20 @@ export class Router {
     if (!ticket) return skipped()
     const permanent = reason => Object.assign(new Error(reason), { permanent: true })
     const text = () => (current()?.recoveryPending ? RECOVERY_NOTE + '\n\n' : '') + row.body
-    if (request.receiver.kind === 'worker') {
+    const admit = (sessionId, send) => this.#admitDeferredPrompt(request, row.requestId, sessionId, send)
+    let delivered
+    if (request.receiver?.kind === 'worker') {
       const sessionId = request.receiver.sessionId
       const available = await this.#canReceiveWorkerAnswer(ticket, sessionId)
       if (!current()) return skipped()
       const unavailable = 'The original execution session is no longer available.'
       if (!available) throw permanent(unavailable)
       try {
-        await this.sessions.prompt({ sessionId, requestId: row.requestId, text: text() })
+        delivered = await admit(sessionId, async () => {
+          const result = await this.sessions.prompt({ sessionId, requestId: row.requestId, text: text() })
+          if (result?.accepted === false) throw new RouterError('worker-not-admitted', 'The execution Session did not accept the answer.')
+          return { sessionId }
+        })
       } catch (error) {
         if (isMissingSession(error) || error?.code === 'session/not-found') throw permanent(unavailable)
         throw error
@@ -407,13 +463,13 @@ export class Router {
     } else {
       const owner = this.registry.get(request.ownerId)
       if (!owner || owner.recycled) throw permanent('The original owner is no longer available.')
-      const delivered = await this.#promptOwner(owner.id, ticket.id, row.requestId, text(), { isCurrent: current, neededWhileWaiting: true })
-      if (delivered?.postponeMs) return delivered
-      if (!delivered) return skipped()
+      delivered = await this.#promptOwner(owner.id, ticket.id, row.requestId, text(), { isCurrent: current, neededWhileWaiting: true, admit })
     }
+    if (delivered?.postponeMs) return delivered
+    if (!delivered) return skipped()
     if (this.store.closed) return
     this.#persistWork(() => {
-      this.deferred.recordAnswerDelivery(requestId, { state: 'sent' })
+      this.deferred.recordAnswerDelivery(requestId, { state: 'sent', sessionId: delivered.sessionId })
       if (current()?.recoveryPending) this.tasks.noteRecoveryCarried(ticket.id)
     })
   }
@@ -490,7 +546,8 @@ export class Router {
         this.#deliverOwnerSwitch(control)
       } else if (!trigger.dropped) {
         this.runner.enqueue({
-          id: outboxId, ticketId: null, triggerId: id, kind: stop ? 'stop' : command ? 'deferred-decision' : 'inbox', to: 'owner:chief',
+          id: outboxId, ticketId: null, triggerId: id, kind: stop ? 'stop' : command ? 'deferred-decision' : 'inbox',
+          to: command ? 'deferred:' + command[1] : 'owner:chief',
           body: trigger.message, sessionId, requestId,
         })
       }
@@ -613,13 +670,17 @@ export class Router {
    * (spec「错误场景」: 待确认路由 24 小时未确认自动取消，回复"已取消").
    */
   async tick() {
+    if (this.store.closed) return
     await this.runner.tick({ kind: 'deferred-decision' })
+    if (this.store.closed) return
     await this.runner.tick({ excludeKind: 'deferred-decision' })
+    if (this.store.closed) return
     await this.#sweepConfirmTimeouts()
+    if (this.store.closed) return
     // #72 执行槽： a slot freed since the last pulse promotes the oldest queued ticket (FIFO); the second
     // runner pass delivers the released injection in the same pulse （提升即投递）.
     await this.#promoteQueued()
-    await this.runner.tick({ excludeKind: 'deferred-decision' })
+    if (!this.store.closed) await this.runner.tick({ excludeKind: 'deferred-decision' })
   }
 
   /**
@@ -629,39 +690,41 @@ export class Router {
    * person/confirm, so the notice fires exactly once.
    */
   #isTimelyDecision(request, decision, text, at, nowMs) {
-    if (request.status !== 'pending') return false
+    if (request?.status !== 'pending') return false
     const received = Date.parse(at)
     if (!(received <= nowMs && received >= Date.parse(request.openedAt) && received < Date.parse(request.expiresAt))) return false
     const ticket = this.tasks.getTicket(request.ticketId)
-    if (!ticket?.authorization || ticket.deferred?.requestId !== request.requestId) return false
+    if (!ticket?.authorization || ticket.deferred?.requestId !== request.requestId || ticket.deferred.status !== 'pending') return false
+    const revision = ticket.deferred.waitRevision
+    if (typeof revision === 'number' && (ticket.transitions?.length ?? 0) !== revision) return false
     if (request.type === 'answer') return ticket.stage === 'person/answer' && (decision === 'cancel'
       || (decision === 'answer' && typeof text === 'string' && Boolean(text.trim())))
     return ticket.stage === 'person/confirm' && ['approve', 'reject', 'cancel'].includes(decision)
   }
 
-  #receivedDecisions() {
-    const ids = new Set()
+  #receivedDecisions(requestId = null) {
+    const first = new Map()
     const nowMs = Date.parse(this.now())
     const rows = this.store.db.prepare(`
-      SELECT value FROM outbox
-      WHERE json_extract(value, '$.kind') = 'deferred-decision' AND json_extract(value, '$.state') = 'queued'
-    `).all()
-    for (const { value } of rows) {
+      SELECT o.value, t.value AS triggerValue FROM outbox o LEFT JOIN trigger t ON t.id = json_extract(o.value, '$.triggerId')
+      WHERE json_extract(o.value, '$.kind') = 'deferred-decision' AND json_extract(o.value, '$.state') = 'queued'
+        AND (? IS NULL OR COALESCE(json_extract(o.value, '$.panelDecision.requestId'), json_extract(t.value, '$.decision.requestId')) = ?)
+      ORDER BY o.at, o.rowid
+    `).all(requestId, requestId)
+    for (const { value, triggerValue } of rows) {
       const row = JSON.parse(String(value))
-      if (row.panelDecision) {
-        const { requestId, ticketId, decision, text, receivedAt } = row.panelDecision
-        const request = this.deferred.get(requestId)
-        if (request?.ticketId === ticketId && this.#isTimelyDecision(request, decision, text, receivedAt, nowMs)) ids.add(requestId)
-        continue
-      }
-      const trigger = this.getTrigger(row.triggerId)
-      const choice = trigger?.decision
-      if (!choice || !trigger.authorization || trigger.dropped) continue
+      const trigger = triggerValue && JSON.parse(String(triggerValue))
+      const choice = row.panelDecision ?? trigger?.decision
+      if (!choice || first.has(choice.requestId)) continue
       const request = this.deferred.get(choice.requestId)
-      if (!request || !this.#isOriginalFeishuSender(request, trigger.authorization.actor, trigger.source?.chatId)) continue
-      if (this.#isTimelyDecision(request, choice.decision, choice.text, trigger.at, nowMs)) ids.add(request.requestId)
+      if (!request) continue
+      if (row.panelDecision) {
+        if (choice.ticketId !== request.ticketId) continue
+      } else if (!trigger.authorization || trigger.dropped
+        || !this.#isOriginalFeishuSender(request, trigger.authorization.actor, trigger.source?.chatId)) continue
+      if (this.#isTimelyDecision(request, choice.decision, choice.text, choice.receivedAt ?? trigger?.at, nowMs)) first.set(choice.requestId, row.id)
     }
-    return ids
+    return first
   }
 
   async #sweepConfirmTimeouts() {
@@ -705,7 +768,7 @@ export class Router {
       + '任务已绑到新会话并回到进行中；请用 inject_session（带 ticketId）把续作指令注入新会话继续任务。原会话保留可查，勿再注入。'
       + '\n\n授权：' + auth.actor + ' 经 ' + auth.source + ' 于 ' + auth.at + '；任务 ' + ticketId
     this.runner.enqueue({ ticketId, kind: 'inject', to: 'session:' + ensured.sessionId, sessionId: ensured.sessionId, body: text, requestId: 'hub-bot-route-' + this.ids.uuid() })
-    await this.runner.tick({ excludeKind: 'deferred-decision' })
+    if (!approvalId) await this.runner.tick({ excludeKind: 'deferred-decision' })
     return { ownerId: owner.id, sessionId: ensured.sessionId, ticketId, requestId: ticket.requestId, createdSession: ensured.created, rebuilt: false, deduped: false, confirmed: true, fork: { fromSessionId: result.fromSessionId, sessionId: result.sessionId }, stage: 'working' }
   }
 
@@ -1216,30 +1279,34 @@ export class Router {
     if (row.kind === 'deferred-decision') {
       if (row.panelDecision) {
         try {
-          await this.#applyPanelDecision(row)
-          return { recorded: true }
+          const result = await this.#applyPanelDecision(row)
+          return result.outcome === 'queued' ? { postponeMs: 0 } : { recorded: true }
         } catch (error) {
           if (!['TaskError', 'RouterError', 'DeferredError'].includes(error?.name)) throw error
           return { recorded: true, skipped: error.code }
         }
       }
       const trigger = this.getTrigger(row.triggerId)
-      if (!trigger?.authorization || !trigger.decision) return { recorded: true, skipped: 'invalid-decision' }
+      if (!trigger?.authorization || !trigger.decision || trigger.dropped) return { recorded: true, skipped: 'invalid-decision' }
       let message
+      let queued = false
       try {
-        const result = await this.resolveDeferred({ ...trigger.decision, actor: trigger.authorization.actor,
-          channel: 'feishu', chatId: trigger.source.chatId, receivedAt: trigger.at })
-        message = '已记录答复 ' + result.requestId + ' · ' + result.stage
+        const request = this.#requestForDecision({ ...trigger.decision, actor: trigger.authorization.actor,
+          channel: 'feishu', chatId: trigger.source.chatId })
+        const result = await this.#applyDeferredDecision(request, { ...trigger.decision, receivedAt: trigger.at }, row.id)
+        queued = result.outcome === 'queued'
+        message = '已记录答复 ' + result.requestId + (queued ? ' · 已排队，等待处理' : ' · ' + result.stage)
       } catch (error) {
         if (!['DeferredError', 'RouterError', 'TaskError'].includes(error?.name)) throw error
         message = '答复未受理：' + error.message
       }
-      const id = 'out-decision-reply-' + trigger.id
+      const reply = (queued ? 'decision-received-' : 'decision-reply-') + trigger.id
+      const id = 'out-' + reply
       if (!this.store.closed && !this.#outboxRow(id)) insertOutbox(this.store, {
         id, triggerId: trigger.id, kind: 'reply', state: 'recorded', to: 'feishu:chat:' + trigger.source.chatId,
-        requestId: 'hub-bot-decision-reply-' + trigger.id, body: message,
+        requestId: 'hub-bot-' + reply, body: message,
       }, () => Date.parse(this.now()))
-      return { recorded: true }
+      return queued ? { postponeMs: 0 } : { recorded: true }
     }
     if (row.kind === 'digest') return this.#deliverDigest(row)
     if (row.kind === 'reply') return this.#deliverReply(row)
@@ -1559,7 +1626,7 @@ export class Router {
   }
 
   /** Admit a prompt, retrying a missing binding only while the originating ticket is active. */
-  #promptOwner(ownerId, ticketId, requestId, text, { isCurrent, fixedSessionId, neededWhileWaiting, model } = {}) {
+  #promptOwner(ownerId, ticketId, requestId, text, { isCurrent, fixedSessionId, neededWhileWaiting, model, admit } = {}) {
     return this.withOwnerAdmission(ownerId, async () => {
       const phase = this.ownerSwitch?.phaseFor(ownerId)
       if (phase === 'preparing' || (phase === 'waiting' && !neededWhileWaiting)) return { postponeMs: 1000 }
@@ -1569,7 +1636,7 @@ export class Router {
         const latest = this.tasks.getTicket(ticketId)
         return !latest || this.#isTerminalTicket(latest)
       }
-      const send = async sessionId => {
+      const prompt = async sessionId => {
         const key = 'owner-bootstrap/' + ownerId
         const plan = this.store.get(key)
         const initializing = plan?.sessionId === sessionId
@@ -1592,6 +1659,7 @@ export class Router {
         })
         return { sessionId, rebuilt: initializing }
       }
+      const send = sessionId => admit ? admit(sessionId, () => prompt(sessionId)) : prompt(sessionId)
       if (ticketClosed()) return null
       let owner = this.registry.get(ownerId)
       if (fixedSessionId !== undefined) {

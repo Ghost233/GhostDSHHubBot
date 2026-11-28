@@ -140,6 +140,12 @@ input[type="number"], input[type="password"], textarea {
   color: var(--dsh-fg); padding: 5px 9px; font: inherit;
 }
 textarea { width: 100%; font-family: var(--dsh-mono); font-size: 12.5px; }
+dialog[data-handoff-editor] {
+  width: min(660px, calc(100vw - 24px)); max-height: calc(100vh - 32px); overflow: auto;
+  background: var(--dsh-bg-raised); color: var(--dsh-fg);
+  border: 1px solid var(--dsh-border); border-radius: var(--dsh-radius); padding: 16px;
+}
+dialog[data-handoff-editor]::backdrop { background: rgba(0, 0, 0, 0.45); }
 .status-line { color: var(--dsh-fg-dim); }
 .repo-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
 .repo-table th, .repo-table td { text-align: left; padding: 4px 8px; border-top: 1px solid var(--dsh-border); }

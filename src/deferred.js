@@ -250,8 +250,11 @@ export class DeferredRegistry {
     return this.list({ ticketId, status: 'pending' })
   }
 
-  /** Applies one structured decision; a registered handler runs only after its approval commits. */
-  async resolve({ requestId, decision, actor, text, receivedAt, workerUnavailable } = {}) {
+  /**
+   * Applies one structured decision. A registered handler runs only after its approval commits.
+   * `hasTimelyReceipt` is trusted evidence from the caller's persisted receipt scan.
+   */
+  async resolve({ requestId, decision, actor, text, receivedAt, workerUnavailable, hasTimelyReceipt } = {}) {
     if (typeof requestId !== 'string' || !requestId.trim()) {
       throw new DeferredError('request-required', 'deferred: requestId must be a non-empty string')
     }
@@ -262,7 +265,7 @@ export class DeferredRegistry {
     const answerText = typeof text === 'string' ? text.trim() : ''
     const canDispatch = !this.store.db?.isTransaction
     const prepared = this.#write(() => this.#prepareDecision({
-      requestId, decision, actor, answerText, receivedAt, at, canDispatch, workerUnavailable,
+      requestId, decision, actor, answerText, receivedAt, at, canDispatch, workerUnavailable, hasTimelyReceipt,
     }))
     if (prepared instanceof DeferredError) throw prepared
     if (!prepared.handler) return prepared
@@ -273,6 +276,7 @@ export class DeferredRegistry {
       result = await handler({ request, actor: who, decision, text: answerText || null })
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error)
+      if (this.store.closed) throw new DeferredError('deferred-stopped', 'Hub Bot stopped before the approval result was recorded.')
       this.#write(() => {
         const current = this.#load(requestId)
         if (this.#waitingTicket(current)) this.tasks.fail({ ticketId: current.ticketId, reason: reason || '确认动作未能完成' })
@@ -280,10 +284,11 @@ export class DeferredRegistry {
       })
       throw new DeferredError('fulfillment-failed', reason, { cause: error })
     }
+    if (this.store.closed) throw new DeferredError('deferred-stopped', 'Hub Bot stopped before the approval result was recorded.')
     return this.#write(() => this.#finishApproval(this.#load(requestId), decisionFacts, result, true))
   }
 
-  #prepareDecision({ requestId, decision, actor, answerText, receivedAt, at, canDispatch, workerUnavailable }) {
+  #prepareDecision({ requestId, decision, actor, answerText, receivedAt, at, canDispatch, workerUnavailable, hasTimelyReceipt }) {
     const doc = this.#load(requestId)
     if (!doc) return new DeferredError('request-unknown', 'deferred: unknown request ' + requestId)
     let who
@@ -325,7 +330,9 @@ export class DeferredRegistry {
       || cutoff < Date.parse(doc.openedAt) || cutoff > Date.parse(at))) {
       return new DeferredError('receipt-invalid', 'deferred: the receipt time must be between opening and processing')
     }
-    if (this.#expireIfDue(doc, decision, at, cutoff)) {
+    if (cutoff >= Date.parse(doc.expiresAt)) {
+      // A late decision cannot expire a request with an earlier authenticated receipt awaiting delivery.
+      if (hasTimelyReceipt !== true) this.#expireIfDue(doc, decision, at, cutoff)
       return new DeferredError('request-expired', 'deferred: request ' + requestId + ' expired at ' + doc.expiresAt)
     }
 
@@ -411,8 +418,22 @@ export class DeferredRegistry {
     })
   }
 
+  /** Persists the exact receiver before dispatch, so a crash cannot silently move an ambiguous prompt. */
+  noteAnswerDeliveryAttempt(requestId, sessionId) {
+    return this.#write(() => {
+      const doc = this.#load(requestId)
+      const previous = doc?.outcome?.delivery
+      if (doc?.outcome?.decision !== 'answer' || (previous && previous.state !== 'queued')) return
+      if ((previous?.attemptedSessionId ?? null) === sessionId) return
+      const delivery = { state: 'queued' }
+      if (sessionId !== null) delivery.attemptedSessionId = sessionId
+      this.tasks.recordDeferredAnswerDelivery(doc.ticketId, { requestId, delivery })
+      this.#save({ ...doc, outcome: { ...doc.outcome, delivery } })
+    })
+  }
+
   /** Records a terminal delivery receipt separately from the accepted answer. */
-  recordAnswerDelivery(requestId, { state, reason } = {}) {
+  recordAnswerDelivery(requestId, { state, reason, sessionId } = {}) {
     if (state !== 'sent' && state !== 'failed') {
       throw new DeferredError('delivery-state-invalid', 'deferred: delivery receipt state must be sent or failed')
     }
@@ -426,7 +447,8 @@ export class DeferredRegistry {
       if (previous && previous.state !== 'queued') return { request: doc, duplicate: true }
       let detail = typeof reason === 'string' ? reason.trim() : ''
       if (state === 'failed' && !detail) detail = 'The answer could not be delivered to its original receiver.'
-      const delivery = { state, at: this.now(), ...(detail && { reason: detail }) }
+      const receiver = sessionId ?? previous?.attemptedSessionId
+      const delivery = { state, at: this.now(), ...(receiver && { sessionId: receiver }), ...(detail && { reason: detail }) }
       this.tasks.recordDeferredAnswerDelivery(doc.ticketId, { requestId, delivery })
       const request = this.#save({ ...doc, outcome: { ...doc.outcome, delivery } })
       return { request, duplicate: false }
