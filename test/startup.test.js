@@ -239,6 +239,7 @@ test('authenticated handoff summary previews the exact source and carries only t
   const root = new Context()
   const token = 'fixture-handoff-token'
   const oldSession = 'fixture-old-summary-owner'
+  const feishuId = 'om_summary_real_source_fixture'
   const creations = [], pages = [], prompts = []
   let handle
   root.provide('sessionController', {
@@ -252,6 +253,12 @@ test('authenticated handoff summary previews the exact source and carries only t
         { event: { type: 'user/message', seq: 33, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '旧讨论：选择验收范围' }] } } },
         { event: { type: 'user/message', seq: 34, data: { source: { kind: 'skill-invocation', name: 'fixture', form: 'instructions' },
           content: [{ type: 'text', text: '不应出现在草稿的内部技能文本' }] } } },
+        { event: { type: 'user/message', seq: 31, data: { source: { kind: 'user', rpcId: 'hub-bot-switch-fixture' },
+          content: [{ type: 'text', text: '不应出现在草稿的切换初始化事实' }] } } },
+        { event: { type: 'user/message', seq: 30, data: { source: { kind: 'user', rpcId: 'hub-bot-resume-fixture' },
+          content: [{ type: 'text', text: '不应出现在草稿的重启恢复提示' }] } } },
+        { event: { type: 'user/message', seq: 36, data: { source: { kind: 'user', rpcId: 'hub-bot-feishu-' + feishuId },
+          content: [{ type: 'text', text: '不应出现在草稿的飞书路由包装' }] } } },
         { event: { type: 'system/message', seq: 32, data: { message: { content: [{ type: 'text', text: '不应出现在草稿的系统文本' }] } } } },
         { event: { type: 'assistant/message', seq: 35, data: { message: { content: [{ type: 'text', text: '此前讨论了两个方案' }, { type: 'tool-call', arguments: '不应出现在草稿的工具参数' }] } } } },
       ] }
@@ -285,13 +292,19 @@ test('authenticated handoff summary previews the exact source and carries only t
   assert.equal((await request('owners/handoff-summary', generate, false)).status, 401)
   assert.equal((await request('owners/handoff-summary', { ...generate, expectedSessionId: 'other-fixture' })).status, 400)
   assert.equal(pages.length, 0)
+  assert.equal((await request('feishu/simulate', {
+    sender: { sender_type: 'user', sender_id: { open_id: 'ou_fixture' } },
+    message: { message_id: feishuId, chat_id: 'oc_fixture', chat_type: 'p2p', message_type: 'text',
+      content: JSON.stringify({ text: '用户的飞书原始讨论' }) },
+  })).status, 200)
   const draft = (await request('owners/handoff-summary', generate)).value
   assert.equal(draft.status, 'draft')
   assert.equal(draft.sourceSessionId, oldSession)
-  assert.equal(draft.sourceThroughSeq, 35)
+  assert.equal(draft.sourceThroughSeq, 36)
   assert.match(draft.text, /#33.*选择验收范围/)
   assert.match(draft.text, /#35.*此前讨论了两个方案/)
-  assert.doesNotMatch(draft.text, /系统文本|工具参数|内部技能文本/)
+  assert.match(draft.text, /#36.*用户的飞书原始讨论/)
+  assert.doesNotMatch(draft.text, /系统文本|工具参数|内部技能文本|切换初始化事实|重启恢复提示|飞书路由包装/)
   assert.deepEqual(pages, [{ address: { kind: 'session', sessionId: oldSession }, maxMessages: 16 }])
   const reference = value => ({ draftId: value.draftId, revision: value.revision })
   const replace = { action: 'request', mode: 'wait', ...source }

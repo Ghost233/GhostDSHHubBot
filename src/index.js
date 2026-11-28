@@ -319,10 +319,21 @@ export function apply(ctx, rawConfig) {
         if (Number.isSafeInteger(event.seq) && event.seq >= 0) throughSeq = Math.max(throughSeq ?? 0, event.seq)
         if (!['user/message', 'assistant/message'].includes(event.type)) continue
         const message = event.data?.message ?? event.data
-        if (event.type === 'user/message' && message?.source?.kind !== 'user') continue
+        const fromUser = event.type === 'user/message'
+        const source = message?.source
+        if (fromUser && source?.kind !== 'user') continue
         const parts = Array.isArray(message?.content) ? message.content : []
-        const text = parts.filter(part => part?.type === 'text' && typeof part.text === 'string')
-          .slice(0, 3).map(part => part.text.slice(0, 320)).join(' ').replace(/\s+/gu, ' ').trim()
+        let text
+        if (fromUser && typeof source.rpcId === 'string' && source.rpcId.startsWith('hub-bot-')) {
+          if (!source.rpcId.startsWith('hub-bot-feishu-') || source.rpcId.startsWith('hub-bot-feishu-unsupported-')) continue
+          const trigger = hub.router.getTrigger(source.rpcId.slice('hub-bot-'.length))
+          if (trigger?.kind !== 'feishu' || !trigger.authorization || trigger.dropped || (trigger.ownerId && trigger.ownerId !== 'chief')) continue
+          text = typeof trigger.message === 'string' ? trigger.message.slice(0, 960) : ''
+        } else {
+          text = parts.filter(part => part?.type === 'text' && typeof part.text === 'string')
+            .slice(0, 3).map(part => part.text.slice(0, 320)).join(' ')
+        }
+        text = text.replace(/\s+/gu, ' ').trim()
         if (!text) continue
         const role = event.type === 'user/message' ? '用户' : '助手'
         const seq = Number.isSafeInteger(event.seq) && event.seq >= 0 ? '#' + event.seq + ' ' : ''
