@@ -364,23 +364,57 @@ test('recurring cancellation during admission preserves a host receipt returned 
   assert.equal(f.calls.length, 1)
 })
 
-test('a later permanent scheduling error leaves an older Router receipt eligible', async t => {
-  const f = fixture({ route: async (_request, count) => {
-    if (count === 2) throw Object.assign(new Error('later route refused'), { permanent: true })
-    return { ticketId: 'tsk-queued', stage: 'queued', admitted: false }
+test('cancelling a failed recurring timer closes older queued receipts across restart', async t => {
+  const f = fixture({ route: async ({ triggerRef, source }, count) => {
+    if (count === 3) throw Object.assign(new Error('later route refused'), { permanent: true })
+    const ticket = {
+      id: `tsk-delayed-${count}`, triggerId: triggerRef, stage: 'queued',
+      background: { kind: 'timer', timerId: source.timerId },
+    }
+    f.store.db.prepare('INSERT INTO ticket (id, value) VALUES (?, ?)').run(ticket.id, JSON.stringify(ticket))
+    return { ticketId: ticket.id, stage: ticket.stage, admitted: false }
   } })
   t.after(() => f.cleanup())
   const timer = f.timers.create({
     ownerId: 'repo-DSH', createdBy: 'user:l1', message: 'Daily follow-up',
     schedule: { frequency: 'daily', time: '08:01' },
   })
-  f.setNow(Date.parse('2026-11-15T00:01:00Z'))
-  await f.timers.tick()
-  f.setNow(Date.parse('2026-11-16T00:01:00Z'))
-  await f.timers.tick()
+  for (const due of ['2026-11-15T00:01:00Z', '2026-11-16T00:01:00Z', '2026-11-17T00:01:00Z']) {
+    f.setNow(Date.parse(due))
+    await f.timers.tick()
+  }
+  const [queuedRef, admittedRef, failedRef] = f.calls.map(call => call.triggerRef)
   assert.equal(f.timers.get(timer.id).status, 'failed')
-  assert.equal(f.timers.deliveryState(timer.id, f.calls[1].triggerRef), 'closed')
-  assert.equal(f.timers.deliveryState(timer.id, f.calls[0].triggerRef), 'ready')
+  assert.equal(f.timers.deliveryState(timer.id, failedRef), 'closed')
+  assert.equal(f.timers.deliveryState(timer.id, queuedRef), 'ready')
+  assert.equal(f.timers.deliveryState(timer.id, admittedRef), 'ready')
+
+  // The Router admits one delayed prompt after the third occurrence fails.
+  const sentAt = at(f.now())
+  f.store.db.prepare(`UPDATE ticket SET value = json_set(value, '$.stage', 'working', '$.lastDelivery', json(?)) WHERE id = ?`)
+    .run(JSON.stringify({ state: 'sent', at: sentAt }), 'tsk-delayed-2')
+  const failed = f.timers.get(timer.id)
+  const cancelled = f.timers.cancel(timer.id)
+  assert.equal(cancelled.changed, true)
+  assert.equal(cancelled.timer.status, 'cancelled')
+  assert.deepEqual(cancelled.timer.delivery, failed.delivery)
+  assert.deepEqual(cancelled.timer.lastError, failed.lastError)
+  assert.equal(f.timers.deliveryState(timer.id, queuedRef), 'closed')
+  f.closeOnly()
+
+  const reopened = fixture({ dir: f.stateDir, startAt: Date.parse('2026-11-20T00:01:00Z') })
+  t.after(() => reopened.closeOnly())
+  const saved = reopened.timers.get(timer.id)
+  const receipts = new Map(saved.queuedDeliveries.map(receipt => [receipt.triggerRef, receipt]))
+  assert.equal(saved.status, 'cancelled')
+  assert.equal(receipts.get(queuedRef).state, 'cancelled')
+  assert.equal(receipts.get(admittedRef).state, 'sent')
+  assert.equal(receipts.get(admittedRef).sentAt, sentAt)
+  assert.equal(saved.delivery.state, 'failed')
+  assert.equal(reopened.timers.deliveryState(timer.id, queuedRef), 'closed')
+  assert.equal(reopened.timers.cancel(timer.id).changed, false)
+  await reopened.timers.tick()
+  assert.equal(reopened.calls.length, 0)
 })
 
 test('a terminal failed Router receipt advances a recurring timer to its next occurrence', async t => {
@@ -593,6 +627,7 @@ test('a structurally invalid target fails the timer instead of retrying forever'
   assert.equal(stored.delivery.state, 'failed')
   assert.equal(stored.nextAttemptAt, null)
   assert.equal(stored.lastError.code, 'unknown-owner')
+  assert.deepEqual(f.timers.cancel(timer.id), { timer: stored, changed: false, alreadyFailed: true })
   // A failed row leaves the due scan, so it cannot hot-spin.
   assert.deepEqual(await f.timers.tick(), { due: 0, fired: 0, retried: 0, failed: 0, skipped: 0 })
   assert.equal(f.calls.length, 1)

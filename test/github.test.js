@@ -106,6 +106,7 @@ test('background GitHub checks leave silent, accepted and failed notification ev
     await f.source.deliverReplies() // the existing intake acknowledgement is separate from the run decision
     const postedBefore = f.posts.length
     const worker = f.router.getTicket(silent.ticketId).workerSession.sessionId
+    assert.throws(() => f.router.tasks.accept(silent.ticketId), { code: 'illegal-transition' })
     await assert.rejects(f.router.reportBackground({ ticketId: silent.ticketId, sessionId: 'different-worker', silenceReason: 'no-change' }), /bound worker/)
     assert.equal((await f.router.reportBackground({ ticketId: silent.ticketId, sessionId: worker, silenceReason: 'no-change' })).stage, 'done')
     await f.router.tick()
@@ -114,6 +115,7 @@ test('background GitHub checks leave silent, accepted and failed notification ev
     const quiet = f.router.runs.get('run-' + silent.ticketId)
     assert.equal(quiet.status, 'silent')
     assert.equal(quiet.decisions.at(-1).reasonCode, 'no-change')
+    assert.equal(f.router.getTicket(silent.ticketId).transitions.at(-1).reason, 'background-no-result')
     assert.equal(quiet.notification, null)
 
     const result = await f.source.handleIssueEvent(issue({ number: 101 }), REPO_CFG)
@@ -142,6 +144,26 @@ test('background GitHub checks leave silent, accepted and failed notification ev
     assert.equal(reopened.source.router.runs.get(error.id).notification.discarded, true)
     assert.deepEqual(reopened.source.router.runs.list({ status: 'silent' }).map(row => row.id), [quiet.id])
   } finally { reopened?.store.close(); f.cleanup() }
+})
+
+test('an explicit GitHub comment receives a reply and progress keeps its ticket active', async () => {
+  const f = fixture()
+  try {
+    const direct = await f.source.handleCommentEvent(comment({ body: '@hub-bot 请检查有没有新情况？' }), REPO_CFG)
+    const { ticketId } = direct
+    const sessionId = f.router.getTicket(ticketId).workerSession.sessionId
+    const progress = await f.router.reportBackground({ ticketId, sessionId, silenceReason: 'progress-only' })
+    assert.equal(progress.stage, 'working')
+    assert.equal(f.router.runs.get('run-' + ticketId).lastProgressAt, f.router.now())
+    assert.equal(f.outbox().filter(row => row.kind === 'reply').length, 0)
+    const answer = await f.router.reportBackground({ ticketId, sessionId, silenceReason: 'no-change' })
+    assert.equal(answer.stage, 'done')
+    assert.equal(f.router.runs.get('run-' + ticketId).status, 'waiting')
+    await f.source.deliverReplies()
+    assert.equal(f.posts.length, 1)
+    assert.match(f.posts[0].find(arg => arg.startsWith('body=')), /本次检查没有变化/)
+    assert.equal(f.router.runs.get('run-' + ticketId).status, 'sent')
+  } finally { f.cleanup() }
 })
 
 test('config: the github section validates and defaults disabled with 5min polling', () => {

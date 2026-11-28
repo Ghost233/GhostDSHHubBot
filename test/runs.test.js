@@ -214,6 +214,9 @@ test('a shared final row controls notification history and retains failure after
   assert.equal(saved.notification.id, group.id)
   assert.equal(saved.notification.linkedId, member.id)
   assert.equal(reopened.get(second.id).status, 'failed')
+  const listed = reopened.list({ status: 'failed' })
+  assert.deepEqual(listed.map(run => run.id).sort(), [first.id, second.id].sort())
+  assert.deepEqual(listed.find(run => run.id === first.id).notification, saved.notification)
   assert.doesNotMatch(JSON.stringify(saved), /synthetic-secret-archive/)
 })
 
@@ -245,4 +248,119 @@ test('previously stored background tickets remain discoverable by their exact tr
   assert.equal(newer.ownerId, ownerId)
   const { runs: reopened } = reopen()
   assert.deepEqual(reopened.list({ ownerId }).map(run => run.ticketId).sort(), ['tsk-github', 'tsk-unicode'])
+})
+
+test('legacy timer history links each exact Feishu question and excludes unrelated replies', t => {
+  const ticketId = 'tsk-legacy-timer'
+  const triggerRef = 'timer:tmr-legacy:1'
+  const origin = { kind: 'feishu', triggerId: 'feishu:om-legacy', chatId: 'oc-legacy' }
+  const source = { kind: 'timer', timerId: 'tmr-legacy', origin }
+  const firstSentAt = '2026-11-28T12:02:00.000Z'
+  const lastSentAt = '2026-11-28T12:05:00.000Z'
+  const request = (requestId, fields) => ({ requestId, ticketId, type: 'answer', source: origin, ...fields })
+  const earlier = request('dfr-earlier', { status: 'fulfilled' })
+  const current = request('dfr-current', { status: 'pending' })
+  const registryOnly = request('dfr-registry-only', { ownerId: 'chief', status: 'answered' })
+
+  const { runs, reopen } = fixture(t, store => {
+    // A prior version already imported the run, but did not link deferred question notifications.
+    store.set('run-audit:backfilled', true)
+    const existing = { id: 'run-' + ticketId, ticketId, triggerRef, ownerId: 'chief', source, createdAt: initialTime }
+    store.set('run-audit:run-' + ticketId, { ...existing, source: { ...source, origin: { kind: 'feishu', triggerId: origin.triggerId } } })
+    store.set('run-audit:trigger:' + triggerRef, ticketId)
+    store.set('deferred/req/' + registryOnly.requestId, registryOnly)
+    store.db.prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)').run(triggerRef, JSON.stringify({
+      id: triggerRef, kind: 'timer', ownerId: 'chief', source, at: initialTime,
+    }), initialTime)
+    const ticket = {
+      id: ticketId, triggerId: triggerRef, owner: 'chief', stage: 'person/answer', createdAt: initialTime,
+      background: { kind: 'timer', timerId: source.timerId }, deferred: current,
+      deferredHistory: [earlier, request('dfr-other-chat'), request('dfr-other-trigger'), request('dfr-other-ticket'),
+        request('dfr-other-kind'), request('dfr-other-request'), request('dfr-wrong-origin', { source: { ...origin, chatId: 'oc-wrong' } })],
+    }
+    store.db.prepare('INSERT INTO ticket (id, value) VALUES (?, ?)').run(ticketId, JSON.stringify(ticket))
+    const reply = (requestId, at, patch) => insertOutbox(store, {
+      id: 'out-question-' + requestId, ticketId, triggerId: origin.triggerId, kind: 'reply',
+      requestId: 'hub-bot-question-' + requestId, to: 'feishu:chat:' + origin.chatId, state: 'sent', sentAt: at,
+      body: 'synthetic-secret-question', ...patch,
+    }, () => Date.parse(at))
+    reply(earlier.requestId, firstSentAt)
+    reply(registryOnly.requestId, '2026-11-28T12:03:00.000Z')
+    reply(current.requestId, lastSentAt)
+    reply('dfr-other-chat', lastSentAt, { to: 'feishu:chat:oc-other' })
+    reply('dfr-other-trigger', lastSentAt, { triggerId: 'feishu:om-other' })
+    reply('dfr-other-ticket', lastSentAt, { ticketId: 'tsk-other' })
+    reply('dfr-other-kind', lastSentAt, { kind: 'inject' })
+    reply('dfr-other-request', lastSentAt, { requestId: 'hub-bot-question-unrelated' })
+    reply('dfr-wrong-origin', lastSentAt)
+    reply('dfr-unrelated', lastSentAt)
+    reply('ack', lastSentAt, { id: 'out-ack-fixture' })
+  })
+
+  const saved = runs.get('run-' + ticketId)
+  assert.equal(saved.stage, 'person/answer')
+  assert.equal(saved.status, 'sent')
+  assert.equal(saved.notification.acceptedAt, lastSentAt)
+  assert.deepEqual(saved.notifications.map(row => row.id), ['out-question-dfr-earlier', 'out-question-dfr-registry-only', 'out-question-dfr-current'])
+  assert.equal(saved.decisions[0].at, firstSentAt)
+  assert.doesNotMatch(JSON.stringify(saved), /synthetic-secret-question|oc-legacy/)
+  assert.deepEqual(reopen().runs.get(saved.id), saved)
+})
+
+test('local timer outcomes explain silence and progress only updates the last timestamp', t => {
+  const { runs, setTime, reopen } = fixture(t)
+  const local = runs.ensure({ ticketId: 'tsk-local', triggerRef: 'timer:tmr-local:1', ownerId: 'chief',
+    source: { kind: 'timer', timerId: 'tmr-local' } })
+  assert.throws(() => runs.recordSilent(local.ticketId, 'local-panel'), /silence reason/)
+  setTime('2026-11-28T12:03:00.000Z')
+  runs.recordProgress(local.ticketId)
+  assert.equal(runs.get(local.id).status, 'in-progress')
+  assert.equal(runs.get(local.id).result, null)
+  runs.recordResult(local.ticketId, { kind: 'result', reportId: 'out-local-report' })
+  runs.recordNotNotified(local.ticketId, 'local-panel')
+  const latest = '2026-11-28T12:06:00.000Z'
+  setTime(latest)
+  runs.recordProgress(local.ticketId)
+
+  const { runs: reopened } = reopen()
+  const saved = reopened.get(local.id)
+  assert.equal(saved.status, 'silent')
+  assert.equal(saved.reason, '结果已记录在本机面板。')
+  assert.equal(saved.result.reportId, 'out-local-report')
+  assert.equal(saved.notification, null)
+  assert.equal(saved.lastProgressAt, latest)
+  assert.equal(saved.decisions.length, 1)
+  assert.equal(saved.decisions[0].reasonCode, 'local-panel')
+  assert.deepEqual(reopened.list({ status: 'silent' }).map(row => row.id), [local.id])
+})
+
+test('a sparse timeline filter uses bounded SQLite statements across a long history', t => {
+  const { store, runs } = fixture(t)
+  store.db.exec('BEGIN IMMEDIATE')
+  for (let number = 1; number <= 1_001; number++) {
+    runs.ensure({ ...githubRun, ticketId: 'tsk-bulk-' + number, triggerRef: 'github:fixture/project:issue:' + number,
+      source: { ...githubRun.source, issueNumber: number } })
+  }
+  store.db.exec('COMMIT')
+
+  const prepare = store.db.prepare
+  let prepares = 0
+  store.db.prepare = function (sql) {
+    prepares++
+    return prepare.call(this, sql)
+  }
+  try {
+    assert.deepEqual(runs.list({ status: 'failed', limit: 1 }), [])
+    assert.ok(prepares <= 2, `prepared ${prepares} SQLite statements for an empty page`)
+    t.diagnostic(`Empty failed page across 1,001 runs: ${prepares} SQLite prepare call(s).`)
+
+    const reply = insertOutbox(store, { kind: 'reply', to: 'github:fixture/project:1', state: 'failed' })
+    runs.linkOutbox('tsk-bulk-1', reply.id)
+    prepares = 0
+    assert.deepEqual(runs.list({ status: 'failed', limit: 1 }).map(row => row.ticketId), ['tsk-bulk-1'])
+    assert.ok(prepares <= 3, `prepared ${prepares} SQLite statements for a one-row page`)
+    t.diagnostic(`One matching failed run across 1,001 runs: ${prepares} SQLite prepare call(s).`)
+  } finally {
+    store.db.prepare = prepare
+  }
 })

@@ -1,11 +1,13 @@
 /** Durable history for GitHub and timer work. Delivery is a projection of channel Outbox evidence. */
-import { STAGES, TaskBoard } from './tasks.js'
+import { DEFERRED_TYPES, DeferredRegistry } from './deferred.js'
+import { STAGES, TaskBoard, normalizeStage } from './tasks.js'
 
 const RUN_KEY = 'run-audit:run-'
 const RUN_KEY_END = 'run-audit:run.' // Exclusive upper bound for the SQLite primary-key prefix scan.
 const TRIGGER_KEY = 'run-audit:trigger:'
 const OUTBOX_KEY = 'run-audit:outbox:'
 const BACKFILL_KEY = 'run-audit:backfilled'
+const BACKFILL_VERSION = 2
 const SOURCES = ['github', 'timer']
 const RESULT_KINDS = ['result', 'failure', 'blocked']
 const WAITING_STATES = ['held', 'queued', 'recorded']
@@ -20,6 +22,8 @@ export const SILENCE_REASONS = Object.freeze({
   'already-reported': '结果已在此前汇报。',
   'progress-only': '普通进展留在面板供查询。',
 })
+
+const NOT_NOTIFIED_REASONS = { 'local-panel': '结果已记录在本机面板。' }
 
 function timestamp(value) {
   if (typeof value !== 'string' && typeof value !== 'number') return null
@@ -75,11 +79,27 @@ function channelEvidence(row) {
   }
 }
 
+function parseDocument(value) {
+  return value == null ? undefined : JSON.parse(value)
+}
+
+function savedChannelEvidence(value, archived) {
+  if (value != null) return channelEvidence(JSON.parse(value))
+  return archived?.discarded ? archived : undefined
+}
+
 function readChannelEvidence(store, id) {
   const row = store.db.prepare('SELECT value FROM outbox WHERE id = ?').get(id)
-  if (row) return channelEvidence(JSON.parse(row.value))
-  const archived = store.get(OUTBOX_KEY + id)
-  return archived?.discarded ? archived : undefined
+  return savedChannelEvidence(row?.value, row ? undefined : store.get(OUTBOX_KEY + id))
+}
+
+function resolveNotification(id, linked, readFinal) {
+  if (linked?.settledWith) {
+    const final = readFinal(linked.settledWith)
+    if (final?.channel === linked.channel) return { ...final, linkedId: id }
+    return { id: linked.settledWith, linkedId: id, channel: linked.channel, state: 'missing', channelAccepted: false, acceptedAt: null }
+  }
+  return linked ?? { id, channel: null, state: 'missing', channelAccepted: false, acceptedAt: null }
 }
 
 function markLinkedOutbox(store, id) {
@@ -104,6 +124,21 @@ export function archiveRunNotification(store, row) {
 function notificationStatus(notification) {
   if (notification?.state === 'sent' || notification?.state === 'failed') return notification.state
   return WAITING_STATES.includes(notification?.state) ? 'waiting' : 'in-progress'
+}
+
+function notificationOutcome(decision, readNotification) {
+  const notification = decision?.kind === 'notification' ? readNotification(decision.outboxId) : null
+  let reason = null
+  if (decision?.kind === 'silent') reason = SILENCE_REASONS[decision.reasonCode]
+  if (decision?.kind === 'not-notified') reason = NOT_NOTIFIED_REASONS[decision.reasonCode]
+  return { reason, notification, status: reason ? 'silent' : notificationStatus(notification) }
+}
+
+function runSummary({ decisions, results = [], lastProgressAt, ...run }, ticket, outcome) {
+  const stage = normalizeStage(ticket?.stage)
+  const sessionId = identifier(ticket?.workerSession?.sessionId)
+  const workerSession = sessionId ? { sessionId, at: timestamp(ticket.workerSession.at) } : null
+  return { ...run, stage: STAGES.includes(stage) ? stage : null, workerSession, result: results.at(-1) ?? null, ...outcome }
 }
 
 function transaction(store, write) {
@@ -133,12 +168,22 @@ export class RunAudit {
   }
 
   #backfill() {
-    if (this.#store.get(BACKFILL_KEY)) return
+    if (this.#store.get(BACKFILL_KEY) === BACKFILL_VERSION) return
     transaction(this.#store, () => {
-      if (this.#store.get(BACKFILL_KEY)) return
+      if (this.#store.get(BACKFILL_KEY) === BACKFILL_VERSION) return
       const legacy = this.#store.db.prepare(`SELECT ticket.value AS ticket, trigger.value AS trigger
         FROM ticket JOIN trigger ON trigger.id = json_extract(ticket.value, '$.triggerId')
         WHERE json_extract(ticket.value, '$.background.kind') IN ('github', 'timer') ORDER BY ticket.rowid`).all()
+      const requestsByTicket = new Map()
+      if (legacy.length) {
+        const registry = new DeferredRegistry({ store: this.#store, tasks: this.#tasks })
+        for (const request of registry.list()) {
+          const requests = requestsByTicket.get(request.ticketId)
+          if (requests) requests.push(request)
+          else requestsByTicket.set(request.ticketId, [request])
+        }
+      }
+      const findReply = this.#store.db.prepare('SELECT value FROM outbox WHERE id = ?')
       for (const row of legacy) {
         const ticket = JSON.parse(row.ticket)
         const trigger = JSON.parse(row.trigger)
@@ -147,17 +192,64 @@ export class RunAudit {
         if (!at || !identifier(ticketId) || !identifier(triggerRef) || !validOwnerId(ownerId)) continue
         if (trigger.dropped || trigger.id !== triggerRef || trigger.kind !== background.kind || trigger.source?.kind !== trigger.kind
           || (trigger.ownerId && trigger.ownerId !== ownerId)) continue
-        if (this.#store.get(RUN_KEY + ticketId) || this.#store.get(TRIGGER_KEY + triggerRef)) continue
-        this.ensure({ ticketId, triggerRef, ownerId, source: trigger.source, at })
-        const results = [
-          { kind: 'result', at: timestamp(ticket.report?.at) },
-          { kind: 'failure', at: timestamp(ticket.failed?.at) },
-          { kind: 'blocked', at: timestamp(ticket.escalated?.at) },
-        ].filter(result => result.at).sort((a, b) => a.at.localeCompare(b.at))
-        for (const result of results) this.recordResult(ticketId, result)
+        const existing = this.#store.get(RUN_KEY + ticketId)
+        if (existing) {
+          if (existing.triggerRef !== triggerRef || existing.ownerId !== ownerId || existing.source.kind !== trigger.kind) continue
+        } else {
+          if (this.#store.get(TRIGGER_KEY + triggerRef)) continue
+          this.ensure({ ticketId, triggerRef, ownerId, source: trigger.source, at })
+          const results = [
+            { kind: 'result', at: timestamp(ticket.report?.at) },
+            { kind: 'failure', at: timestamp(ticket.failed?.at) },
+            { kind: 'blocked', at: timestamp(ticket.escalated?.at) },
+          ].filter(result => result.at).sort((a, b) => a.at.localeCompare(b.at))
+          for (const result of results) this.recordResult(ticketId, result)
+        }
+        if (trigger.kind === 'timer' && trigger.source.origin?.kind === 'feishu') {
+          this.#backfillQuestions(ticket, trigger.source.origin, requestsByTicket.get(ticketId) ?? [], findReply)
+        }
       }
-      this.#store.set(BACKFILL_KEY, true)
+      this.#store.set(BACKFILL_KEY, BACKFILL_VERSION)
     })
+  }
+
+  #backfillQuestions(ticket, origin, registryRequests, findReply) {
+    if (!identifier(origin.triggerId) || !identifier(origin.chatId)) return
+    const run = this.#store.get(RUN_KEY + ticket.id)
+    const decisions = run.decisions ?? []
+    const linked = new Set(decisions.map(decision => decision.outboxId))
+    const history = Array.isArray(ticket.deferredHistory) ? ticket.deferredHistory : []
+    // The registry retains requests after they leave the ticket's bounded history.
+    const requests = new Map([...history, ticket.deferred, ...registryRequests]
+      .filter(request => identifier(request?.requestId)).map(request => [request.requestId, request]))
+    const recovered = []
+    for (const [requestId, request] of requests) {
+      if (request.ticketId !== ticket.id || !DEFERRED_TYPES.includes(request.type)
+        || (request.ownerId !== undefined && request.ownerId !== ticket.owner)
+        || request.source?.kind !== 'feishu' || request.source.triggerId !== origin.triggerId
+        || request.source.chatId !== origin.chatId) continue
+      const outboxId = 'out-question-' + requestId
+      if (!identifier(outboxId) || linked.has(outboxId)) continue
+      const stored = findReply.get(outboxId)
+      if (!stored) continue
+      const row = JSON.parse(stored.value)
+      if (row?.id !== outboxId || row.requestId !== 'hub-bot-question-' + requestId || row.kind !== 'reply'
+        || row.ticketId !== ticket.id || row.triggerId !== origin.triggerId || row.to !== 'feishu:chat:' + origin.chatId) continue
+      const at = timestamp(row.createdAt) ?? timestamp(request.openedAt)
+      if (!at) continue
+      markLinkedOutbox(this.#store, outboxId)
+      markLinkedOutbox(this.#store, channelEvidence(row)?.settledWith)
+      recovered.push({ kind: 'notification', outboxId, at })
+    }
+    if (!recovered.length) return
+    recovered.sort((a, b) => a.at.localeCompare(b.at))
+    const timeline = []
+    let historical = 0
+    for (const decision of decisions) {
+      while (historical < recovered.length && recovered[historical].at <= decision.at) timeline.push(recovered[historical++])
+      timeline.push(decision)
+    }
+    this.#store.set(RUN_KEY + ticket.id, { ...run, decisions: [...timeline, ...recovered.slice(historical)] })
   }
 
   /** Store a single run alongside its background ticket, participating in the caller's transaction. */
@@ -191,11 +283,29 @@ export class RunAudit {
     if (typeof reasonCode !== 'string' || !Object.hasOwn(SILENCE_REASONS, reasonCode)) {
       throw new TypeError('A recognized silence reason is required.')
     }
+    return this.#recordNoNotification(ticketId, 'silent', reasonCode)
+  }
+
+  /** A host decision to publish the result in the local panel only. */
+  recordNotNotified(ticketId, reasonCode) {
+    if (typeof reasonCode !== 'string' || !Object.hasOwn(NOT_NOTIFIED_REASONS, reasonCode)) {
+      throw new TypeError('A recognized no-notification reason is required.')
+    }
+    return this.#recordNoNotification(ticketId, 'not-notified', reasonCode)
+  }
+
+  /** Keep the latest ordinary progress time without changing the result or notification. */
+  recordProgress(ticketId) {
+    const at = this.#time()
+    return this.#change(ticketId, run => run.lastProgressAt >= at ? run : { ...run, lastProgressAt: at })
+  }
+
+  #recordNoNotification(ticketId, kind, reasonCode) {
     return this.#change(ticketId, run => {
       const decisions = run.decisions ?? []
       const previous = decisions.at(-1)
-      if (previous?.kind === 'silent' && previous.reasonCode === reasonCode) return run
-      return { ...run, decisions: [...decisions, { kind: 'silent', reasonCode, at: this.#time() }] }
+      if (previous?.kind === kind && previous.reasonCode === reasonCode) return run
+      return { ...run, decisions: [...decisions, { kind, reasonCode, at: this.#time() }] }
     })
   }
 
@@ -260,19 +370,47 @@ export class RunAudit {
       conditions.push("json_extract(value, '$.source.kind') = ?")
       params.push(source)
     }
-    const rows = this.#store.db.prepare(`SELECT value FROM kv WHERE ${conditions.join(' AND ')}
-      ORDER BY json_extract(value, '$.createdAt') DESC, key DESC`).iterate(...params)
-    for (const { value } of rows) {
-      const run = this.#project(JSON.parse(value), false)
-      if (status !== undefined && run.status !== status) continue
+    const decisionKind = "json_extract(value, '$.decisions[#-1].kind')"
+    if (status === 'silent') conditions.push(`${decisionKind} IN ('silent', 'not-notified')`)
+    if (status !== undefined && status !== 'silent' && status !== 'in-progress') conditions.push(`${decisionKind} = 'notification'`)
+    const paging = status === undefined ? 'ORDER BY createdAt DESC, key DESC LIMIT ? OFFSET ?' : ''
+    if (paging) {
+      params.push(pageSize, offset)
+      offset = 0
+    }
+
+    // One join reads the referenced live or archived channel rows. Fetch tickets only for the selected page.
+    const db = this.#store.db
+    const rows = db.prepare(`WITH scoped AS (
+      SELECT key, value, json_extract(value, '$.createdAt') AS createdAt,
+        json_extract(value, '$.decisions[#-1]') AS decision
+      FROM kv WHERE ${conditions.join(' AND ')} ${paging}
+    ) SELECT scoped.value, decision, linked.value AS linked, linkedArchive.value AS linkedArchive,
+        final.value AS final, finalArchive.value AS finalArchive
+      FROM scoped
+      LEFT JOIN outbox AS linked ON linked.id = json_extract(decision, '$.outboxId')
+      LEFT JOIN kv AS linkedArchive ON linked.id IS NULL AND linkedArchive.key = ? || json_extract(decision, '$.outboxId')
+      LEFT JOIN outbox AS final ON final.id = json_extract(coalesce(linked.value, linkedArchive.value), '$.settledWith')
+      LEFT JOIN kv AS finalArchive ON final.id IS NULL AND finalArchive.key = ?
+        || json_extract(coalesce(linked.value, linkedArchive.value), '$.settledWith')
+      ORDER BY scoped.createdAt DESC, scoped.key DESC`).iterate(...params, OUTBOX_KEY, OUTBOX_KEY)
+    for (const row of rows) {
+      const outcome = notificationOutcome(parseDocument(row.decision), id => resolveNotification(id,
+        savedChannelEvidence(row.linked, parseDocument(row.linkedArchive)),
+        () => savedChannelEvidence(row.final, parseDocument(row.finalArchive))))
+      if (status !== undefined && outcome.status !== status) continue
       if (offset > 0) {
         offset--
         continue
       }
-      selected.push(run)
+      selected.push({ run: JSON.parse(row.value), outcome })
       if (selected.length >= pageSize) break
     }
-    return selected
+    if (!selected.length) return []
+    const ticketIds = JSON.stringify(selected.map(({ run }) => run.ticketId))
+    const tickets = new Map(db.prepare('SELECT id, value FROM ticket WHERE id IN (SELECT value FROM json_each(?))')
+      .all(ticketIds).map(({ id, value }) => [id, JSON.parse(value)]))
+    return selected.map(({ run, outcome }) => runSummary(run, tickets.get(run.ticketId), outcome))
   }
 
   #time(value = this.#now()) {
@@ -295,29 +433,16 @@ export class RunAudit {
 
   #notification(id) {
     const linked = readChannelEvidence(this.#store, id)
-    if (linked?.settledWith) {
-      const final = readChannelEvidence(this.#store, linked.settledWith)
-      if (final?.channel === linked.channel) return { ...final, linkedId: id }
-      return { id: linked.settledWith, linkedId: id, channel: linked.channel, state: 'missing', channelAccepted: false, acceptedAt: null }
-    }
-    return linked ?? { id, channel: null, state: 'missing', channelAccepted: false, acceptedAt: null }
+    return resolveNotification(id, linked, finalId => readChannelEvidence(this.#store, finalId))
   }
 
-  #project({ decisions = [], results = [], ...run }, detail = true) {
+  #project(run) {
+    const { decisions = [], results = [], lastProgressAt = null } = run
     const current = decisions.at(-1)
-    const notification = current?.kind === 'notification' ? this.#notification(current.outboxId) : null
-    const reason = current?.kind === 'silent' ? SILENCE_REASONS[current.reasonCode] : null
-    const ticket = this.#tasks.getTicket(run.ticketId)
-    const stage = STAGES.includes(ticket?.stage) ? ticket.stage : null
-    const sessionId = identifier(ticket?.workerSession?.sessionId)
-    const workerSession = sessionId ? { sessionId, at: timestamp(ticket.workerSession.at) } : null
-    const summary = {
-      ...run, stage, workerSession, result: results.at(-1) ?? null, reason, notification,
-      status: reason ? 'silent' : notificationStatus(notification),
-    }
-    if (!detail) return summary
+    const outcome = notificationOutcome(current, id => this.#notification(id))
+    const summary = runSummary(run, this.#tasks.getTicket(run.ticketId), outcome)
     const notifications = decisions.filter(decision => decision.kind === 'notification')
-      .map(decision => decision === current ? notification : this.#notification(decision.outboxId))
-    return { ...summary, results, decisions, notifications }
+      .map(decision => decision === current ? outcome.notification : this.#notification(decision.outboxId))
+    return { ...summary, results, decisions, notifications, lastProgressAt }
   }
 }

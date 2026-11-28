@@ -295,7 +295,7 @@ export function apply(ctx, rawConfig) {
   ctx.inject(['tools'], scope => {
     scope.tools.register({
       name: 'report_background',
-      description: '记录当前后台任务的结果或失败原因。没有新信息时可用 silenceReason 静默结束并保留原因。',
+      description: '记录后台任务的结果、失败或静默原因。progress-only 仅记录进展，任务保持进行中。',
       parameters: {
         type: 'object', required: ['ticketId'], additionalProperties: false,
         properties: {

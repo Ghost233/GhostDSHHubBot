@@ -373,14 +373,15 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       runSilent: '未通知', runWaiting: '待发送或汇总', runSent: '通道已接受', runFailed: '发送失败', runUnsent: '无发送记录',
       runTimer: '提醒', runResult: '有结果', runExecutionFailed: '执行失败', runBlocked: '需要介入', runTask: '查看关联任务',
       runSourceLink: '打开来源', runEmpty: '暂无符合条件的运行。', runRefresh: '刷新运行记录', runPrevious: '上一页', runNext: '下一页',
-      runLoading: '正在读取运行记录…', runOpenWorker: '打开原执行会话',
+      runLoading: '正在读取运行记录…', runOpenWorker: '打开原执行会话', runLastProgress: '上次记录进展',
       timersEmpty: '暂无提醒。',
       timerPause: '暂停',
       timerResume: '恢复',
       timerCancel: '取消提醒',
       timerLate: '已迟到',
       timerRun: '查看任务',
-      timerDaily: '每日 {time}（上海时间）', timerWeekly: '每周{weekday} {time}（上海时间）', timerWeekdays: ['一', '二', '三', '四', '五', '六', '日'], timerNext: '下次计划 {time}',
+      timerDaily: '每日 {time}（上海时间）', timerWeekly: '每周{weekday} {time}（上海时间）', timerNext: '下次计划 {time}',
+      timerWeekday1: '一', timerWeekday2: '二', timerWeekday3: '三', timerWeekday4: '四', timerWeekday5: '五', timerWeekday6: '六', timerWeekday7: '日',
       timerPending: '待触发', timerPaused: '已暂停', timerFiring: '正在提交', timerFired: '已建任务',
       timerCancelled: '已取消', timerFailed: '失败',
       timerWorker: '打开执行会话', timerDeliverySent: '已接管', timerDeliveryQueued: '待投递', timerDeliveryFailed: '投递失败',
@@ -760,14 +761,15 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       runSilent: 'Silent', runWaiting: 'Awaiting send or summary', runSent: 'Accepted by channel', runFailed: 'Delivery failed', runUnsent: 'No delivery record',
       runTimer: 'Reminder', runResult: 'Result available', runExecutionFailed: 'Work failed', runBlocked: 'Needs attention', runTask: 'Open linked task',
       runSourceLink: 'Open source', runEmpty: 'No matching runs.', runRefresh: 'Refresh runs', runPrevious: 'Previous page', runNext: 'Next page',
-      runLoading: 'Loading runs…', runOpenWorker: 'Open original worker session',
+      runLoading: 'Loading runs…', runOpenWorker: 'Open original worker session', runLastProgress: 'Last progress recorded',
       timersEmpty: 'No follow-ups scheduled.',
       timerPause: 'Pause',
       timerResume: 'Resume',
       timerCancel: 'Cancel reminder',
       timerLate: 'Late',
       timerRun: 'Open task',
-      timerDaily: 'Daily at {time} (Shanghai time)', timerWeekly: '{weekday} at {time} (Shanghai time)', timerWeekdays: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'], timerNext: 'Next scheduled {time}',
+      timerDaily: 'Daily at {time} (Shanghai time)', timerWeekly: '{weekday} at {time} (Shanghai time)', timerNext: 'Next scheduled {time}',
+      timerWeekday1: 'Mon', timerWeekday2: 'Tue', timerWeekday3: 'Wed', timerWeekday4: 'Thu', timerWeekday5: 'Fri', timerWeekday6: 'Sat', timerWeekday7: 'Sun',
       timerPending: 'Scheduled', timerPaused: 'Paused', timerFiring: 'Submitting', timerFired: 'Task created',
       timerCancelled: 'Cancelled', timerFailed: 'Failed',
       timerWorker: 'Open worker session', timerDeliverySent: 'Admitted', timerDeliveryQueued: 'Pending delivery', timerDeliveryFailed: 'Delivery failed',
@@ -1846,6 +1848,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               run.reason ? h('p', null, run.reason) : null,
               run.source.fireAt ? h('p', null, date(run.source.fireAt)) : null,
               error ? h('p', { role: 'alert' }, error) : !detail ? h('p', null, t('runLoading')) : null,
+              detail?.lastProgressAt ? h('p', null, t('runLastProgress') + ' · ' + date(detail.lastProgressAt)) : null,
               ...(detail?.results ?? []).map((result, index) => h('p', { key: 'result-' + index },
                 [t(runResultLabels[result.kind]), date(result.at)].filter(Boolean).join(' · '))),
               ...(detail?.notifications ?? []).map((notice, index) => h('p', { key: 'notice-' + index },
@@ -2360,17 +2363,16 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               h('h3', { id: 'hub-bot-timers-title', tabIndex: -1, className: 'hb-scroll-target', style: sectionTitleStyle }, t('timersSection')),
               timerError ? h('p', { role: 'alert', style: settingsHintStyle }, timerError) : null,
               overview.timers.length ? overview.timers.map(function (timer) {
-                var stoppable = timer.status === 'firing' || (timer.status === 'fired' && timer.delivery?.state === 'queued');
+                var stoppable = timer.status === 'firing' || (timer.status === 'fired' && timer.delivery?.state === 'queued') || (timer.schedule && timer.status === 'failed');
                 var actions = timer.status === 'pending' ? ['pause', 'cancel'] : timer.status === 'paused' ? ['resume', 'cancel'] : stoppable ? ['cancel'] : [];
                 var statusKey = ({ pending: 'timerPending', paused: 'timerPaused', firing: 'timerFiring', fired: 'timerFired', cancelled: 'timerCancelled', failed: 'timerFailed' })[timer.status];
                 var deliveryKey = ({ sent: 'timerDeliverySent', queued: 'timerDeliveryQueued', failed: 'timerDeliveryFailed' })[timer.delivery?.state];
                 var worker = timer.delivery?.workerSession;
                 var schedule = timer.schedule;
-                var cadence = schedule ? fill(t(schedule.frequency === 'daily' ? 'timerDaily' : 'timerWeekly'), {
-                  time: schedule.time, weekday: t('timerWeekdays')?.[schedule.weekday - 1] ?? '',
-                }) : null;
+                var cadence = schedule?.frequency === 'daily' ? t('timerDaily').replace('{time}', schedule.time)
+                  : schedule?.frequency === 'weekly' ? t('timerWeekly').replace('{weekday}', t('timerWeekday' + schedule.weekday)).replace('{time}', schedule.time) : null;
                 var time = timer.fireAt ? new Date(timer.fireAt).toLocaleString(undefined, schedule ? { timeZone: 'Asia/Shanghai' } : {}) : '—';
-                if (schedule) time = timer.status === 'cancelled' ? null : fill(t('timerNext'), { time });
+                if (schedule) time = timer.status === 'cancelled' ? null : t('timerNext').replace('{time}', time);
                 return h('div', { key: timer.id, style: { margin: '8px 0' } },
                   h('strong', null, timer.message),
                   h('div', { style: settingsHintStyle }, [ownerNames.get(timer.ownerId) || timer.ownerId, cadence, time, statusKey ? t(statusKey) : timer.status, deliveryKey ? t(deliveryKey) : null, timer.late ? t('timerLate') : null].filter(Boolean).join(' · ')),

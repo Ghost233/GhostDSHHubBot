@@ -33,17 +33,19 @@ function hub(ctx) {
   return found
 }
 
-/** Registers one tool with a JSON-schema parameters object and a plain-text render. */
-function register(ctx, tool) {
-  ctx.tools.register(tool)
-}
-
 export function apply(ctx) {
-  // Resolve the hub once at apply time: fail fast (and loudly in the loader log) when the root plugin is absent.
   const api = hub(ctx)
+  const isCurrentChief = agent => api.registry.findByCurrentSession(agent?.id)?.id === 'chief'
+  const register = tool => ctx.tools.register({
+    ...tool,
+    async execute(args, exec) {
+      if (!isCurrentChief(exec?.agent)) throw new Error('Only the current chief session may use this tool.')
+      return await tool.execute(args, exec)
+    },
+  }, { when: ({ agent }) => isCurrentChief(agent) })
   ctx.systemPrompt.section({ name: PERSONA_PREFIX_SECTION, order: PERSONA_PREFIX_ORDER, text: routerPersona({ homeRepo: api.config.homeRepo }) })
 
-  register(ctx, {
+  register({
     name: 'list_owners',
     description: '列出负责人注册表：每个负责人的 id、形态（repo/dir/scratch）、cwd、会话与创建状态。路由前先调它。',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
@@ -56,7 +58,7 @@ export function apply(ctx) {
     execute: async () => ({ owners: api.registry.list() }),
   })
 
-  register(ctx, {
+  register({
     name: 'create_owner',
     description: '创建动态负责人：repo（需 workspace+cwd）、dir（需 cwd，目录即身份，不猜）、scratch（自动分配临时目录）。已存在的身份返回原行。',
     parameters: {
@@ -76,7 +78,7 @@ export function apply(ctx) {
     execute: async args => ({ owner: api.registry.create({ kind: args.kind, cwd: args.cwd, workspace: args.workspace }) }),
   })
 
-  register(ctx, {
+  register({
     name: 'route_to_owner',
     description: '把一条消息路由给指定负责人：负责人会话不存在则懒创建（cwd=注册表目录），消息含授权记录注入其会话。任务先存为待触发、由可靠投递转进行中；瞬时失败自动 2 秒退避重试，无需重复调用。同一 triggerRef 重复路由只建一个任务。带 ticketId 时是追问：等验收/等回复/等确认/被卡住/失败的票被释放回进行中并注入追问，不新建票（追问不重新绑定触发与授权）；ticketId + resolution:"accept" 是用户验收、票转完成；resolution:"cancel" 取消一个等确认的票；resolution:"confirm" 确认票面提议（fork 由系统自动执行并绑新会话续作）；resolution:"reject" 否定提议（票转被卡住、保持原会话）；除 confirm 外都不注入。',
     parameters: {
@@ -112,7 +114,7 @@ export function apply(ctx) {
     execute: async args => await api.router.routeToOwner({ ownerId: args.ownerId, message: args.message, triggerRef: args.triggerRef, ticketId: args.ticketId, resolution: args.resolution }),
   })
 
-  register(ctx, {
+  register({
     name: 'query_tasks',
     description: '查询任务存储：可按负责人 id 与阶段（stage）过滤，最新在前。',
     parameters: {
@@ -132,7 +134,7 @@ export function apply(ctx) {
     execute: async args => ({ tasks: api.router.queryTasks({ owner: args.owner, stage: args.stage }) }),
   })
 
-  register(ctx, {
+  register({
     name: 'reply_source',
     description: '把答复写入 Outbox 后投递给原消息来源，超过 100 词时自动截断。回复飞书来信时使用该消息提供的 triggerRef。',
     parameters: {

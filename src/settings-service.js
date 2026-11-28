@@ -147,9 +147,9 @@ export class HubBotSettingsService extends TypertRemoteService {
     return detail
   }
 
-  async listRuns(filters) {
+  async listRuns(request) {
     try {
-      return await this.deps.listRuns(filters ?? {})
+      return await this.deps.listRuns(request ?? {})
     } catch (error) {
       if (error?.status === 400 || error?.statusCode === 400) throw new RemoteError('runs/invalid', error.message, {})
       throw error

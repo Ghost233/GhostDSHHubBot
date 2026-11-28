@@ -407,8 +407,8 @@ export class TimerService {
   }
 
   /**
-   * Cancels future recurring occurrences or a one-shot whose initial prompt is still queued.
-   * For one-shots, an admitted prompt returns `alreadyFired`.
+   * Cancels future recurring occurrences and outstanding queued receipts, including after a scheduling failure.
+   * A one-shot with an admitted or failed prompt returns its existing terminal result.
    *
    * @returns {{ timer: object, changed: boolean, alreadyFired?: boolean, alreadyFailed?: boolean }}
    */
@@ -417,7 +417,7 @@ export class TimerService {
     const nowMs = this.#nowMs()
     const view = this.#view(timer, nowMs)
     if (timer.status === 'cancelled') return { timer: view, changed: false }
-    if (timer.status === 'failed' || (!timer.schedule && view.delivery?.state === 'failed')) {
+    if (!timer.schedule && (timer.status === 'failed' || view.delivery?.state === 'failed')) {
       return { timer: view, changed: false, alreadyFailed: true }
     }
     if (!timer.schedule && (view.delivery?.state === 'sent' || (timer.status === 'fired' && view.delivery?.state !== 'queued'))) {

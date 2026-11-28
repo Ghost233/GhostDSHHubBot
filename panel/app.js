@@ -282,7 +282,7 @@ function renderTimers(timers, owners) {
   for (const timer of timers) {
     const label = owners.find(owner => owner.id === timer.ownerId)?.workspace ?? timer.ownerId
     const actions = timer.status === 'pending' ? [['pause', '暂停'], ['cancel', '取消提醒']]
-      : timer.status === 'paused' ? [['resume', '恢复'], ['cancel', '取消提醒']] : timer.status === 'firing' || (timer.status === 'fired' && timer.delivery?.state === 'queued') ? [['cancel', '取消提醒']] : []
+      : timer.status === 'paused' ? [['resume', '恢复'], ['cancel', '取消提醒']] : timer.status === 'firing' || (timer.status === 'fired' && timer.delivery?.state === 'queued') || (timer.schedule && timer.status === 'failed') ? [['cancel', '取消提醒']] : []
     const schedule = timer.schedule
     const repeat = schedule && (schedule.frequency === 'daily' ? '每日' : '每周' + ('一二三四五六日'[schedule.weekday - 1] ?? ''))
     const cadence = repeat ? repeat + ' ' + schedule.time + '（上海时间）' : null
@@ -334,6 +334,7 @@ function renderRun(run) {
     try {
       const detail = await api('runs/detail?id=' + encodeURIComponent(run.id))
       history.replaceChildren(
+        ...(detail.lastProgressAt ? [detailRow('上次记录进展', fmtTime(detail.lastProgressAt))] : []),
         ...(detail.results ?? []).map(result => detailRow(RUN_RESULT[result.kind] ?? result.kind, fmtTime(result.at))),
         ...(detail.notifications ?? []).map(notice => {
           const state = notice.channelAccepted ? '通道已接受' : (QUEUE_TEXT[notice.state] ?? '无发送记录')

@@ -246,6 +246,36 @@ test('owner rebuild reuses its persisted proposal after the host response is los
   } finally { reopened?.close(); cleanup() }
 })
 
+test('a replacement has no current binding until its first fact-bearing request is accepted', async () => {
+  const { router, registry, calls, advance, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'dir', cwd: '/repos/await-bind' })
+    registry.bindSession(owner.id, 'missing-manager')
+    let replacement
+    const unboundAtPrompt = []
+    router.sessions.create = async input => { calls.create.push(input); replacement = input.sessionId; return { sessionId: replacement, agentPreset: input.agentPreset } }
+    let refused = false
+    router.sessions.prompt = async input => {
+      calls.prompt.push(input)
+      if (input.sessionId === 'missing-manager') throw Object.assign(new Error('fixture missing'), { code: 'session/not-found' })
+      unboundAtPrompt.push(!registry.findByCurrentSession(input.sessionId))
+      assert.match(input.text, /负责人事实/)
+      if (!refused) { refused = true; throw Error('fixture first intake refused') }
+      return { accepted: true }
+    }
+    const receipt = await router.routeToOwner({ ownerId: owner.id, message: 'fixture pending initialization' })
+    assert.equal(receipt.stage, 'idle')
+    assert.equal(registry.get(owner.id).sessionId, null)
+    assert.equal(registry.findByCurrentSession(replacement), undefined)
+    advance(2000)
+    await router.tick()
+    assert.deepEqual(unboundAtPrompt, [true, true])
+    assert.equal(calls.create.length, 1)
+    assert.equal(registry.get(owner.id).sessionId, replacement)
+    assert.ok(calls.prompt.every(prompt => prompt.requestId === receipt.requestId))
+  } finally { cleanup() }
+})
+
 test('three consecutive delivery failures report a system problem (一次性错误不惊动人)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'hub-bot-router-'))
   const store = new Store(dir)
@@ -1018,6 +1048,24 @@ test('restart resumes interrupted background work in its original execution sess
       assert.equal(current.assignments.at(-1).state, 'running')
       assert.ok(recovery[index].text.includes(old.id))
     }
+  } finally { cleanup() }
+})
+
+test('a local timer result records a panel-only outcome without channel delivery', async () => {
+  const { router, registry, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'dir', cwd: '/repos/local-timer' })
+    const source = { kind: 'timer', timerId: 'local-fixture', occurrenceId: '1', fireAt: router.now() }
+    const authorization = { actor: 'fixture-local', source: 'timer', at: router.now() }
+    const launch = await router.routeBackground({ ownerId: owner.id, message: 'fixture local timer', triggerRef: 'timer:local-fixture:1', source, authorization })
+    await router.reportBackground({ ticketId: launch.ticketId, sessionId: launch.workerSession.sessionId, summary: 'Fixture result' })
+    const run = router.runs.get('run-' + launch.ticketId)
+    assert.equal(run.stage, 'person/review')
+    assert.equal(run.status, 'silent')
+    assert.equal(run.decisions.at(-1).reasonCode, 'local-panel')
+    assert.equal(run.notification, null)
+    assert.equal(run.result.kind, 'result')
+    assert.equal(router.listOutbox().some(row => row.kind === 'reply'), false)
   } finally { cleanup() }
 })
 

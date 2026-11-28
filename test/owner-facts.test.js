@@ -155,6 +155,11 @@ test('execution links require a bound L3 and retain the latest active timer bind
     ['c-latest-bound-occurrence', 'current-timer-worker', 'daily-reminder'],
   ])
   assert.equal(snapshot.workers.total, 3)
+  const workerPage = listOwnerFactIndex({ store, ownerId: owner.id, section: 'workers', offset: 2, limit: 1,
+    isArchived: sessionId => sessionId === 'archived-worker-session' })
+  assert.equal(workerPage.entries[0].sessionId, 'current-timer-worker')
+  assert.equal(workerPage.total, 3)
+  assert.equal(workerPage.nextOffset, null)
   assert.equal(facts({ ownerId: retired.id }), undefined)
 })
 
@@ -180,6 +185,8 @@ test('stored answers stay on the original execution receiver until a delivery re
   assert.equal(delivery.expiresAt, request.expiresAt)
   assert.equal(delivery.question, 'Which result should I use?')
   assert.deepEqual(delivery.receiver, receiver)
+  const pendingPage = listOwnerFactIndex({ store, ownerId: owner.id, section: 'pending', limit: 1 })
+  assert.equal(pendingPage.entries[0].deliveryState, 'queued')
   book.recordAnswerDelivery(request.requestId, { state: 'sent' })
   assert.equal(facts().pending.total, 0)
 })
@@ -209,6 +216,12 @@ test('report indexes find recent and historical stored details under the same ow
     ['complete-result', 'Fresh persisted report'], ['old-result', 'Older persisted report'],
   ])
   assert.deepEqual(new Set(snapshot.reportRecords.entries.map(item => item.id)), new Set([digest.id, background.id]))
+  const reportPage = listOwnerFactIndex({ store, ownerId: owner.id, section: 'reportRecords', limit: 1 })
+  assert.equal(reportPage.total, 2)
+  assert.equal(reportPage.nextOffset, 1)
+  const nextReportPage = listOwnerFactIndex({ store, ownerId: owner.id, section: 'reportRecords', offset: reportPage.nextOffset })
+  assert.deepEqual(new Set([reportPage.entries[0].id, nextReportPage.entries[0].id]), new Set([digest.id, background.id]))
+  assert.equal(nextReportPage.nextOffset, null)
   const detail = (kind, id) => readOwnerFactDetail({ store, ownerId: owner.id, kind, id })
   assert.deepEqual(detail('ticket', 'complete-result').report, result.report)
   assert.equal(detail('ticket', 'complete-result').stage, 'done')
@@ -240,7 +253,8 @@ test('large histories produce bounded previews and complete deterministic paged 
   assert.match(first, /read_owner_fact/)
   assert.doesNotMatch(first, /bulk-154|UNABRIDGED END/)
 
-  const page = (section, offset = 0, limit = 20) => listOwnerFactIndex({ store, ownerId: owner.id, section, offset, limit })
+  const page = (section, offset = 0, limit = 20) => listOwnerFactIndex({ store, ownerId: owner.id, section, offset, limit,
+    isArchived: () => assert.fail('only the workers index checks worker archives') })
   const start = page('pending', 0, 200)
   assert.equal(start.total, 155)
   assert.equal(start.nextOffset, 50)
@@ -253,4 +267,24 @@ test('large histories produce bounded previews and complete deterministic paged 
   assert.equal(page('not-a-section'), undefined)
   assert.equal(readOwnerFactDetail({ store, ownerId: owner.id, kind: 'ticket', id: final.entries.at(-1).id }).report.summary, longText)
   assert.equal(formatOwnerFacts(undefined), '')
+})
+
+test('a one-ticket page keeps owner scope and never checks worker archives', t => {
+  const { store, owner, chief, ticket } = fixture(t)
+  ticket('last-id', 'working', { workerSession: { sessionId: 'worker-1', cwd: owner.cwd, at: NOW } })
+  ticket('first-id', 'review', { workerSession: { sessionId: 'worker-2', cwd: owner.cwd, at: NOW } })
+  ticket('old-id', 'done', { updatedAt: null, createdAt: '2026-11-27T12:00:00.000Z' })
+  ticket('other-owner', 'working', { owner: chief.id, updatedAt: '2026-11-29T12:00:00.000Z' })
+  const page = (offset, section = 'tickets') => listOwnerFactIndex({ store, ownerId: owner.id, section, offset, limit: 1,
+    isArchived: () => assert.fail('a ticket page has no worker liveness dependency') })
+
+  const first = page(0)
+  assert.deepEqual(first, { entries: [{ kind: 'ticket', id: 'first-id', stage: 'person/review',
+    requestId: 'req-first-id', triggerId: 'trg-first-id', updatedAt: NOW }], total: 3, nextOffset: 1 })
+  assert.equal(page(first.nextOffset).entries[0].id, 'last-id')
+  const last = page(2)
+  assert.equal(last.entries[0].updatedAt, '2026-11-27T12:00:00.000Z')
+  assert.equal(last.nextOffset, null)
+  assert.deepEqual(page(3), { entries: [], total: 3, nextOffset: null })
+  assert.deepEqual(page(0, 'activeTasks'), { entries: first.entries, total: 2, nextOffset: 1 })
 })

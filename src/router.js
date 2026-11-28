@@ -722,6 +722,7 @@ export class Router {
       const agentPreset = latest.role === 'chief' ? 'hub-bot-router' : 'hub-bot-owner'
       const key = 'owner-bootstrap/' + latest.id
       const plan = this.store.get(key)
+      if (plan?.prepared) return { owner: latest, sessionId: plan.sessionId, created: true }
       const created = await this.sessions.create({
         ...(ws ? { workspaceId: ws.workspaceId } : { cwd: latest.cwd }), agentPreset,
         ...(plan && { sessionId: plan.sessionId }),
@@ -733,12 +734,11 @@ export class Router {
       if (plan && created.agentPreset && created.agentPreset !== agentPreset) {
         throw new RouterError('owner-preset-invalid', 'The replacement must use the registered owner role.')
       }
-      const bound = this.#persistWork(() => {
-        const next = this.registry.bindSession(latest.id, sessionId)
-        if (plan) this.store.set(key, { ...plan, sessionId })
-        return next
-      })
-      return { owner: bound, sessionId, created: true }
+      if (plan) {
+        this.store.set(key, { ...plan, sessionId, prepared: true })
+        return { owner: latest, sessionId, created: true }
+      }
+      return { owner: this.registry.bindSession(latest.id, sessionId), sessionId, created: true }
     })
   }
 
@@ -1374,9 +1374,18 @@ export class Router {
     return this.#persistWork(() => {
       this.tasks.markDelivered(ticketId)
       if (silenceReason !== undefined) {
-        if (!this.#ensureRun(ticket)) throw new RouterError('background-source-missing', 'The original background source is unavailable.')
+        const trigger = this.getTrigger(ticket.triggerId)
+        if (!this.#ensureRun(ticket, trigger)) throw new RouterError('background-source-missing', 'The original background source is unavailable.')
+        if (silenceReason === 'progress-only') {
+          this.runs.recordProgress(ticketId)
+          return { ticketId, stage: 'working' }
+        }
         const saved = this.tasks.finishBackgroundCheck(ticketId)
-        this.runs.recordSilent(ticketId, silenceReason)
+        if (trigger.source.kind === 'github' && trigger.source.event === 'comment') {
+          this.#queueBackgroundNotification(saved, trigger, SILENCE_REASONS[silenceReason])
+        } else {
+          this.runs.recordSilent(ticketId, silenceReason)
+        }
         return { ticketId, stage: saved.stage }
       }
       const saved = failure === undefined ? this.tasks.report({ ticketId, summary, evidence }) : this.tasks.fail({ ticketId, reason: failure })
@@ -1394,10 +1403,11 @@ export class Router {
     if (!this.#ensureRun(ticket, trigger)) return
     const kind = ticket.stage === 'failed' ? 'failure' : ticket.stage === 'blocked' ? 'blocked' : 'result'
     this.runs.recordResult(ticket.id, { kind, reportId: report.id })
-    this.#queueBackgroundNotification(ticket, trigger, kind)
+    const status = { result: '有结果待验收', failure: '执行失败', blocked: '需要介入' }[kind]
+    this.#queueBackgroundNotification(ticket, trigger, '后台任务 ' + ticket.id + ' ' + status + '。在 Hub Bot 运行记录中可查看详情。')
   }
 
-  #queueBackgroundNotification(ticket, trigger, kind) {
+  #queueBackgroundNotification(ticket, trigger, body) {
     const source = trigger.source
     let to, triggerId = trigger.id
     if (source.kind === 'github' && typeof source.repo === 'string' && /^[a-z0-9_-]+[/][a-z0-9_.-]+$/i.test(source.repo)
@@ -1407,11 +1417,12 @@ export class Router {
       to = 'feishu:chat:' + source.origin.chatId
       triggerId = source.origin.triggerId
     }
-    if (!to) return
-    const status = { result: '有结果待验收', failure: '执行失败', blocked: '需要介入' }[kind]
+    if (!to) {
+      this.runs.recordNotNotified(ticket.id, 'local-panel')
+      return
+    }
     const row = insertOutbox(this.store, {
-      ticketId: ticket.id, triggerId, kind: 'reply', state: 'recorded', to,
-      body: '后台任务 ' + ticket.id + ' ' + status + '。在 Hub Bot 运行记录中可查看详情。',
+      ticketId: ticket.id, triggerId, kind: 'reply', state: 'recorded', to, body,
       requestId: 'hub-bot-run-notice-' + this.ids.uuid(),
     }, () => Date.parse(this.now()))
     this.runs.linkOutbox(ticket.id, row.id)
@@ -1443,9 +1454,12 @@ export class Router {
         const message = facts ? facts + '\n\n' + text : text
         const result = await this.sessions.prompt({ sessionId, requestId, text: message })
         if (result?.accepted === false) throw new RouterError('owner-not-admitted', 'The owner Session did not accept the prompt.')
-        if (initializing && !this.store.closed && this.store.get(key)?.sessionId === sessionId) {
+        if (initializing && !this.store.closed) this.#persistWork(() => {
+          if (this.store.get(key)?.sessionId !== sessionId) return
+          const current = this.registry.get(ownerId)
+          if (current && !current.recycled && !current.sessionId) this.registry.bindSession(ownerId, sessionId)
           this.store.db.prepare('DELETE FROM kv WHERE key = ?').run(key)
-        }
+        })
         return { sessionId, rebuilt: initializing }
       }
       if (ticketClosed()) return null
@@ -1463,8 +1477,14 @@ export class Router {
       owner = this.#persistWork(() => {
         const current = this.registry.get(ownerId)
         if (!current || current.recycled) throw new RouterError('owner-unavailable', 'The registered owner is unavailable.')
+        const key = 'owner-bootstrap/' + ownerId
+        if (!current.sessionId) {
+          const plan = this.store.get(key)
+          if (plan?.sessionId === sessionId) this.store.set(key, { ...plan, prepared: false })
+          return current
+        }
         if (current.sessionId !== sessionId) return current
-        this.store.set('owner-bootstrap/' + ownerId, { sessionId: 'session-' + this.ids.uuid(), missingSessionId: sessionId })
+        this.store.set(key, { sessionId: 'session-' + this.ids.uuid(), missingSessionId: sessionId })
         return this.registry.markSessionMissing(ownerId)
       })
       const replacement = await this.#ensureSession(owner)

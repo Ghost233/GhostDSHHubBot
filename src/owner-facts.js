@@ -1,6 +1,7 @@
 import { DANGEROUS_INJECT_ACTION } from './security.js'
 import { CONFIRM_TIMEOUT_MS, STAGES, STAGE_TEXT, normalizeStage, stageDetail } from './tasks.js'
 
+const ACTIVE_STAGES = STAGES.filter(stage => stage !== 'done')
 const WAITING_STAGES = new Set(['person/answer', 'person/confirm', 'person/review'])
 const BACKGROUND_REPORT_PREFIX = '[hub-bot 后台结果] '
 const TICKET_WITH_TRIGGER = `
@@ -17,6 +18,32 @@ const REPORT_OWNER_FILTER = `(
       AND json_extract(t.value, '$.owner') = :ownerId))
 )`
 
+const TICKET_STAGE = "json_extract(t.value, '$.stage')"
+const OWNER_TICKETS = "FROM ticket t WHERE json_extract(t.value, '$.owner') = :ownerId"
+const TICKET_INDEX_COLUMNS = `t.id, 'ticket' AS kind, ${TICKET_STAGE} AS stage,
+  json_extract(t.value, '$.triggerId') AS triggerId, json_extract(t.value, '$.requestId') AS requestId,
+  COALESCE(json_extract(t.value, '$.updatedAt'), json_extract(t.value, '$.createdAt')) AS updatedAt`
+const TICKET_INDEX_ORDER = "COALESCE(updatedAt, '') DESC, t.id"
+const MATCHING_STAGES = `${TICKET_STAGE} IN (SELECT value FROM json_each(:stages))`
+const REPORT_RECORD_INDEX = {
+  columns: `o.id, 'outbox' AS kind, o.at, json_extract(o.value, '$.kind') AS reportKind,
+    json_extract(o.value, '$.state') AS state, json_extract(o.value, '$.ticketId') AS ticketId`,
+  source: `FROM outbox o WHERE ${REPORT_OWNER_FILTER}`,
+  order: 'o.at DESC, o.id',
+}
+
+const SQL_INDEX_QUERIES = new Map([
+  ['tickets', { columns: TICKET_INDEX_COLUMNS, source: OWNER_TICKETS, order: TICKET_INDEX_ORDER }],
+  ['activeTasks', { columns: TICKET_INDEX_COLUMNS, order: TICKET_INDEX_ORDER,
+    source: `${OWNER_TICKETS} AND ${MATCHING_STAGES}`, stages: JSON.stringify([...ACTIVE_STAGES, 'review']) }],
+  ['reports', {
+    columns: `t.id, 'ticket' AS kind, ${TICKET_STAGE} AS stage, json_extract(t.value, '$.report.at') AS at`,
+    source: `${OWNER_TICKETS} AND json_type(t.value, '$.report.summary') = 'text'`,
+    order: "COALESCE(at, '') DESC, t.id",
+  }],
+  ['reportRecords', REPORT_RECORD_INDEX],
+])
+
 function registeredOwner(store, ownerId) {
   if (typeof ownerId !== 'string' || !ownerId || store.closed) return undefined
   const row = store.db.prepare('SELECT value FROM owner WHERE id = ?').get(ownerId)
@@ -31,12 +58,8 @@ function normalizedTicket(value) {
 }
 
 function readReportRecordIndex(store, ownerId) {
-  return store.db.prepare(`
-    SELECT o.id, 'outbox' AS kind, o.at, json_extract(o.value, '$.kind') AS reportKind,
-      json_extract(o.value, '$.state') AS state, json_extract(o.value, '$.ticketId') AS ticketId
-    FROM outbox o WHERE ${REPORT_OWNER_FILTER}
-    ORDER BY o.at DESC, o.id
-  `).all({ ownerId }).map(row => ({ ...row }))
+  const { columns, source, order } = REPORT_RECORD_INDEX
+  return store.db.prepare(`SELECT ${columns} ${source} ORDER BY ${order}`).all({ ownerId }).map(row => ({ ...row }))
 }
 
 /** Looks up the exact ticket or a stored report snapshot by persisted ID within one owner. */
@@ -181,7 +204,7 @@ export function buildOwnerFacts({ store, ownerId, isArchived = () => false }) {
     requestId: ticket.requestId ?? null, updatedAt: ticket.updatedAt ?? ticket.createdAt ?? null,
     title: ticket.routedMessage ?? rows[index].message ?? null, detail: stageDetail(ticket) ?? null,
   })).sort(byRecent('updatedAt'))
-  const byStage = Object.fromEntries(STAGES.filter(stage => stage !== 'done').map(stage => [stage, 0]))
+  const byStage = Object.fromEntries(ACTIVE_STAGES.map(stage => [stage, 0]))
   const active = entries.filter(ticket => Object.hasOwn(byStage, ticket.stage))
   const pending = tickets.map((ticket, index) => pendingFact(ticket, JSON.parse(rows[index].source ?? 'null')))
     .filter(Boolean).sort(byRecent('openedAt'))
@@ -200,28 +223,56 @@ export function buildOwnerFacts({ store, ownerId, isArchived = () => false }) {
   }
 }
 
-const INDEX_FIELDS = new Map([
-  ['tickets', ['stage', 'requestId', 'triggerId', 'updatedAt']],
-  ['activeTasks', ['stage', 'requestId', 'triggerId', 'updatedAt']],
+const COMPUTED_INDEX_FIELDS = new Map([
   ['workers', ['stage', 'sessionId', 'timerId', 'retainedForTimer', 'updatedAt']],
   ['pending', ['stage', 'requestId', 'status', 'openedAt', 'expiresAt', 'deliveryState']],
-  ['reports', ['stage', 'at']],
-  ['reportRecords', ['reportKind', 'ticketId', 'state', 'at']],
 ])
+
+function indexPage(entries, total, offset) {
+  const end = offset + entries.length
+  return { entries, total, nextOffset: entries.length > 0 && end < total ? end : null }
+}
+
+function readSqlIndexPage(db, query, ownerId, offset, limit) {
+  const { columns, source, order, stages } = query
+  const scope = stages ? { ownerId, stages } : { ownerId }
+  const { total } = db.prepare(`SELECT COUNT(*) AS total ${source}`).get(scope)
+  if (offset >= total) return indexPage([], total, offset)
+  const rows = db.prepare(`SELECT ${columns} ${source} ORDER BY ${order} LIMIT :limit OFFSET :offset`)
+    .all({ ...scope, offset, limit })
+  const entries = rows.map(row => row.kind === 'ticket' ? { ...row, stage: normalizeStage(row.stage) } : { ...row })
+  return indexPage(entries, total, offset)
+}
+
+function readComputedIndex({ store, ownerId, section, isArchived = () => false }) {
+  if (section === 'workers') {
+    const rows = store.db.prepare(`
+      SELECT t.value ${OWNER_TICKETS} AND json_extract(t.value, '$.workerSession.sessionId') IS NOT NULL
+      ORDER BY t.rowid DESC
+    `).all({ ownerId })
+    return workerFacts(store, ownerId, rows.map(row => normalizedTicket(row.value)), isArchived)
+  }
+  const rows = store.db.prepare(`
+    SELECT t.value ${OWNER_TICKETS}
+    AND (${MATCHING_STAGES} OR (${TICKET_STAGE} = 'working'
+      AND json_extract(t.value, '$.deferred.outcome.delivery.state') = 'queued'))
+  `).all({ ownerId, stages: JSON.stringify([...WAITING_STAGES, 'review']) })
+  return rows.map(row => pendingFact(normalizedTicket(row.value))).filter(Boolean).sort(byRecent('openedAt'))
+}
 
 /** A deterministic page of lookup references for the current owner facts. Use nextOffset for the next page. */
 export function listOwnerFactIndex({ store, ownerId, section = 'tickets', offset = 0, limit = 20, isArchived }) {
-  const fields = INDEX_FIELDS.get(section)
-  if (!fields || !Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1) return undefined
-  const facts = buildOwnerFacts({ store, ownerId, isArchived })
-  if (!facts) return undefined
-  const { entries, total } = facts[section]
-  const end = Math.min(offset + Math.min(limit, 50), total)
+  const query = SQL_INDEX_QUERIES.get(section)
+  const fields = COMPUTED_INDEX_FIELDS.get(section)
+  if ((!query && !fields) || !Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1) return undefined
+  if (!registeredOwner(store, ownerId)) return undefined
+  const pageSize = Math.min(limit, 50)
+  if (query) return readSqlIndexPage(store.db, query, ownerId, offset, pageSize)
+
+  const entries = readComputedIndex({ store, ownerId, section, isArchived })
   const keys = ['kind', 'id', ...fields]
-  return {
-    entries: entries.slice(offset, end).map(entry => Object.fromEntries(keys.map(key => [key, entry[key]]))),
-    total, nextOffset: end < total ? end : null,
-  }
+  const page = entries.slice(offset, offset + pageSize).map(entry => Object.fromEntries(keys.map(key => [key, entry[key]])))
+  return indexPage(page, entries.length, offset)
 }
 
 function excerpt(value, maxLength) {
