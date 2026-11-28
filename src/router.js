@@ -39,6 +39,7 @@ export class RouterError extends Error {
 
 /** The recovery note carried exactly once into the first injection after a host restart (spec: 重启恢复）. */
 export const RECOVERY_NOTE = '（重启恢复：先检查目录与 git 状态，再重复任何对外动作）'
+const OWNER_APPROVAL_NOTICE = '\n\n（本条消息命中危险命令黑名单，已经用户确认放行）'
 
 /** True when a prompt failure means the Session record is gone (deleted), not a transient/provider failure. */
 function isMissingSession(error) {
@@ -171,7 +172,7 @@ export class Router {
     }
     if (!row.ticketId) return false
     const ticket = this.tasks.getTicket(row.ticketId)
-    if (row.kind === 'approved-owner-inject' || this.#isLegacyApprovedRow(row, ticket)) {
+    if (row.kind === 'approved-owner-inject' || this.#isLegacyApprovedRow(row)) {
       if (this.#currentApprovedWork(row)) this.tasks.fail({ ticketId: ticket.id, reason })
       return true
     }
@@ -926,7 +927,7 @@ export class Router {
     const sessionId = fixedSessionId ?? this.registry.get(owner.id)?.sessionId ?? ensured.sessionId
     const label = action.entry === 'follow-up' ? '[hub-bot 追问 ' + ticketId + '] ' : '[hub-bot 路由 ' + ticketId + '] '
     const text = label + action.message + '\n\n授权：' + auth.actor + ' 经 ' + auth.source + ' 于 ' + auth.at + '；任务 ' + ticketId
-      + '\n\n（本条消息命中危险命令黑名单，已经用户确认放行）'
+      + OWNER_APPROVAL_NOTICE
     const requestId = approvalId ? 'hub-bot-approved-' + approvalId : 'hub-bot-route-' + this.ids.uuid()
     this.#persistWork(() => {
       try { this.tasks.confirm({ ticketId, result: { injected: { entry: action.entry, requestId } }, by: 'user' }) } catch (error) { throw translateTaskError(error, (code, message) => new RouterError(code, message)) }
@@ -945,11 +946,10 @@ export class Router {
         .map(raw => JSON.parse(String(raw.value)))
         .filter(ticket => ticket.recoveryPending === true && normalizeStage(ticket.stage) === 'working')
         .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)))
-      const pendingById = new Map(pending.map(ticket => [ticket.id, ticket]))
       const queuedRecoveries = new Set(this.listOutbox()
         .filter(row => ['queued', 'held'].includes(row.state) && (['background-recovery', 'deferred-answer', 'approved-owner-inject'].includes(row.kind)
           || (row.kind === 'inject' && (row.body.startsWith('[hub-bot 恢复 ' + row.ticketId + ']')
-            || this.#isLegacyApprovedRow(row, pendingById.get(row.ticketId))))))
+            || this.#isLegacyApprovedRow(row)))))
         .map(row => row.ticketId))
       const perOwner = new Map()
       let resumed = 0
@@ -1446,7 +1446,7 @@ export class Router {
     if (row.kind === 'reply') return this.#deliverReply(row)
     if (row.kind !== 'inject' && row.kind !== 'background-recovery') return
     const ticket = this.tasks.getTicket(row.ticketId)
-    if (this.#isLegacyApprovedRow(row, ticket)) return this.#deliverApprovedOwner(row)
+    if (this.#isLegacyApprovedRow(row)) return this.#deliverApprovedOwner(row)
     const permanent = (message) => { const error = new Error(message); error.permanent = true; return error }
     if (!ticket) throw permanent('outbox ' + row.id + ': ticket ' + row.ticketId + ' is gone')
     // S01：入队之后票可能已被取消/失败/关闭 —— 结案的票一次都不许注入（也不算投递成功，记 recorded）。
@@ -1483,17 +1483,16 @@ export class Router {
     })
   }
 
-  #isLegacyApprovedRow(row, ticket) {
-    const approval = ticket?.confirmOutcome
-    const injected = approval?.result?.injected
-    return row.kind === 'inject' && approval?.kind === 'confirmed' && ['route', 'follow-up'].includes(injected?.entry)
-      && injected.requestId === row.requestId
+  #isLegacyApprovedRow(row) {
+    // V1 encoded approvals on each stored prompt. A later approval can replace the ticket face.
+    return row.kind === 'inject' && typeof row.body === 'string' && row.body.endsWith(OWNER_APPROVAL_NOTICE)
+      && (row.body.startsWith('[hub-bot 路由 ' + row.ticketId + '] ') || row.body.startsWith('[hub-bot 追问 ' + row.ticketId + '] '))
   }
 
   #currentApprovedWork(row) {
     if (row.kind === 'approved-owner-inject') return this.#currentDeferredWork(row.ticketId, row.requestId.slice('hub-bot-approved-'.length))
     const ticket = this.tasks.getTicket(row.ticketId)
-    return ticket?.stage === 'working' && ticket.authorization && this.#isLegacyApprovedRow(row, ticket) ? ticket : null
+    return ticket?.stage === 'working' && ticket.authorization && this.#isLegacyApprovedRow(row) ? ticket : null
   }
 
   async #deliverApprovedOwner(row) {
