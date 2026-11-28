@@ -36,7 +36,8 @@ function identifier(value) {
 }
 
 function validOwnerId(value) {
-  return typeof value === 'string' && value.trim().length > 0 && value.length <= 512 && !/[\p{Cc}]/u.test(value)
+  // Registry owners may come from existing workspace names or absolute paths.
+  return typeof value === 'string' && value.trim().length > 0
 }
 
 function positiveInteger(value) {

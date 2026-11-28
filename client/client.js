@@ -305,6 +305,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       kindRepo: '仓库',
       kindTemp: '临时',
       sessionNone: '尚未绑定',
+      ownerRecycled: '已回收', switchEarlierArchives: '之前更换的归档失败',
       openSessionButton: '打开会话',
       copySessionButton: '复制 ID',
       openOwnerSession: '打开「{n}」的会话',
@@ -723,6 +724,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       kindRepo: 'Repo',
       kindTemp: 'Temp',
       sessionNone: 'Unbound',
+      ownerRecycled: 'Recycled', switchEarlierArchives: 'Earlier archive failures',
       openSessionButton: 'Open session',
       copySessionButton: 'Copy ID',
       openOwnerSession: 'Open the session for {n}',
@@ -2234,7 +2236,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             error ? h('p', { role: 'alert', style: { overflowWrap: 'anywhere' } }, error) : null);
         }
 
-        function OwnerSwitchControls({ owner, operation, onRefresh, onOperationSession, showSessions, disabled, t }) {
+        function OwnerSwitchControls({ owner, operation, onRefresh, onOperationSession, showSessions, disabled, historyOnly, t }) {
           var [expanded, setExpanded] = React.useState(false);
           var [busy, setBusy] = React.useState(false);
           var [error, setError] = React.useState(null);
@@ -2254,7 +2256,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             try { await onOperationSession(operation.operationId, binding); }
             catch (failure) { setError(t('openSessionFailed') + ' · ' + (failure?.message ?? String(failure))); }
           }
-          var pending = ['waiting', 'preparing', 'committed', 'archive-failed'].includes(operation?.status);
+          var pending = historyOnly || ['waiting', 'preparing', 'committed', 'archive-failed'].includes(operation?.status);
           var newRequest = { action: 'request', expectedSessionId: owner.sessionId };
           var button = (label, request) => h('button', { type: 'button', style: settingsButtonStyle, disabled: busy || disabled, onClick: () => void act(request) }, t(label));
           return h('div', { style: { display: 'flex', gap: '6px 8px', flexWrap: 'wrap', alignItems: 'center' } },
@@ -2348,11 +2350,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var rds = React.useState(false); var recentDroppedOnly = rds[0]; var setRecentDroppedOnly = rds[1];
           var rus = React.useState(false); var recentUnprocOnly = rus[0]; var setRecentUnprocOnly = rus[1];
 
-          function publishOverview(board) {
+          function publishOverview(board, generationId) {
+            if (!generationId || generationSource.getSnapshot()?.id !== generationId) return;
             if (!board?.generatedAt) throw new Error(t('loadFailed'));
             var receivedAt = Date.now();
-            var generationId = generationSource.getSnapshot()?.id;
-            setMonitor(current => current.generationId === generationId && current.overview?.generatedAt > board.generatedAt
+            setMonitor(current => generationSource.getSnapshot()?.id !== generationId
+              || (current.generationId === generationId && current.overview?.generatedAt > board.generatedAt)
               ? current : { overview: board, receivedAt, generationId, error: null });
           }
           function refreshMonitoring() {
@@ -2364,7 +2367,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               .then(function ([board, rows]) {
                 if (monitorRequest.current !== pending || generationSource.getSnapshot()?.id !== generationId) return;
                 if (board.status === 'rejected') throw board.reason;
-                publishOverview(board.value);
+                publishOverview(board.value, generationId);
                 if (rows.status === 'rejected') {
                   if (Array.isArray(board.value.owners)) setOwners(board.value.owners);
                   throw rows.reason;
@@ -2433,17 +2436,22 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               finishSelfTest(run, 'error', 'selfTestTimeout');
               return;
             }
+            var generationId = generationSource.getSnapshot()?.id;
             scoped.remote.hubBotSettings.overview().then(function (raw) {
               if (selfTestRun.current !== run) return;
+              if (generationSource.getSnapshot()?.id !== generationId) {
+                run.timer = setTimeout(function () { pollSelfTest(run); }, 2500);
+                return;
+              }
               var ov = unwrap(raw);
               var result = ov?.selfTests?.find(test => test.id === run.triggerId);
               if (result?.dropped) {
                 finishSelfTest(run, 'error', 'selfTestDropped', result.dropped);
               } else if (result?.reply?.state === 'sent') {
-                publishOverview(ov);
+                publishOverview(ov, generationId);
                 finishSelfTest(run, 'success', 'selfTestPassed');
               } else if (result?.reply?.state === 'failed') {
-                publishOverview(ov);
+                publishOverview(ov, generationId);
                 finishSelfTest(run, 'error', 'selfTestDeliveryFailed', result.reply.lastError);
               } else {
                 run.timer = setTimeout(function () { pollSelfTest(run); }, 2500);
@@ -2523,6 +2531,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             return ticket.deferred?.status === 'pending' ? { requestId: ticket.deferred.requestId } : {};
           }
 
+          function answerDraftKey(ticket) {
+            return JSON.stringify([ticket.id, ticket.stage, ticket.question?.at ?? null, ticket.deferred?.requestId ?? null, ticket.report?.at ?? null]);
+          }
+
           async function sendTicketResolution(request) {
             var result = unwrap(await scoped.remote.hubBotSettings.resolveTicket(request));
             if (result?.ticketId !== request.ticketId) throw new Error(t('ticketResultMissing'));
@@ -2550,7 +2562,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             };
             var [actionLabel, successLabel] = labels[resolution];
             if (resolution === 'answer' && tk.stage === 'person/review') successLabel = 'reworkDone';
-            var message = resolution === 'answer' ? (answers[tk.id] || '').trim() : '';
+            var draftKey = answerDraftKey(tk);
+            var message = resolution === 'answer' ? (answers[draftKey] || '').trim() : '';
             if (resolution === 'answer') {
               if (!message) return;
             } else if (!window.confirm(t(actionLabel) + ' · ' + (tk.pendingConfirm?.text || tk.message || tk.id))) return;
@@ -2560,7 +2573,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               var result = await sendTicketResolution({ ticketId: tk.id, resolution, ...decisionId(tk), ...(message ? { message } : {}) });
               if (resolution === 'answer') setAnswers(function (current) {
                 var next = { ...current };
-                delete next[tk.id];
+                delete next[draftKey];
                 return next;
               });
               if (selected.has(tk.id)) setSelected(function (current) {
@@ -2623,7 +2636,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           }, [panelPage, Boolean(view && owners && overview)]);
 
           function refreshOverview() {
-            return scoped.remote.hubBotSettings.overview().then(unwrap).then(publishOverview);
+            var generationId = generationSource.getSnapshot()?.id;
+            return scoped.remote.hubBotSettings.overview().then(unwrap).then(board => publishOverview(board, generationId));
           }
 
           async function refreshWorkspace() {
@@ -2837,7 +2851,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                   return h(RecentMessageRow, { key: entry.id, entry, t, channel: kindLabel(entry.kind), copiedId, onCopy: copyText,
                     ownerButton: ownerFilterButton(ownerId, entry.ownerLabel, { maxWidth: '135px', fontSize: '11px' }),
                     onTicket: ticketId => openStream({ ticketId }),
-                    onRetry: () => scoped.remote.hubBotSettings.overview().then(unwrap).then(publishOverview).catch(() => {}),
+                    onRetry: () => refreshOverview().catch(() => {}),
                   });
                 })));
           }
@@ -2931,7 +2945,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               var current = inWorkspace ? unwrap(await api.ownerWorkspace({ ownerId: owner.id }))?.owner
                 : unwrap(await api.listOwners()).find(row => row.id === owner.id);
               if (!isCurrent()) return;
-              if (current?.id !== owner.id || !current.sessionId) throw new Error(t('sessionNone'));
+              if (current?.id !== owner.id || current.recycled || !current.sessionId) throw new Error(t('sessionNone'));
               await openSessionById(current.sessionId);
             } catch (error) {
               if (isCurrent()) setOwnerSessionError({ ownerId: owner.id, sessionId: owner.sessionId, message: error?.message || String(error) });
@@ -3164,14 +3178,15 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             }
             if (tk.stage === 'person/answer' || tk.stage === 'person/review') {
               var inputLabel = t(reviewing ? 'reworkPlaceholder' : 'answerPlaceholder');
-              var draft = answers[tk.id] || '';
-              actions.push(h('textarea', { key: 'reply', rows: 2,
+              var draftKey = answerDraftKey(tk);
+              var draft = answers[draftKey] || '';
+              actions.push(h('textarea', { key: draftKey, rows: 2,
                 style: Object.assign({}, settingsInputStyle, { flex: '1 1 180px', minWidth: 0, padding: '5px 10px', fontSize: '13px', resize: 'vertical' }),
                 value: draft, disabled: disableTicketActions, placeholder: inputLabel, 'aria-label': inputLabel,
                 'aria-description': t('replyShortcut'), title: t('replyShortcut'),
                 onChange: function (ev) {
                   var value = ev.target.value;
-                  setAnswers(current => ({ ...current, [tk.id]: value }));
+                  setAnswers(current => ({ ...current, [draftKey]: value }));
                 },
                 onKeyDown: function (ev) {
                   if (ev.key === 'Enter' && !ev.shiftKey && !ev.nativeEvent.isComposing) {
@@ -3319,6 +3334,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             var owner = value.owner;
             var scope = 'owner:' + owner.id;
             var targetId = workspaceTarget?.ownerId === owner.id ? workspaceTarget.ticketId : null;
+            var priorArchives = (value.archiveFailures ?? []).filter(operation => operation.ownerId === owner.id
+              && operation.status === 'archive-failed' && operation.operationId !== value.switchOperation?.operationId);
+            var currentSession = owner.recycled ? null : owner.sessionId;
             var sessionError = ownerSessionError?.ownerId === owner.id && ownerSessionError.sessionId === owner.sessionId ? ownerSessionError.message : null;
             var role = owner.role === 'chief' ? 'roleChief' : owner.kind === 'scratch' ? 'kindTemp' : 'roleOwner';
             var sessionKey = 'sid:' + owner.id;
@@ -3360,14 +3378,19 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                   h('div', { style: { ...actions, margin: '8px 0', paddingBlock: '8px', borderBlock: '1px solid var(--dsw-alias-border-l2)' } },
                     h('div', { style: { flex: '1 1 160px', minWidth: 0 } },
                       h('div', { style: settingsHintStyle }, t('ownerWorkspaceCurrent')),
-                      h('div', { style: { fontSize: '12px' } }, owner.sessionId || t('sessionNone'))),
-                    owner.sessionId && canOpenOwnerSession ? h('button', { type: 'button', style: settingsButtonStyle,
+                      h('div', { style: { fontSize: '12px' } }, currentSession || t(owner.recycled ? 'ownerRecycled' : 'sessionNone'))),
+                    currentSession && canOpenOwnerSession ? h('button', { type: 'button', style: settingsButtonStyle,
                       onClick: () => void openOwnerSession(owner, true) }, t('openSessionButton')) : null,
-                    owner.sessionId ? h('button', { type: 'button', style: settingsButtonStyle,
-                      onClick: () => copyText(owner.sessionId, sessionKey) }, t(copiedId === sessionKey ? 'copiedBtn' : 'copySessionButton')) : null),
+                    currentSession ? h('button', { type: 'button', style: settingsButtonStyle,
+                      onClick: () => copyText(currentSession, sessionKey) }, t(copiedId === sessionKey ? 'copiedBtn' : 'copySessionButton')) : null),
                   sessionError ? h('p', { role: 'alert', style: settingsHintStyle }, t('openSessionFailed') + ' · ' + sessionError) : null,
                   h(OwnerSwitchControls, { key: owner.sessionId, owner, t, operation: value.switchOperation, showSessions: true, disabled: Boolean(workspace.error), onRefresh: refreshWorkspace,
                     onOperationSession: canOpenOwnerSession ? (id, binding) => openOperationSession(owner.id, id, binding, true) : null })),
+                priorArchives.length ? h('section', { 'aria-labelledby': 'hub-bot-workspace-archive-failures', style: sectionStyle },
+                  h('h3', { id: 'hub-bot-workspace-archive-failures', style: sectionTitleStyle }, t('switchEarlierArchives')),
+                  ...priorArchives.map(operation => h(OwnerSwitchControls, { key: operation.operationId, owner, t, operation,
+                    historyOnly: true, showSessions: true, disabled: Boolean(workspace.error), onRefresh: refreshWorkspace,
+                    onOperationSession: canOpenOwnerSession ? (id, binding) => openOperationSession(owner.id, id, binding, true) : null }))) : null,
                 ticketStatus(scope),
                 targetId && !value.tickets.some(ticket => ticket.id === targetId) ? h('p', { ref: workspaceTicketError, tabIndex: -1, role: 'alert' }, t('ownerWorkspaceNoTicket')) : null,
                 ticketSection('hub-bot-owner-needs-title', 'needsMe', needs, 'quiet'),
@@ -3451,7 +3474,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               onMessages: recent.some(row => row.unprocessed) ? () => {
                 setRecentKind(''); setRecentDroppedOnly(false); setRecentUnprocOnly(true); scrollToSection('hub-bot-recent-title');
               } : null,
-              refresh: () => scoped.remote.hubBotSettings.overview().then(unwrap).then(publishOverview),
+              refresh: refreshOverview,
             }),
              h('section', { id: 'hub-bot-needs', 'aria-labelledby': 'hub-bot-needs-title', style: Object.assign({}, sectionStyle, needs.length > 0 ? { borderLeft: '3px solid ' + TONES.amber.border, paddingLeft: '14px' } : {}) },
                h('div', { style: Object.assign({}, sectionTitleStyle, { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }) },
@@ -3694,7 +3717,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     sessionId = operation?.ownerId === ownerId && operation.operationId === operationId && operation.committedAt ? operation.oldSessionId : null;
                   } else {
                     var owners = unwrap(await linkScope.remote.hubBotSettings.listOwners());
-                    sessionId = owners.find(row => row.id === ownerId)?.sessionId;
+                    sessionId = owners.find(row => row.id === ownerId && !row.recycled)?.sessionId;
                   }
                   if (!current || generations.getSnapshot()?.id !== generationId) return;
                   url = new URL(window.location.href);

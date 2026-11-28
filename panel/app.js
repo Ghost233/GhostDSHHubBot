@@ -392,7 +392,7 @@ function ownerSwitchControls(owner, operation) {
   const controls = el('div', { class: 'run-filters' })
   const busy = operation && ['waiting', 'preparing', 'committed', 'archive-failed'].includes(operation.status)
   const actionButton = (label, request) => {
-    const button = el('button', { class: 'btn', type: 'button' }, text(label))
+    const button = el('button', { class: 'btn', type: 'button', 'data-switch-action': request.action }, text(label))
     button.addEventListener('click', async () => {
       if (switchOperations.has(owner.id)) return
       if (request.mode === 'stop' && !window.confirm('确认停止原负责人会话当前处理，等它空闲后更换？')) return
@@ -473,7 +473,7 @@ function renderBoard(overview) {
     workspaceOwners = owners
     renderWorkspacePicker()
   }
-  const nextTimerKey = JSON.stringify([timers, owners])
+  const nextTimerKey = JSON.stringify([timerViewKey(timers), owners.map(owner => [owner.id, owner.workspace])])
   if (timerKey !== nextTimerKey) {
     timerKey = nextTimerKey
     renderTimers($('#timers'), timers, owners)
@@ -606,6 +606,12 @@ function renderTriggerDetail(trigger) {
     }
   })
   return details
+}
+
+function timerViewKey(timers) {
+  return JSON.stringify(timers.map(timer => [timer.id, timer.ownerId, timer.message, timer.status, timer.fireAt, timer.late,
+    timer.schedule?.frequency, timer.schedule?.time, timer.schedule?.weekday, timer.delivery?.ticketId, timer.delivery?.state,
+    timer.delivery?.workerSession?.sessionId, timer.lastError?.message ?? timer.delivery?.lastError]))
 }
 
 function renderTimers(box, timers, owners, ownerId) {
@@ -837,9 +843,11 @@ function renderWorkspace(workspace, data) {
   const { ownerId, keys } = workspace
   const { owner } = data
   const operation = data.switchOperation?.ownerId === ownerId ? data.switchOperation : null
-  const sessionKey = JSON.stringify([owner, operation])
+  const archiveFailures = (data.archiveFailures ?? []).filter(failure =>
+    failure.ownerId === ownerId && failure.status === 'archive-failed' && failure.operationId !== operation?.operationId)
+  const sessionKey = JSON.stringify([owner, operation, archiveFailures])
   if (keys.session !== sessionKey) {
-    renderWorkspaceSession(owner, operation)
+    renderWorkspaceSession(owner, operation, archiveFailures)
     keys.session = sessionKey
   }
   $('#workspace-content').hidden = false
@@ -857,7 +865,7 @@ function renderWorkspace(workspace, data) {
     keys.tickets = ticketKey
   }
   const timers = data.timers.filter(timer => timer.ownerId === ownerId)
-  const timerKey = JSON.stringify(timers)
+  const timerKey = timerViewKey(timers)
   if (keys.timers !== timerKey) {
     renderTimers($('#workspace-timers'), timers, [owner], ownerId)
     keys.timers = timerKey
@@ -868,7 +876,7 @@ function renderWorkspace(workspace, data) {
   workspace.loaded = true
 }
 
-function renderWorkspaceSession(owner, operation) {
+function renderWorkspaceSession(owner, operation, archiveFailures) {
   const box = $('#workspace-session')
   const current = owner.recycled ? '已回收' : (owner.sessionId ?? '未绑定')
   box.replaceChildren(detailRow('负责人', ownerLabel(owner)), detailRow('负责人 ID', owner.id))
@@ -888,6 +896,17 @@ function renderWorkspaceSession(owner, operation) {
   } else if (controls) {
     controls.classList.add('workspace-switch')
     box.append(controls)
+  }
+  if (archiveFailures.length) {
+    const archives = el('section', { id: 'workspace-archive-failures', class: 'workspace-switch', 'aria-labelledby': 'workspace-archive-title' },
+      el('h4', { id: 'workspace-archive-title', class: 'q' }, text('历史归档失败')))
+    for (const failure of archiveFailures) {
+      archives.append(el('article', { class: 'ticket-row', 'data-operation-id': failure.operationId },
+        detailRow('原会话', failure.oldSessionId ?? '—'),
+        detailRow('更新时间', fmtTime(failure.updatedAt)),
+        ownerSwitchControls(owner, failure)))
+    }
+    box.append(archives)
   }
 }
 

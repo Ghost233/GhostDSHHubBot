@@ -529,6 +529,8 @@ test('both workspace endpoints keep the same owner facts after replacement and r
   const oldSession = 'session-workspace-original'
   const otherSession = 'session-workspace-other'
   const sessions = new Set([oldSession, otherSession])
+  const archived = []
+  let refuseFirstArchive = true
   const registered = new Map()
   let handler
   root.provide('tools', { register(tool) { registered.set(tool.name, tool); return () => registered.delete(tool.name) } })
@@ -541,7 +543,11 @@ test('both workspace endpoints keep the same owner facts after replacement and r
     async prompt(request) { assert.ok(sessions.has(request.sessionId)); return { accepted: true } },
   })
   root.provide('sessionPersistence', { async flush() {} })
-  root.provide('workspaceController', { async archiveSession({ sessionId }) { return { archivedSessionIds: [sessionId] } } })
+  root.provide('workspaceController', { async archiveSession({ sessionId }) {
+    if (sessionId === oldSession && refuseFirstArchive) throw new Error('Fixture first archive refusal')
+    archived.push(sessionId)
+    return { archivedSessionIds: [sessionId] }
+  } })
   root.provide('webServer', { host: '127.0.0.1', port: 3199, register(entry) {
     handler = entry.handler
     return () => { handler = undefined }
@@ -588,10 +594,41 @@ test('both workspace endpoints keep the same owner facts after replacement and r
   const swap = await settings.ownerSwitchAction({ action: 'request', mode: 'wait', ownerId: owner.id, expectedSessionId: oldSession })
   await hub.router.ownerSwitch.tick()
   await hub.router.ownerSwitch.tick()
+  const firstArchive = await settings.ownerWorkspace({ ownerId: owner.id })
+  assert.equal(firstArchive.owner.sessionId, swap.newSessionId)
+  assert.equal(firstArchive.switchOperation.oldSessionId, oldSession)
+  assert.equal(firstArchive.switchOperation.status, 'archive-failed')
+  assert.deepEqual(firstArchive.archiveFailures, [])
+  const next = await settings.ownerSwitchAction({ action: 'request', mode: 'wait', ownerId: owner.id, expectedSessionId: swap.newSessionId })
+  await hub.router.ownerSwitch.tick()
+  await hub.router.ownerSwitch.tick()
   const after = await settings.ownerWorkspace({ ownerId: owner.id })
-  assert.equal(after.owner.sessionId, swap.newSessionId)
-  assert.equal(after.switchOperation.oldSessionId, oldSession)
+  assert.equal(after.owner.sessionId, next.newSessionId)
+  assert.equal(after.switchOperation.oldSessionId, swap.newSessionId)
   assert.equal(after.switchOperation.status, 'completed')
+  assert.deepEqual(after.archiveFailures.map(row => row.operationId), [swap.operationId])
+  assert.equal(after.archiveFailures[0].oldSessionId, oldSession)
+  assert.deepEqual((await request(other.id)).body.archiveFailures, [])
+  refuseFirstArchive = false
+  await settings.ownerSwitchAction({ action: 'retry-archive', ownerId: owner.id, operationId: swap.operationId })
+  await hub.router.ownerSwitch.tick()
+  assert.deepEqual(archived, [swap.newSessionId, oldSession])
+  const retried = await settings.ownerWorkspace({ ownerId: owner.id })
+  assert.equal(retried.owner.sessionId, next.newSessionId)
+  assert.deepEqual(retried.archiveFailures, [])
+  for (const workspace of ['长'.repeat(509), 'release\tqa']) {
+    const registered = hub.registry.create({ kind: 'repo', workspace, cwd: homeRepo })
+    const opened = await request(registered.id)
+    assert.equal(opened.status, 200)
+    assert.equal(opened.body.owner.id, registered.id)
+  }
+  const scratch = hub.registry.create({ kind: 'scratch' })
+  hub.registry.bindSession(scratch.id, 'session-workspace-history-only')
+  hub.registry.markRecycled(scratch.id)
+  const historical = await settings.ownerWorkspace({ ownerId: scratch.id })
+  assert.equal(historical.owner.recycled, true)
+  assert.equal(historical.owner.sessionId, 'session-workspace-history-only')
+  assert.equal(hub.registry.findByCurrentSession('session-workspace-history-only'), undefined)
   assert.deepEqual(after.tickets.map(row => row.id), before.tickets.map(row => row.id))
   assert.deepEqual(after.runs.map(row => row.id), before.runs.map(row => row.id))
   assert.equal(after.tickets.find(row => row.id === task.ticketId).deferred.requestId, pending.deferred.requestId)

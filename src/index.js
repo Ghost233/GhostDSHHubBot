@@ -459,10 +459,12 @@ export function apply(ctx, rawConfig) {
     const ownerId = requireString(request, 'ownerId')
     if (!ownerId.trim()) throw new HttpError(400, 'An owner ID is required.')
     if (!hub.registry.get(ownerId)) throw new HttpError(404, 'Unknown owner.')
+    const [currentOperation, ...priorOperations] = ownerSwitch.list({ ownerId })
     const workspace = readOwnerWorkspace({ store, registry: hub.registry, ownerId, timers: timers.list({ ownerId }),
-      runs: listRuns({ ownerId }), switchOperation: ownerSwitch.list({ ownerId })[0] ?? null })
+      runs: listRuns({ ownerId }), switchOperation: currentOperation ?? null })
     if (!workspace) throw new HttpError(404, 'Unknown owner.')
-    return workspace
+    const archiveFailures = priorOperations.filter(operation => operation.status === 'archive-failed')
+    return { ...workspace, archiveFailures }
   }
 
   const overview = async () => ({
