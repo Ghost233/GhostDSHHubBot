@@ -66,7 +66,7 @@ patch 结构测试复用仓内先例 `scripts/test-runtime.mjs` 的解析链：`
 ## 任务三态与 L2 执行闭环（#65）
 
 - **三态机（src/tasks.js）**：`working → review → done`；review 是挡板，done 只能由 review 经用户验收（resolution:"accept"）到达。追问把 review 恢复为 working（resume, by:'route'），验收 by:'user'；非法迁移拒绝（如 working 直接 accept、done 后追问、double-report）。全部迁移记 transitions 审计数组。
-- **L2 六工具（src/owner-tools.js，owner preset 静态行）**：search_sessions / read_session / inject_session / create_session / report / escalate。身份解析：工具执行的 exec.agent 经 workingDirectory.ensure 拿会话 cwd，须等于注册表某 owner 的 cwd，否则拒执。
+- **L2 负责人管理工具**：`search_sessions`、`read_session`、`inject_session`、`create_session`、`fork_session`、`report` 和 `escalate`。仅当前绑定的负责人会话可调用，目录也须与注册表一致。旧绑定和具有负责人 preset 的历史会话会标明角色，读取、注入和 fork 只接受责任范围内的执行会话。
 - **越界拒执**：create/inject/read 的目标会话（或 create_session 的目标 cwd）必须落在 owner 责任子树内（isWithinCwd 路径段感知，`/a/b` 不含 `/a/bc`）；越界抛错并指向 escalate。escalate 不改票阶段、打 escalated 标记并写 outbox(kind=escalation)，L1 经 query_tasks 可见。
 - **执行会话保持用户 preset**：create_session 不传 agentPreset（部署默认），插件永不改写执行会话配置。
 - **授权不可变**：Ticket 创建时记 authorization{actor,source,at}，注入执行会话的文本自动携带它；追问注入文本带"改完请再次 report"提示（首跑实证：L2 追问后忘了再次 report，票卡在 working）。
@@ -96,11 +96,13 @@ patch 结构测试复用仓内先例 `scripts/test-runtime.mjs` 的解析链：`
 
 - **扫码绑定**：设备授权回调取得的应用绑定先写入 DSH 宿主凭据记录，成功后才建立长连接。面板通过飞书状态接口查看进度和二维码。权限包含发送消息、读取消息、读取会话基本信息和长连接事件订阅。
 - **沿用已有 Bot**：在当前 profile 所用的 DSH 凭据库中，将原应用的 `appId` 和 `appSecret` 存为 `hub-bot/feishu` 下的 `grant` 记录，两项均放在 `payload` 中，可选填 `boundAt`。如果使用其他记录名，将 `feishu.credentialRef` 设置为对应的 `hub-bot/<id>`。保存引用后重新加载插件。请从插件配置中移除旧的 `feishu.appId` 和 `feishu.appSecret`。原绑定来自 `stateDir/feishu-credentials.json` 时也使用相同的迁移步骤。安装版 DSH 默认将宿主凭据库放在对应 `DSH_HOME` 的 `.credentials.yaml`，权限需为 0600。
-- **长连接配置**：凭证落地后插件尝试 application-config patch 设长连接模式——**实测不可行**（2026-11-16：设备流权限包不含 `application:application:patch`，返回 404）；**正式路径是手工一次性配置**：open.feishu.cn/app → 应用 → 事件与回调 → 订阅方式 → 使用长连接接收事件/回调。失败只记日志不阻断。
+- **长连接配置**：绑定保存后，插件尝试设置长连接事件订阅。只有飞书确认成功时状态为 `configured`。返回失败或缺少权限时状态为 `manual`，面板会提示在飞书开放平台的「事件与回调 → 订阅方式」里一次性开启长连接。配置失败后仍可检查实际连接状态。
 - **来信关联**：先在同一次 SQLite 写入中保存 `feishu-<messageId>`、到达时的来源及策略和投递意图，再确认收录。现有投递泵依序把消息交给总负责人的 DSH 队列，待投递记录可在重启后恢复。回复或派单时使用原来信的 `triggerRef`，以便面板显示关联结果。
 - **飞书受理规则**：应用可用范围由飞书管理后台配置。只受理私聊或明确 @ 本 Bot 的群消息。缺少真实 `botOpenId` 或 @ 对象不同，会记录丢弃原因。非文本消息记一条「暂不支持该消息类型」回复。明确输入「停」或「停止」会请求停止当前总负责人回合，保留已排队消息。
 - **回复投递**：`reply_source` 带飞书 `triggerRef` 时从来信读取聊天地址，投递成功后显示「已回复」。连续失败五次后可从面板重投。历史记录只有聊天地址时显示「回复未关联」。
 - **凭据状态**：`credentialReason` 区分缺少记录、记录格式不正确和宿主凭据服务不可用。保存失败会显示错误，已有绑定保留最后一次确认的记录。旧明文插件配置在启动时被拒绝并给出迁移提示。
+- **绑定状态（`registration`）**：`pending` = 扫码绑定进行中，状态里带本次二维码（面板只在 `pending` 且本次状态确实返回了二维码时才渲染，过期后立即收起，不会拿旧二维码继续展示）；`expired` = 二维码过期、绑定没走完——不自动重开扫码，只给提示和「重新生成二维码」显式重试，已有绑定不受影响、已绑定的 Bot 照常工作，不会被说成需要更换；`failed` = 绑定失败并附 `registrationError`。字段缺省表示没有进行中的绑定流。已绑定时更换 Bot 是显式操作，二次确认后才重新走注册流；此时 `pending`/`expired`/`failed` 都只描述「这次更换」没走完，绑定与现有 Bot 均不变。
+- **验收边界**：设备流绑定固定 `createOnly`，只在飞书上创建新应用，不会修改、也不会验证已存在的旧 Bot；因此「对真实旧 Bot 走一遍创建设备流」这类验收在自动化里做不到，只能由人按上面「沿用已有 Bot」的迁移步骤在真实环境确认。
 - dev 实证探针：`POST /hub-bot/api/feishu/simulate` 注入 mock 事件走真实归一化/Policy/注入路径（无真实飞书时实证全链）。
 
 ## fork 路径与确认流程（#69）
@@ -165,4 +167,4 @@ patch 结构测试复用仓内先例 `scripts/test-runtime.mjs` 的解析链：`
 - 插件配置校验为手写 resolveConfig，未引 schemastery——零运行时依赖的取舍；后续若接 DSH 设置 UI 再评估。
 - 危险命令黑名单是**大小写不敏感子串匹配**的启发式兜底：减少误操作与明显危险注入，不能防御刻意混淆（base64/变量拼接等）；真正的边界仍是渠道侧授权 + preset 工具面 + 用户确认裁决。
 - 被删重建依赖"注入失败"这一信号：`session "<id>" not found` 与 `ApiSessionNotFound` 之外的删除表现（如静默丢弃）不会被识别为重建触发。
-- **owner 重建后的孤儿会话**（#65 首跑实证）：负责人会话被删重建后，旧会话仍在且保持 owner preset；它出现在 search_sessions 结果里（registry 已指向新会话，无法标记 role:'owner'），可能被 L2 误当执行会话注入，形成嵌套委托。功能上闭环仍成立（嵌套层也是 owner，最终完成并 report），但属噪声；后续可考虑按会话的 preset 名或启动侧写登记来识别孤儿。
+- **旧负责人会话**：注册表保留近期历史绑定。未记录在注册表里的旧负责人也可通过 DSH 保存的负责人 preset 识别。清单和内容搜索均标记这些会话的角色。

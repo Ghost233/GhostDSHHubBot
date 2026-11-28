@@ -63,8 +63,14 @@ const NEEDS_ME = new Set(['person/confirm', 'person/answer', 'person/review', 'b
 function healthProblems(health) {
   const items = []
   const feishu = health.feishu ?? {}
-  if (feishu.enabled && feishu.credentialState !== 'ok') items.push('飞书凭据' + (feishu.credentialState === 'missing' ? '缺失' : '无效') + ' — 到设置页重新扫码')
-  if (feishu.enabled && feishu.credentialState === 'ok' && feishu.connected === false) items.push('飞书长连接未建立')
+  // 未绑上时的待办：绑定流过期/失败优先说清「哪一步没走完」，否则才说凭据缺失/无效（同一件事不重复报）。
+  if (feishu.enabled && feishu.credentialState !== 'ok') {
+    if (feishu.registration === 'expired') items.push('飞书绑定未完成（二维码已过期）— 到设置页重新生成二维码')
+    else if (feishu.registration === 'failed') items.push('飞书绑定失败' + (feishu.registrationError ? '：' + feishu.registrationError : ''))
+    else items.push('飞书凭据' + (feishu.credentialState === 'missing' ? '缺失' : '无效') + ' — 到设置页重新扫码')
+  }
+  // 已绑定：只有真的连不上（failed/off）才算待办；connecting/reconnecting 是瞬时过程，保持安静不报警。
+  if (feishu.enabled && feishu.credentialState === 'ok' && (feishu.wsState === 'failed' || feishu.wsState === 'off')) items.push('飞书长连接未建立')
   const gh = health.github ?? {}
   if (gh.enabled && gh.lastPollError) items.push('GitHub 轮询最近失败：' + gh.lastPollError)
   const ob = health.outbox ?? {}
@@ -362,8 +368,13 @@ function renderSettings(view) {
     card.append(el('div', { class: 'quiet small' }, text(fs.bot?.desc ?? fs.preset?.desc ?? '')))
     if (bound) {
       card.append(el('div', { class: 'quiet small' }, text('App ID：' + (fs.bot.appIdMasked ?? '—') + (fs.bot.boundAt ? ' · 绑定于 ' + String(fs.bot.boundAt).slice(0, 16).replace('T', ' ') : ''))))
-      const conn = fs.bot.connected ? '长连接已建立' : '长连接未建立'
-      card.append(el('div', { class: 'small ' + (fs.bot.connected ? 'ok-text' : 'warn-text') }, text('● ' + conn)))
+      // 连接阶段如实分档（connecting/reconnecting/connected/failed），不再一律压成「已/未建立」。
+      const wsPhase = fs.wsState === 'reconnecting' ? '正在重连'
+        : fs.wsState === 'connecting' ? '连接中'
+          : fs.wsState === 'connected' || fs.bot.connected ? '长连接已建立'
+            : '长连接未建立'
+      const wsOk = wsPhase === '长连接已建立'
+      card.append(el('div', { class: 'small ' + (wsOk ? 'ok-text' : 'warn-text') }, text('● ' + wsPhase)))
     }
     fSection.append(card)
     if (invalid) {
@@ -371,15 +382,33 @@ function renderSettings(view) {
         : fs.credentialReason === 'credentials-malformed' ? '凭据记录格式无效，请检查现有 Bot 的引用和绑定。' : '凭据失效，请检查现有 Bot 的凭据记录。'
       fSection.append(el('p', { class: 'warn-text small' }, text(hint)))
     }
-    if (fs.registration === 'pending') fSection.append(el('p', { role: 'status', class: 'small' }, text('绑定请求已受理，等待授权和凭据保存。')))
-    if (fs.registration === 'failed') fSection.append(el('p', { role: 'alert', class: 'warn-text small' }, text('绑定失败 · ' + fs.registrationError)))
+    const pending = fs.registration === 'pending'
+    const expired = fs.registration === 'expired'
+    const qrExpiry = fs.qr?.expireIn ? '二维码有效期 ' + Math.round(fs.qr.expireIn / 60) + ' 分钟，过期需重新生成。' : ''
+    // 已绑定时这两句都要说清「绑定未变更、现有 Bot 照常工作」，不能让更换流程看起来像现有 Bot 出了问题。
+    if (pending) fSection.append(el('p', { role: 'status', class: 'small' }, text(bound
+      ? '正在更换绑定：等待扫码授权，现有 Bot 继续工作、绑定未变更。' + qrExpiry
+      : '绑定请求已受理，等待授权和凭据保存。' + qrExpiry)))
+    if (expired) fSection.append(el('p', { role: 'status', class: 'warn-text small' }, text(bound
+      ? '这次更换的二维码已过期，绑定未变更；现有 Bot 照常工作，无需更换。'
+      : '二维码已过期，绑定未完成——现有绑定（如有）不受影响，需重新生成二维码。')))
+    if (fs.registration === 'failed') {
+      const detail = fs.registrationError ?? '未知原因'
+      const message = bound ? '更换绑定失败：' + detail + '。现有 Bot 可继续使用。' : '绑定失败：' + detail
+      fSection.append(el('p', { role: 'alert', class: 'warn-text small' }, text(message)))
+    }
+    // 事件订阅模式（status.eventMode）：manual=需在开发者后台手工设置一次才提示；configured 已自动设好，保持安静。
+    if (fs.eventMode === 'manual') {
+      fSection.append(el('p', { class: 'hint' }, text('长连接事件订阅需手工设置一次：open.feishu.cn/app → 应用 → 事件与回调 → 订阅方式 → 使用长连接接收事件/回调。')))
+    }
     // 权限申明（明文）：绑定前告知将申请什么，绑定后展示已授权什么
     const permTitle = bound ? '已申明权限' : '将申明的权限（扫码时一次确认）'
     const permList = el('ul', { class: 'perm-list' })
     for (const p of fs.permissions ?? []) permList.append(el('li', {}, el('code', {}, text(p.key)), text(' — ' + p.label)))
     fSection.append(el('p', { class: 'small' }, text(permTitle)), permList)
-    // 二维码只在未绑定且注册流 pending 时出现
-    if (!bound && fs.qr && fs.qr.url) {
+    // 二维码只在注册流 pending、且当前状态确实返回了二维码时出现——
+    // 过期的二维码不再展示（expired 只给提示与重新生成入口），保存的绑定与实时二维码始终分开。
+    if (pending && fs.qr && fs.qr.url) {
       const qrBox = el('div', { class: 'qr-box' })
       try {
         const qr = qrcode(0, 'M'); qr.addData(fs.qr.url); qr.make()
@@ -391,8 +420,14 @@ function renderSettings(view) {
       fSection.append(el('p', { class: 'hint' }, text('用手机飞书 App「扫一扫」扫上方二维码（桌面浏览器打开授权页无效）。用户码 ' + String(fs.qr.url).match(/user_code=([^&]+)/)?.[1] + '，有效期 ' + Math.round((fs.qr.expireIn ?? 3600) / 60) + ' 分钟。')))
       fSection.append(el('p', {}, el('a', { href: fs.qr.url, target: '_blank' }, text('（手机上点我直接打开）'))))
     }
-    // 操作按钮：未绑定=开始扫码绑定；已绑定=重新注册（覆盖凭据，需确认）
-    const scanBtn = el('button', { class: 'btn' }, text(bound ? '重新注册（覆盖现有凭据）' : (fs.registration === 'pending' ? '重新生成二维码' : '开始扫码绑定')))
+    // 操作按钮：未绑定=开始扫码绑定；过期=重新生成二维码（显式重试）；等待中禁用避免重复发起；
+    // 已绑定=重新注册（覆盖凭据，需确认）——不暗示现有 Bot 需要更换，也绝不自动开始扫码。
+    const scanLabel = pending ? '等待扫码授权…'
+      : expired ? '重新生成二维码'
+        : bound ? '重新注册（覆盖现有凭据）'
+          : '开始扫码绑定'
+    const scanBtn = el('button', { class: 'btn' }, text(scanLabel))
+    scanBtn.disabled = pending
     scanBtn.addEventListener('click', async () => {
       if (bound && !confirm('重新注册会创建新应用并覆盖现有凭据，当前绑定即失效。继续？')) return
       scanBtn.disabled = true

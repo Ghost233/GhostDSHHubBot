@@ -168,7 +168,12 @@ test('GitHub 自动入口同护: 含 sudo 的 mention 评论 → 票转 person/c
   } finally { f.cleanup() }
 })
 
-/** owner-tools harness: register the plugin against a fake ctx and invoke inject_session directly. */
+/**
+ * owner-tools harness: register the plugin against a fake ctx and invoke inject_session directly.
+ * 身份 = Session id (dsh-agent 保持 agent.id === session.id): the owner row must carry a CURRENT binding, and the
+ * agent context must report that exact id — otherwise the hardened callerOwner refuses before the security policy
+ * under test is ever reached.
+ */
 async function ownerToolsHarness(f) {
   const tools = new Map()
   const prompts = []
@@ -182,6 +187,7 @@ async function ownerToolsHarness(f) {
     systemPrompt: { section() {} },
     tools: { register: def => tools.set(def.name, def) },
     workingDirectory: { ensure: async () => f.owner.cwd },
+    sessionPersistence: { stat: async () => undefined },
     sessionController: {
       list: async () => ({ items: [{ sessionId: 'session-w1', cwd: join(f.owner.cwd, 'worker') }] }),
       prompt: async request => { prompts.push(request); return { accepted: true } },
@@ -191,7 +197,9 @@ async function ownerToolsHarness(f) {
     },
   }
   ownerTools.apply(ctx)
-  return { tools, prompts, exec: { agent: {}, signal: AbortSignal.timeout(5000) } }
+  const binding = f.registry.get(f.owner.id)
+  const id = binding.sessionId ?? f.registry.bindSession(f.owner.id, 'session-o1').sessionId
+  return { tools, prompts, exec: { agent: { id }, signal: AbortSignal.timeout(5000) } }
 }
 
 test('inject_session 命中黑名单 (带 ticketId): 抛错不注入, 票转 person/confirm, 用户确认后注入执行', async () => {

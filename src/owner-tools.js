@@ -6,10 +6,13 @@
  * create_session / fork_session / report / escalate. fork_session only PROPOSES the fork — the ticket goes
  * person/confirm and the actual fork runs code-driven on the user's confirm (src/fork.js, #69).
  * Two disciplines are enforced in code, not left to the prompt:
- *   - identity: the calling session's cwd (workingDirectory service over exec.agent) must match a registered
- *     owner's cwd — owner tools refuse to run anywhere else;
+ *   - identity: the calling agent's Session id (exec.agent.id — dsh-agent keeps agent.id === session.id) must be the
+ *     CURRENT binding of a registered L2 owner row, and that row's cwd must equal the session's cwd — a worker, a
+ *     rebuilt-away orphan, or another owner's Session cannot act as an owner (issue #34);
  *   - 越界拒执: create_session/inject_session/read_session targets must live inside the owner's cwd subtree;
  *     anything outside is refused with a pointer at escalate().
+ *   - L3 目标: a Session that IS an owner instance (current binding, displaced history, or a recycled owner's) is
+ *     never a valid execution target — read_session/inject_session/fork_session refuse it by name.
  *
  * Worker sessions are created WITHOUT agentPreset, so they run the deployment's default preset — the user's
  * own configuration, never rewritten by the plugin (spec #65).
@@ -26,7 +29,7 @@ import { DANGEROUS_INJECT_ACTION, DEFAULT_DANGEROUS_PATTERNS, findDangerousPatte
 
 export const name = 'hub-bot-owner-tools'
 // See router-tools.js: sessionController/sessionPersistence are load-bearing for cross-realm service
-// resolution. workingDirectory is the identity channel (session cwd ↔ owner registry row).
+// resolution. workingDirectory is the cwd half of the identity check (the Session id half comes from exec.agent).
 export const inject = ['tools', 'systemPrompt', 'sessionController', 'sessionPersistence', 'workingDirectory']
 
 /** The installed hub, or a model-readable failure when the root plugin is absent from the composition. */
@@ -41,33 +44,60 @@ function norm(cwd) {
 }
 
 /**
- * Resolves the calling owner from the tool-execution's agent: the session cwd must equal a registered owner's
- * cwd. Tools act on behalf of that owner and only inside its subtree.
+ * Resolves the calling owner from the tool-execution's agent. Identity is the Session id — dsh-agent keeps
+ * agent.id === session.id — and that id must be the CURRENT binding of a registered L2 owner row. The cwd is a
+ * second, non-authoritative guard (a row whose directory moved is a refusal, not a new identity).
+ *
+ * Why not cwd alone: a rebuild leaves the old owner Session alive in the same directory, and worker Sessions live in
+ * that directory too — a cwd match cannot tell them apart (issue #34). A worker Session, a binding displaced by a
+ * rebuild, or another owner's Session is refused with a message naming the Session.
  */
 async function callerOwner(ctx, api, exec) {
   if (!exec?.agent) throw new Error('hub-bot owner tools: no agent context — refusing to act')
+  const sessionId = typeof exec.agent.id === 'string' ? exec.agent.id : ''
+  if (!sessionId) {
+    throw new Error('hub-bot owner tools: the agent context carries no Session id — refusing to act (only a bound owner Session may use these tools)')
+  }
+  const owner = api.registry.findByCurrentSession(sessionId)
+  if (!owner || owner.role !== 'owner') {
+    throw new Error('hub-bot owner tools: session ' + sessionId + ' is not the current binding of a registered owner — worker Sessions, displaced/历史 bindings and other owners\' Sessions must not use these tools; refusing to act')
+  }
   const cwd = norm(await ctx.workingDirectory.ensure(exec.agent, exec.signal))
-  const owner = api.registry.list().find(o => o.role === 'owner' && norm(o.cwd) === cwd)
-  if (!owner) {
-    throw new Error('hub-bot owner tools: session cwd ' + cwd + ' is not a registered owner root — refusing to act')
+  if (norm(owner.cwd) !== cwd) {
+    throw new Error('hub-bot owner tools: session ' + sessionId + ' is bound to owner ' + owner.id + ' (cwd ' + owner.cwd + ') but reports cwd ' + cwd + ' — refusing to act')
   }
   return owner
 }
 
-/** The session's recorded cwd, looked up in the controller inventory; undefined when unknown. */
-async function sessionCwd(ctx, sessionId, signal) {
-  const listed = await ctx.sessionController.list({}, signal)
-  const item = (listed.items ?? []).find(s => s.sessionId === sessionId)
-  return item?.cwd === undefined ? undefined : norm(item.cwd)
+function requireCurrentBinding(api, owner) {
+  if (api.registry.findByCurrentSession(owner.sessionId)?.id !== owner.id) throw new Error('the calling session is no longer the current owner binding')
 }
 
-/** Guard: refuse targets outside the owner's responsibility subtree (越界拒执 — escalate instead). */
-async function mustBeInside(ctx, owner, sessionId, signal) {
-  const cwd = await sessionCwd(ctx, sessionId, signal)
-  if (cwd === undefined) throw new Error('unknown session "' + sessionId + '" in the controller inventory')
+const OWNER_PRESETS = new Set(['hub-bot-owner', 'hub-bot-router'])
+
+/** Current bindings, remembered bindings, and v1 owner sessions recorded only by DSH. */
+async function isOwnerSession(ctx, api, item, signal) {
+  const { sessionId } = item
+  if (api.registry.isOwnerSession(sessionId) || OWNER_PRESETS.has(item.projections?.values?.agentPreset)) return true
+  const stored = await ctx.sessionPersistence.stat(sessionId, { signal })
+  return api.registry.isOwnerSession(sessionId) || OWNER_PRESETS.has(stored?.header?.agentPreset)
+}
+
+function refuseOwnerTarget(sessionId, tool) {
+  throw new Error(tool + ': session ' + sessionId + ' is an owner session (负责人实例)')
+}
+
+async function workerCwd(ctx, api, owner, sessionId, tool, signal) {
+  if (api.registry.isOwnerSession(sessionId)) refuseOwnerTarget(sessionId, tool)
+  const listed = await ctx.sessionController.list({}, signal)
+  const item = (listed.items ?? []).find(session => session.sessionId === sessionId)
+  if (item?.cwd === undefined) throw new Error('unknown session "' + sessionId + '" in the controller inventory')
+  const cwd = norm(item.cwd)
   if (!isWithinCwd(norm(owner.cwd), cwd)) {
-    throw new Error('session ' + sessionId + ' (cwd ' + cwd + ') is outside this owner\'s subtree ' + owner.cwd + ' — do NOT act across repos; call escalate with the reason instead')
+    throw new Error('session ' + sessionId + ' (cwd ' + cwd + ') is outside this owner’s subtree ' + owner.cwd)
   }
+  if (await isOwnerSession(ctx, api, item, signal)) refuseOwnerTarget(sessionId, tool)
+  requireCurrentBinding(api, owner)
   return cwd
 }
 
@@ -83,7 +113,12 @@ function unwrapTaskError(error) {
   return translateTaskError(error, (code, message) => new Error(code + ': ' + message))
 }
 
-/** Compacts one transcript page into model-readable lines: role | text, tool calls by name. */
+/**
+ * Compacts one transcript page into model-readable lines: role | text, tool calls by name. Each line carries the
+ * REAL event seq of the record it came from (prefixed `#<seq>`) when the page provides one — that number is the
+ * inclusive fork boundary the model can pass as `atSeq`, so it must come from the event, never from a line index
+ * (issue #34). Records without a seq are shown without one rather than with an invented number.
+ */
 function compactTranscript(page, max) {
   const out = []
   for (const record of page?.records ?? []) {
@@ -91,14 +126,26 @@ function compactTranscript(page, max) {
     const type = event?.type
     const message = event?.data?.message
     if (!type || !message) continue
+    const seq = Number.isSafeInteger(event.seq) && event.seq >= 0 ? event.seq : undefined
+    const prefix = seq === undefined ? '' : '#' + seq + ' '
     if (type === 'user/message' || type === 'assistant/message' || type === 'system/message') {
       for (const part of message.content ?? []) {
-        if (part?.type === 'text' && part.text) out.push(message.role + ': ' + part.text.slice(0, 400))
-        if (part.type === 'tool-call') out.push(message.role + ' [tool] ' + (part.name ?? '?') + ' ' + JSON.stringify(part.arguments ?? {}).slice(0, 160))
+        if (part?.type === 'text' && part.text) out.push(prefix + message.role + ': ' + part.text.slice(0, 400))
+        if (part.type === 'tool-call') out.push(prefix + message.role + ' [tool] ' + (part.name ?? '?') + ' ' + JSON.stringify(part.arguments ?? {}).slice(0, 160))
       }
     }
   }
   return out.slice(-max)
+}
+
+/** The real event seqs of one page, oldest first — the fork boundaries the model may choose from. */
+function transcriptSeqs(page) {
+  const out = new Set()
+  for (const record of page?.records ?? []) {
+    const seq = (record.event ?? record)?.seq
+    if (Number.isSafeInteger(seq) && seq >= 0) out.add(seq)
+  }
+  return [...out].sort((a, b) => a - b)
 }
 
 export function apply(ctx) {
@@ -126,52 +173,69 @@ export function apply(ctx) {
       const owner = await callerOwner(ctx, api, exec)
       const signal = exec?.signal ?? AbortSignal.timeout(30000)
       const limit = args.limit ?? 20
-      if (args.query) {
-        const found = await ctx.sessionController.search({ query: args.query }, signal)
-        const items = []
-        for (const hit of found.items ?? []) {
-          const cwd = await sessionCwd(ctx, hit.sessionId, signal)
-          if (cwd !== undefined && isWithinCwd(norm(owner.cwd), cwd)) items.push({ sessionId: hit.sessionId, cwd, snippet: hit.snippet })
-          if (items.length >= limit) break
-        }
-        return { sessions: items }
-      }
       const listed = await ctx.sessionController.list({}, signal)
-      // Tag registry-bound owner sessions so the L2 does not mistake another L2 (preset-only delegates) for a
-      // worker session. Note: a session ORPHANED by an owner rebuild keeps its owner preset but leaves the
-      // registry, so it cannot be tagged — that residual is documented in the README.
-      const ownerSessionIds = new Set(api.registry.list().map(o => o.sessionId).filter(Boolean))
-      const sessions = (listed.items ?? [])
-        .filter(s => s.cwd !== undefined && isWithinCwd(norm(owner.cwd), norm(s.cwd)))
-        .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
-        .slice(0, limit)
-        .map(s => ({ sessionId: s.sessionId, cwd: norm(s.cwd), running: Boolean(s.running), role: ownerSessionIds.has(s.sessionId) ? 'owner' : 'session' }))
+      const visible = (listed.items ?? []).filter(item => item.cwd !== undefined && isWithinCwd(norm(owner.cwd), norm(item.cwd)))
+      const matching = args.query ? await ctx.sessionController.search({ query: args.query }, signal) : null
+      const byId = new Map(visible.map(item => [item.sessionId, item]))
+      const hits = matching ? (matching.items ?? []).flatMap(hit => {
+        const item = byId.get(hit.sessionId)
+        return item ? [{ item, snippet: hit.snippet }] : []
+      }) : visible.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)).map(item => ({ item }))
+      const sessions = []
+      for (const { item, snippet } of hits.slice(0, limit)) {
+        const role = await isOwnerSession(ctx, api, item, signal) ? 'owner' : 'session'
+        sessions.push({ sessionId: item.sessionId, cwd: norm(item.cwd), running: Boolean(item.running), role, ...(snippet !== undefined && { snippet }) })
+      }
+      requireCurrentBinding(api, owner)
       return { sessions }
     },
   })
 
   ctx.tools.register({
     name: 'read_session',
-    description: '读取一个会话的近期记录（压缩成 role: 文本 行），用于观察执行会话的进展与结果。',
+    description: '读取执行会话的历史记录和真实事件序号。可用 beforeSeq 翻看更早记录，fork_session 只接受目标会话中存在的切点。',
     parameters: {
       type: 'object',
       properties: {
-        sessionId: { type: 'string', description: '目标会话 id（必须在责任边界内）' },
-        maxMessages: { type: 'number', description: '可选：最多回多少行压缩记录，缺省 30' },
+        sessionId: { type: 'string', description: '目标会话 id（必须在责任边界内，且不是负责人会话）' },
+        maxMessages: { type: 'integer', minimum: 1, maximum: 200, description: '可选：单页最多读取的消息数，缺省 30' },
+        beforeSeq: { type: 'integer', minimum: 0, description: '可选：从此事件之前读取更早的一页，使用前页最小的事件序号' },
       },
       required: ['sessionId'],
       additionalProperties: false,
     },
     output: {
-      schema: { type: 'object', properties: { lines: { type: 'array' } }, required: ['lines'], additionalProperties: false },
-      render: (_args, value) => [{ type: 'text', text: value.lines.length === 0 ? '（无记录）' : value.lines.join('\n') }],
+      schema: {
+        type: 'object',
+        properties: {
+          lines: { type: 'array', items: { type: 'string' } },
+          seqs: { type: 'array', items: { type: 'number' } },
+          hasMore: { type: 'boolean' },
+        },
+        required: ['lines', 'seqs', 'hasMore'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => [{ type: 'text', text: (value.seqs.length === 0
+        ? '（本页没有可核验的事件序号，fork_session 请省略 atSeq 走最近完成回合边界）'
+        : '（本页真实事件序号：' + value.seqs.join(', ') + ' —— 可作为 fork_session 的 atSeq 切点，含边界）')
+        + (value.hasMore && value.seqs.length ? '\n较早记录可用 beforeSeq=' + value.seqs[0] + ' 读取。' : '')
+        + '\n' + (value.lines.length === 0 ? '（无记录）' : value.lines.join('\n')) }],
     },
     execute: async (args, exec) => {
       const owner = await callerOwner(ctx, api, exec)
       const signal = exec?.signal ?? AbortSignal.timeout(30000)
-      await mustBeInside(ctx, owner, args.sessionId, signal)
-      const page = await ctx.sessionController.page({ address: { kind: 'session', sessionId: args.sessionId }, maxMessages: 200 }, signal)
-      return { lines: compactTranscript(page, args.maxMessages ?? 30) }
+      await workerCwd(ctx, api, owner, args.sessionId, 'read_session', signal)
+      const maxMessages = args.maxMessages ?? 30
+      if (!Number.isSafeInteger(maxMessages) || maxMessages < 1 || maxMessages > 200) {
+        throw new Error('read_session: maxMessages must be an integer from 1 to 200')
+      }
+      const { beforeSeq } = args
+      const page = await ctx.sessionController.page({
+        address: { kind: 'session', sessionId: args.sessionId }, maxMessages,
+        ...(beforeSeq !== undefined && { beforeSeq }),
+      }, signal)
+      requireCurrentBinding(api, owner)
+      return { lines: compactTranscript(page, maxMessages), seqs: transcriptSeqs(page), hasMore: page.hasMore === true }
     },
   })
 
@@ -196,11 +260,14 @@ export function apply(ctx) {
       if (!isWithinCwd(norm(owner.cwd), cwd)) {
         throw new Error('create_session: cwd ' + cwd + ' is outside this owner\'s subtree ' + owner.cwd + ' — do NOT act across repos; call escalate with the reason instead')
       }
-      // Deliberately no agentPreset: worker Sessions run the deployment default — the user's own preset.
+      requireCurrentBinding(api, owner)
+      if (args.ticketId !== undefined) mustOwnTicket(api, owner, args.ticketId)
+      // Worker sessions use the deployment's default preset.
       const created = await ctx.sessionController.create({ cwd })
       const sessionId = created.sessionId ?? created.session?.id
       if (!sessionId) throw new Error('create_session: the controller returned no sessionId')
       if (args.ticketId !== undefined) {
+        requireCurrentBinding(api, owner)
         mustOwnTicket(api, owner, args.ticketId)
         api.tasks.bindWorkerSession(args.ticketId, { sessionId, cwd })
       }
@@ -214,7 +281,7 @@ export function apply(ctx) {
     parameters: {
       type: 'object',
       properties: {
-        sessionId: { type: 'string', description: '目标会话 id（必须在责任边界内）' },
+        sessionId: { type: 'string', description: '目标会话 id（必须在责任边界内，且为执行会话）' },
         text: { type: 'string', description: '注入正文' },
         ticketId: { type: 'string', description: '可选：关联任务票，注入文本携带其授权记录' },
         requestId: { type: 'string', description: '可选：幂等键，缺省自动生成' },
@@ -230,7 +297,7 @@ export function apply(ctx) {
       if (typeof args.text !== 'string' || !args.text.trim()) throw new Error('inject_session: text must be a non-empty string')
       const owner = await callerOwner(ctx, api, exec)
       const signal = exec?.signal ?? AbortSignal.timeout(60000)
-      await mustBeInside(ctx, owner, args.sessionId, signal)
+      await workerCwd(ctx, api, owner, args.sessionId, 'inject_session', signal)
       let text
       if (args.ticketId !== undefined) {
         const ticket = mustOwnTicket(api, owner, args.ticketId)
@@ -322,10 +389,10 @@ export function apply(ctx) {
     parameters: {
       type: 'object',
       properties: {
-        sessionId: { type: 'string', description: '要 fork 的执行会话 id（必须在责任边界内）' },
+        sessionId: { type: 'string', description: '要 fork 的执行会话 id（必须在责任边界内，且不是负责人会话）' },
         ticketId: { type: 'string', description: '续作的任务票 id' },
         reason: { type: 'string', description: 'fork 原因与预期结果（一两句，将原样呈给用户）' },
-        atSeq: { type: 'number', description: '可选：从该事件序号（含）处切 fork（丢掉污染的尾巴）；缺省取最近完成回合边界' },
+        atSeq: { type: 'number', description: '可选：从该事件序号（含）处切 fork（丢掉污染的尾巴）；序号用 read_session 返回的 seqs（真实事件序号），不要自己猜；缺省取最近完成回合边界' },
       },
       required: ['sessionId', 'ticketId', 'reason'],
       additionalProperties: false,
@@ -337,10 +404,20 @@ export function apply(ctx) {
     execute: async (args, exec) => {
       const owner = await callerOwner(ctx, api, exec)
       const signal = exec?.signal ?? AbortSignal.timeout(30000)
-      const cwd = await mustBeInside(ctx, owner, args.sessionId, signal)
+      const cwd = await workerCwd(ctx, api, owner, args.sessionId, 'fork_session', signal)
       mustOwnTicket(api, owner, args.ticketId)
       try {
         const action = buildForkAction({ sessionId: args.sessionId, cwd, atSeq: args.atSeq, reason: args.reason })
+        if (action.atSeq !== undefined) {
+          const page = await ctx.sessionController.page({
+            address: { kind: 'session', sessionId: action.sessionId }, throughSeq: action.atSeq, maxMessages: 1,
+          }, signal)
+          if (!transcriptSeqs(page).includes(action.atSeq)) {
+            throw new TaskError('fork-atseq-not-found', 'the requested event is not present in the target session')
+          }
+          requireCurrentBinding(api, owner)
+          mustOwnTicket(api, owner, args.ticketId)
+        }
         const ticket = api.tasks.askConfirm({ ticketId: args.ticketId, question: forkConfirmText(action, args.ticketId), action })
         // 需要行动 = 汇报事实： the confirm request joins this wake's digest and reaches the user via the chief.
         recordReportFact(api.store, owner.id, ticket)

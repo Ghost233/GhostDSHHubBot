@@ -705,3 +705,74 @@ test('S06 单一入口: a non-text message still records the 暂不支持 reply 
     assert.equal(replies().length, 1, 'a replay must not duplicate the recorded reply intent')
   } finally { f.cleanup() }
 })
+
+test('expired Feishu attempts release the scan and ignore their stale grant during retry', { timeout: 3000 }, async () => {
+  const original = { kind: 'grant', payload: { appId: 'fixture-old-bot', appSecret: 'older-fixture-secret' } }
+  const credentials = fakeCredentialsPort({ record: original })
+  const entered = [Promise.withResolvers(), Promise.withResolvers()]
+  const grants = [Promise.withResolvers(), Promise.withResolvers()]
+  let attempt = 0
+  const f = fixture({ credentials, larkOverrides: {
+    registerApp: async options => {
+      const index = attempt++
+      options.onQRCodeReady({ url: 'https://example.invalid/scan-' + index, expireIn: 2 })
+      entered[index].resolve(options)
+      return grants[index].promise
+    },
+    client: { request: async () => ({ code: 99991672 }) },
+    WSClient: class {
+      constructor(options) { this.options = options }
+      async start() { this.options.onReady() }
+      close() {}
+    },
+    EventDispatcher: class { register() { return this } },
+  } })
+  try {
+    await f.source.connect()
+    const first = f.source.register()
+    const firstOptions = await entered[0].promise
+    assert.equal(f.source.status().registration, 'pending')
+    assert.ok(f.source.status().qr)
+    f.advance(2100)
+    const expired = f.source.status()
+    assert.equal(expired.registration, 'expired')
+    assert.equal(expired.qr, undefined)
+    assert.equal(expired.bot.connected, true)
+    assert.equal(firstOptions.signal.aborted, true)
+    const retry = f.source.register()
+    await entered[1].promise
+    firstOptions.onQRCodeReady({ url: 'https://example.invalid/stale', expireIn: 60 })
+    grants[0].resolve({ client_id: 'fixture-stale', client_secret: 'stale-fixture-secret' })
+    assert.deepEqual(await first, { expired: true })
+    assert.equal(f.source.status().qr.url, 'https://example.invalid/scan-1')
+    assert.deepEqual(credentials.records.get(DEFAULT_FEISHU_CREDENTIAL_REF), original)
+    grants[1].resolve({ client_id: 'fixture-new-bot', client_secret: 'newer-fixture-secret' })
+    assert.deepEqual(await retry, { appId: 'fixture-new-bot' })
+    assert.equal(f.source.status().eventMode, 'manual')
+    assert.equal(f.source.status().wsState, 'connected')
+    assert.equal(f.source.status().qr, undefined)
+  } finally {
+    for (const grant of grants) grant.resolve({ client_id: 'cleanup', client_secret: 'cleanup' })
+    f.source.disconnect()
+    f.cleanup()
+  }
+})
+
+test('a saved registration and a failed long connection are distinct outcomes', async () => {
+  const f = fixture({ larkOverrides: {
+    WSClient: class {
+      async start() { throw new Error('fixture connection unavailable') }
+      close() {}
+    },
+    EventDispatcher: class { register() { return this } },
+  } })
+  try {
+    assert.deepEqual(await f.source.register(), { appId: 'cli_new' })
+    const status = f.source.status()
+    assert.equal(status.credentialState, 'ok')
+    assert.equal(status.eventMode, 'configured')
+    assert.equal(status.wsState, 'failed')
+    assert.equal(status.registrationError, undefined)
+    assert.equal(status.bot.connected, false)
+  } finally { f.source.disconnect(); f.cleanup() }
+})
