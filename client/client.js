@@ -311,10 +311,21 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       feishuCredentialsUnavailable: '宿主凭据服务不可用。请检查 DSH 的凭据服务和存储状态。',
       feishuCredentialsMalformed: '凭据记录格式无效。请检查现有 Bot 的引用和绑定。',
       feishuBindStart: '开始扫码绑定',
+      feishuReplaceBound: '更换绑定的 Bot',
+      feishuReplacingBound: '正在更换绑定：等待扫码授权，现有 Bot 继续工作、绑定未变更。',
+      feishuReplaceConfirm: '更换会创建新应用并覆盖现有凭据，当前绑定随即失效。现有 Bot 本身无需更换——确定继续？',
       feishuBinding: '正在等待二维码…',
       feishuScanHint: '用飞书手机 App 扫码完成授权；二维码有时效，过期请重新发起。',
       feishuPermsTitle: '权限申明（授权时将申请）',
       feishuBindFailed: '绑定失败',
+      feishuRegistrationExpired: '二维码已过期',
+      feishuRegistrationExpiredHint: '二维码已过期，绑定未完成——现有绑定（如有）不受影响，可重新生成二维码。',
+      feishuRegistrationExpiredBound: '这次重新扫码的二维码已过期，绑定未变更；现有 Bot 照常工作，无需更换。',
+      feishuRetryRegister: '重新生成二维码',
+      feishuReplaceFailedBound: '这次更换绑定失败（绑定未变更，现有 Bot 照常工作）',
+      feishuQrExpiry: '二维码有效期约 {n} 分钟，过期需重新生成。',
+      feishuEventModeManual: '长连接事件订阅需手工设置一次：open.feishu.cn/app → 应用 → 事件与回调 → 订阅方式 → 使用长连接接收事件/回调。',
+      healthFeishuRegistration: '飞书绑定未完成（二维码已过期）',
       feishuDisabled: '飞书入口已暂停。',
       feishuEnableSwitch: '启用飞书入口',
       feishuPausedBound: '飞书入口已暂停，现有绑定已保留。',
@@ -644,10 +655,21 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       feishuCredentialsUnavailable: 'The host credential service is unavailable. Check the DSH credential service and store.',
       feishuCredentialsMalformed: 'The credential record is malformed. Check the existing bot’s binding and reference.',
       feishuBindStart: 'Start scan-to-bind',
+      feishuReplaceBound: 'Replace the bound bot',
+      feishuReplacingBound: 'Replacing the binding: waiting for scan authorization. The existing bot keeps working and the binding is unchanged.',
+      feishuReplaceConfirm: 'Replacing creates a new app and overwrites the saved credentials, so the current binding stops working. The existing bot does not need replacing — continue?',
       feishuBinding: 'Waiting for the QR code…',
       feishuScanHint: 'Scan with the Feishu mobile app to authorize; the QR code expires — restart if it does.',
       feishuPermsTitle: 'Permissions (requested at authorization)',
       feishuBindFailed: 'Binding failed',
+      feishuRegistrationExpired: 'QR code expired',
+      feishuRegistrationExpiredHint: 'The QR code expired before binding finished. Any existing binding is untouched — generate a new QR code to retry.',
+      feishuRegistrationExpiredBound: 'The replacement QR code expired, so the binding did not change. The existing bot keeps working and needs no replacement.',
+      feishuRetryRegister: 'Generate a new QR code',
+      feishuReplaceFailedBound: 'This replacement failed (binding unchanged; the existing bot keeps working)',
+      feishuQrExpiry: 'The QR code is valid for about {n} minutes; regenerate it after it expires.',
+      feishuEventModeManual: 'Long-connection event subscription needs a one-time manual setup: open.feishu.cn/app → app → Events & Callbacks → subscription mode → receive events/callbacks over a long connection.',
+      healthFeishuRegistration: 'Feishu binding unfinished (QR code expired)',
       feishuDisabled: 'Feishu is paused.',
       feishuEnableSwitch: 'Enable Feishu',
       feishuPausedBound: 'Feishu is paused. The existing bot binding is saved.',
@@ -1119,7 +1141,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
         function feishuPresentation(enabled, status) {
           if (!enabled) return { label: 'disabled', stage: 'idle' };
           if (status.registration === 'pending') return { label: 'feishuBindingStatus', stage: 'working' };
-          if (status.registration === 'failed') return { label: 'feishuBindFailed', stage: 'failed' };
+          // 绑定流失败/二维码过期都只说明这次「扫码绑定」没走完。
+          // 已有可用凭据时（credentialState === 'ok'）现有 Bot 照常工作——继续按连接状态如实呈现，
+          // 不把「重扫没走完」说成现有 Bot 故障；未绑上时才是需要用户处理的待办。
+          if (status.registration === 'failed' && status.credentialState !== 'ok') return { label: 'feishuBindFailed', stage: 'failed' };
+          if (status.registration === 'expired' && status.credentialState !== 'ok') return { label: 'feishuRegistrationExpired', stage: 'failed' };
           if (status.credentialState === 'invalid') return { label: 'feishuCredentialsInvalid', stage: 'failed' };
           if (status.credentialState !== 'ok') return { label: 'feishuWaitingBind', stage: 'queued' };
           if (status.wsState === 'reconnecting') return { label: 'feishuReconnecting', stage: 'working' };
@@ -1138,6 +1164,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var connection = feishuPresentation(feishu.enabled, feishu);
           if (connection.label === 'feishuCredentialsInvalid') items.push(t('healthFeishuCred'));
           if (connection.label === 'feishuBindFailed') items.push(t(connection.label));
+          // 过期只在「没绑上」时出现（feishuPresentation 已排除已绑定场景），此时确属需要用户处理的待办。
+          if (connection.label === 'feishuRegistrationExpired') items.push(t('healthFeishuRegistration'));
           if (connection.label === 'feishuWsDown') items.push(t('healthFeishuWs'));
           var gh = health.github || {};
           var problems = gh.enabled ? githubProblemCount(gh) : 0;
@@ -1156,6 +1184,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var enabled = fs.enabled ?? !!view.feishu?.enabled;
           var bound = fs.credentialState === 'ok' && !!fs.bot;
           var pending = enabled && fs.registration === 'pending';
+          // 二维码过期：绑定没走完。已保存的绑定不受影响，只给提示 + 显式重新生成入口，不自动重开扫码。
+          var expired = enabled && fs.registration === 'expired';
           var form = useSettingsForm(scoped, { enabled }, edits => ({ feishu: edits }), props.onSaved);
           var invalid = fs.credentialState === 'invalid' && !pending;
           var credentialHint = fs.credentialReason === 'credentials-unavailable' ? 'feishuCredentialsUnavailable'
@@ -1173,9 +1203,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             setBusy(true); setErr(null);
             scoped.remote.hubBotSettings.startFeishuRegister()
               .then(unwrap).then(onRefresh)
-              .catch(function (e) { setErr(t('feishuBindFailed') + ': ' + (e && e.message ? e.message : String(e))); })
+              .catch(function (e) { setErr(t(bound ? 'feishuReplaceFailedBound' : 'feishuBindFailed') + ': ' + (e && e.message ? e.message : String(e))); })
               .finally(function () { setBusy(false); });
           };
+          // 二维码只在 pending 且本次状态确实返回了二维码时才渲染（不拿旧缓存），已保存的绑定与实时二维码始终分开。
+          var qrReady = !!(pending && qr?.svg && qr.url === fs.qr?.url);
           var perms = fs.permissions || [];
           var rows = [h(SettingsForm, { key: 'settings', t: t, form: form, title: t('feishuSection'), headingId: 'hub-bot-feishu-title' },
             h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', fontWeight: 600, fontSize: '13px' } },
@@ -1201,26 +1233,45 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 h('span', { style: { fontWeight: 600 } }, t('feishuMetricsTitle')),
                 mtParts.map(function (part, i) { return h('span', { key: i }, part); })));
             }
+            // 已绑定不自动开扫、也不暗示需要换 Bot：更换是显式操作，先二次确认再走注册流。
+            // 已绑定时的重扫（pending/expired）只提示这次更换没走完，现有 Bot 照常工作。
+            if (pending) rows.push(h('p', { key: 'pnd', role: 'status', style: { fontSize: '12px', opacity: 0.75, margin: '6px 0 0' } }, t('feishuReplacingBound')));
+            else if (expired) rows.push(h('p', { key: 'expb', role: 'status', style: { fontSize: '12px', opacity: 0.75, margin: '6px 0 0' } }, t('feishuRegistrationExpiredBound')));
+            if (enabled) {
+              rows.push(h('button', { key: 'replace', onClick: function () {
+                if (!window.confirm(t('feishuReplaceConfirm'))) return;
+                start();
+              }, disabled: busy || pending,
+                style: Object.assign({}, inputStyle, { width: 'auto', cursor: 'pointer', padding: '6px 18px', marginTop: '10px', opacity: 0.85 }),
+              }, t('feishuReplaceBound')));
+            }
           } else if (enabled) {
             if (invalid) rows.push(h('p', { key: 'inv', style: { fontSize: '13px', color: TONES.red.fg, margin: '0 0 4px' } }, t(credentialHint)));
+            else if (expired) rows.push(h('p', { key: 'exp', role: 'status', style: { fontSize: '13px', color: TONES.amber.fg, margin: '0 0 4px' } }, t('feishuRegistrationExpiredHint')));
             else if (!pending) rows.push(h('div', { key: 'nb', style: { marginBottom: '4px' } },
               h('div', { style: { fontWeight: 600 } }, t('feishuNotBound')),
               h('p', { style: { fontSize: '12px', opacity: 0.75, margin: '4px 0' } }, t('feishuSetupHint'))));
             if (!pending) {
               rows.push(h('button', { key: 'start', onClick: start, disabled: busy,
                 style: Object.assign({}, inputStyle, { width: 'auto', cursor: 'pointer', padding: '6px 18px', marginTop: '6px' }),
-              }, busy ? t('feishuBinding') : t('feishuBindStart')));
+              }, busy ? t('feishuBinding') : t(expired ? 'feishuRetryRegister' : 'feishuBindStart')));
             }
           }
-          if (pending && qr?.svg && qr.url === fs.qr?.url) {
+          if (qrReady) {
             rows.push(h('div', { key: 'qr', style: { marginTop: '12px', display: 'flex', gap: '16px', alignItems: 'center', flexWrap: 'wrap' } },
               h('img', {
                 src: 'data:image/svg+xml;utf8,' + encodeURIComponent(qr.svg),
                 alt: 'feishu qr', style: { width: '168px', height: '168px', borderRadius: '8px', background: '#fff', padding: '6px' },
               }),
-              h('div', { style: { fontSize: '13px', opacity: 0.8, maxWidth: '320px' } }, t('feishuScanHint'))));
+              h('div', { style: { fontSize: '13px', opacity: 0.8, maxWidth: '320px' } },
+                t('feishuScanHint'),
+                fs.qr.expireIn ? h('div', { style: { marginTop: '4px', fontSize: '12px', opacity: 0.75 } }, fill(t('feishuQrExpiry'), Math.round(fs.qr.expireIn / 60))) : null)));
           } else if (pending) {
             rows.push(h('p', { key: 'wait', style: { fontSize: '13px', opacity: 0.7 } }, t('feishuBinding')));
+          }
+          // 事件订阅方式（status.eventMode）: 只有需要人工设置（manual）时才提示；已自动配置保持安静。
+          if (enabled && fs.eventMode === 'manual') {
+            rows.push(h('p', { key: 'evm', style: { fontSize: '12px', opacity: 0.75, margin: '8px 0 0' } }, t('feishuEventModeManual')));
           }
           if (enabled && perms.length) {
             rows.push(h('div', { key: 'perms', style: { marginTop: '12px' } },
@@ -1230,9 +1281,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               }))));
           }
           if (enabled && (err || fs.registrationError)) {
+            // 已绑定时的注册失败只是这次更换没成功，绑定没变——别让错误行看起来像现有 Bot 坏了。
+            var errText = err || ((bound ? t('feishuReplaceFailedBound') : t('feishuBindFailed')) + ' · ' + fs.registrationError);
             rows.push(h('div', { key: 'err', role: 'alert', style: { fontSize: '12px',
               color: 'var(--dsw-alias-state-error-primary)', marginTop: '6px', overflowWrap: 'anywhere' },
-            }, err || t('feishuBindFailed') + ' · ' + fs.registrationError));
+            }, errText));
           }
           return h('section', { id: 'hub-bot-feishu', style: sectionStyle, 'aria-labelledby': 'hub-bot-feishu-title' }, rows);
         }

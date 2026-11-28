@@ -96,11 +96,13 @@ patch 结构测试复用仓内先例 `scripts/test-runtime.mjs` 的解析链：`
 
 - **扫码绑定**：设备授权回调取得的应用绑定先写入 DSH 宿主凭据记录，成功后才建立长连接。面板通过飞书状态接口查看进度和二维码。权限包含发送消息、读取消息、读取会话基本信息和长连接事件订阅。
 - **沿用已有 Bot**：在当前 profile 所用的 DSH 凭据库中，将原应用的 `appId` 和 `appSecret` 存为 `hub-bot/feishu` 下的 `grant` 记录，两项均放在 `payload` 中，可选填 `boundAt`。如果使用其他记录名，将 `feishu.credentialRef` 设置为对应的 `hub-bot/<id>`。保存引用后重新加载插件。请从插件配置中移除旧的 `feishu.appId` 和 `feishu.appSecret`。原绑定来自 `stateDir/feishu-credentials.json` 时也使用相同的迁移步骤。安装版 DSH 默认将宿主凭据库放在对应 `DSH_HOME` 的 `.credentials.yaml`，权限需为 0600。
-- **长连接配置**：凭证落地后插件尝试 application-config patch 设长连接模式——**实测不可行**（2026-11-16：设备流权限包不含 `application:application:patch`，返回 404）；**正式路径是手工一次性配置**：open.feishu.cn/app → 应用 → 事件与回调 → 订阅方式 → 使用长连接接收事件/回调。失败只记日志不阻断。
+- **长连接配置**：凭证落地后插件尝试 application-config patch 设长连接模式——**实测不可行**（2026-11-16：设备流权限包不含 `application:application:patch`，返回 404）；**正式路径是手工一次性配置**：open.feishu.cn/app → 应用 → 事件与回调 → 订阅方式 → 使用长连接接收事件/回调。失败只记日志不阻断。状态接口用 `eventMode` 如实报告这一步：`configured` = 已由插件自动设为长连接（界面保持安静）；`manual` = 自动配置不可行，需用户按上面路径手工设置一次（面板与插件设置页在 `manual` 时给出这句引导）。
 - **来信关联**：`im.message.receive_v1` 写入 `feishu-<messageId>` 后交给 L1 总负责人。调用 `reply_source` 或新建任务时使用来信给出的 `triggerRef`，最近消息就能显示对应的回复状态或工单。相同 `triggerRef` 只派单一次。
 - **Policy 代码强制**：bot 自己的消息丢弃；**授权边界在飞书侧**——应用的可用范围与可见成员由飞书管理后台配置，能与 bot 说话即已授权，插件不做二次过滤（原 `openIdAllowlist` 已移除，残留该键的旧配置会被严格校验拒绝）；群聊只有 @bot 的消息成请求（botOpenId 缺省时任何 @ 宽松算）；非文本消息回「暂不支持该消息类型」。
 - **回复投递**：`reply_source` 带飞书 `triggerRef` 时从来信读取聊天地址，投递成功后显示「已回复」。连续失败五次后可从面板重投。历史记录只有聊天地址时显示「回复未关联」。
 - **凭据状态**：`credentialReason` 区分缺少记录、记录格式不正确和宿主凭据服务不可用。保存失败会显示错误，已有绑定保留最后一次确认的记录。旧明文插件配置在启动时被拒绝并给出迁移提示。
+- **绑定状态（`registration`）**：`pending` = 扫码绑定进行中，状态里带本次二维码（面板只在 `pending` 且本次状态确实返回了二维码时才渲染，过期后立即收起，不会拿旧二维码继续展示）；`expired` = 二维码过期、绑定没走完——不自动重开扫码，只给提示和「重新生成二维码」显式重试，已有绑定不受影响、已绑定的 Bot 照常工作，不会被说成需要更换；`failed` = 绑定失败并附 `registrationError`。字段缺省表示没有进行中的绑定流。已绑定时更换 Bot 是显式操作，二次确认后才重新走注册流；此时 `pending`/`expired`/`failed` 都只描述「这次更换」没走完，绑定与现有 Bot 均不变。
+- **验收边界**：设备流绑定固定 `createOnly`，只在飞书上创建新应用，不会修改、也不会验证已存在的旧 Bot；因此「对真实旧 Bot 走一遍创建设备流」这类验收在自动化里做不到，只能由人按上面「沿用已有 Bot」的迁移步骤在真实环境确认。
 - dev 实证探针：`POST /hub-bot/api/feishu/simulate` 注入 mock 事件走真实归一化/Policy/注入路径（无真实飞书时实证全链）。
 
 ## fork 路径与确认流程（#69）
