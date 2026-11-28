@@ -144,6 +144,15 @@ async function deliverRecordedRepliesPass({ store, logger, now, channel, prefix,
 
 export class OutboxRunner {
   /**
+   * S01 单飞账本： per-ticket key（`row.ticketId ?? ''`）标记「这张票当前有一轮 drain 在途」。
+   * 一行从 enqueue 到落 sent/recorded/failed 之间始终是 'queued'，而 1s 定时器并不 await 上一轮
+   * tick（先存后做 = 行先入库，送达后才改状态）—— 慢投递（真实 gh/feishu/会话 prompt）常常超过一秒，
+   * 没有这把锁，重叠的 tick 会把同一个 queued 行再投一次。进程内、不落盘：崩溃后下一轮 tick 照常重试
+   * 仍是 'queued' 的行，语义不变。按票隔离，票与票之间永不互相阻塞。
+   */
+  #activeDrains = new Set()
+
+  /**
    * @param {{ store: import('./store.js').Store,
    *           deliver: (row: object) => Promise<void>,
    *           now?: () => number,
@@ -189,7 +198,7 @@ export class OutboxRunner {
 
   /** All queued delivery rows, oldest first, grouped by ticket (null ticket groups under ''). */
   #pendingByTicket() {
-    const rows = this.store.db.prepare('SELECT value FROM outbox ORDER BY at').all()
+    const rows = this.store.db.prepare('SELECT value FROM outbox ORDER BY at, rowid').all()
       .map(raw => JSON.parse(String(raw.value)))
       .filter(row => row.state === 'queued')
     const groups = new Map()
@@ -201,14 +210,32 @@ export class OutboxRunner {
     return groups
   }
 
-  /** Delivers every due row, strictly ordered within each ticket. */
+  /**
+   * Delivers every due row, strictly ordered within each ticket.
+   *
+   * S01 可靠性（单飞 + 保序 + 幂等）：
+   * 1) 单飞 — 一张票同时只允许一轮 drain。行在送达前一直是 'queued'，而 1s 定时器不 await 上一轮 tick，
+   *    慢投递超过一秒就会让重叠的 tick 重入同一个 queued 行（重复送达）。本轮已持有该票的 key 时，
+   *    整票跳过（只跳过这一张票，别的票照常推进），由在途那一轮的 finally 释放。
+   * 2) 保序 — #pendingByTicket() 按落库顺序（ORDER BY at）给出每票的行；队头未到期则队尾等待（break）。
+   * 3) 幂等 — 每次尝试之前重新读库里的当前行：别处（重投/丢弃/另一条路径）已经把它推进终态
+   *    （sent/recorded/failed）或删掉时直接跳过，绝不凭旧快照再投一次；requestId 等字段一律沿用库里的当前值。
+   */
   async tick() {
     const nowMs = this.now()
-    for (const rows of this.#pendingByTicket().values()) {
-      for (const row of rows) {
-        if (row.nextRetryAt !== null && row.nextRetryAt > nowMs) break // the head is not due; the tail waits (保序)
-        const done = await this.#attempt(row)
-        if (!done) break // failed attempts keep the head in place until it is sent or declared failed
+    for (const [key, rows] of this.#pendingByTicket()) {
+      if (this.#activeDrains.has(key)) continue // 这张票已有一轮 drain 在途 → 本轮不重入
+      this.#activeDrains.add(key)
+      try {
+        for (const row of rows) {
+          const current = this.#readRow(row.id)
+          if (current === undefined || current.state !== 'queued') continue // 已是终态 → 队头已解决，看下一行
+          if (current.nextRetryAt !== null && current.nextRetryAt > nowMs) break // 当前值未到期，队尾等待
+          const done = await this.#attempt(current)
+          if (!done) break // failed attempts keep the head in place until it is sent or declared failed
+        }
+      } finally {
+        this.#activeDrains.delete(key)
       }
     }
   }
@@ -219,8 +246,7 @@ export class OutboxRunner {
    */
   async #attempt(row) {
     try {
-      // The deliverer may ask to be retried later WITHOUT burning an attempt — e.g. a digest waits for the
-      // owner's wake to end (idle session) so one wake coalesces into one outward message (#67).
+      // A deferred digest may stay queued without spending an attempt.
       const result = await this.deliver(row)
       if (result && typeof result.postponeMs === 'number') {
         this.#writeRow({ ...row, nextRetryAt: this.now() + result.postponeMs })
@@ -230,7 +256,10 @@ export class OutboxRunner {
       // whose channel does not exist yet) — a terminal 'recorded' row, kept for a future channel to scan,
       // never a fake 'sent'. Only an actual delivery earns 'sent'.
       if (result && result.recorded === true) {
-        this.#writeRow({ ...row, state: 'recorded', recordedAt: new Date(this.now()).toISOString(), nextRetryAt: null })
+        this.#writeRow({
+          ...row, state: 'recorded', recordedAt: new Date(this.now()).toISOString(), nextRetryAt: null,
+          ...(typeof result.skipped === 'string' && { skipReason: result.skipped }),
+        })
         return true
       }
       this.#writeRow({ ...row, state: 'sent', sentAt: new Date(this.now()).toISOString(), nextRetryAt: null })
