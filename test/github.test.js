@@ -303,6 +303,26 @@ test('status() follows the registry: watched repos come from repo owners\' origi
     const status2 = await f.source.status()
     assert.equal(status2.followed.some(w => w.ownerId === 'repo-plain'), false, '无 origin 的 owner 不进监听')
     assert.ok(status2.resolveErrors['owner:repo-plain'], '解析失败留痕')
+    const originalGit = f.source.git
+    f.source.git = args => args.includes('/Volumes/home/plain')
+      ? Promise.resolve('https://github.com/example/plain.git') : originalGit(args)
+    await f.source.pollAll()
+    const repaired = await f.source.status()
+    assert.ok(repaired.followed.some(w => w.ownerId === 'repo-plain'))
+    assert.equal(repaired.resolveErrors['owner:repo-plain'], undefined)
+  } finally { f.cleanup() }
+})
+
+test('a pending default GitHub login lookup respects an allowlist the user saves', async () => {
+  const f = fixture({ allowlist: [] })
+  try {
+    let resolveLogin
+    f.source.gh = () => new Promise(resolve => { resolveLogin = resolve })
+    const pending = f.source.resolveSelfLogin()
+    f.source.config.loginAllowlist = ['explicit-owner']
+    resolveLogin(JSON.stringify({ login: 'default-owner' }))
+    assert.deepEqual(await pending, ['explicit-owner'])
+    assert.deepEqual((await f.source.status()).loginAllowlist, ['explicit-owner'])
   } finally { f.cleanup() }
 })
 

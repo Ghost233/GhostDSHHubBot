@@ -16,7 +16,7 @@ import { resolveConfig } from '../src/config.js'
 import {
   SETTINGS_FILE, SettingsError,
   applySettingsPatch, applySettingsOverlay, loadSettingsOverlay, saveSettingsOverlay, mergeSettingsOverlay,
-  buildSettingsView, buildOverview,
+  buildSettingsView, buildOverview, buildOutboxHealth, readMessageDetail,
 } from '../src/panel.js'
 
 /** A fully resolved config with feishu/github sections on — the shape the panel mutates. */
@@ -73,6 +73,21 @@ test('settings patch rejects unknown sections and keys (typos cannot pass silent
   })
   assert.throws(() => applySettingsPatch(config, { reporting: { bogus: true } }), /does not know settings key "reporting.bogus"/)
   assert.equal(config.reporting.auto, false, 'a rejected patch mutates nothing')
+})
+
+test('a GitHub switch only changes after the entire patch is validated and persisted', () => {
+  const config = baseConfig()
+  const github = config.github
+  assert.throws(() => applySettingsPatch(config, { github: { enabled: false, intervalMs: 1000 } }), /github.intervalMs/)
+  assert.equal(github.enabled, true)
+  assert.throws(() => applySettingsPatch(config, { github: { enabled: false } }, () => { throw new Error('disk full') }), /disk full/)
+  assert.equal(github.enabled, true)
+  applySettingsPatch(config, { github: { enabled: false } }, patch => {
+    assert.equal(patch.github.enabled, false)
+    assert.equal(github.enabled, true)
+  })
+  assert.equal(config.github, github)
+  assert.equal(github.enabled, false)
 })
 
 test('settings patch validates values: slots >= 1, github interval >= 30s, allowlists are string arrays', () => {
@@ -290,6 +305,63 @@ test('recent messages separate dispatch, legacy chat replies and replies to a si
     assert.equal(msg('old').replyUnlinked, true)
     assert.equal(msg('old').unprocessed, false)
     assert.equal(view.recentTriggers.find(t => t.ticketId === route.ticketId).reply, null)
+  } finally { cleanup() }
+})
+
+test('delivery health includes scheduled and channel retries and keeps history separate', () => {
+  const { store, cleanup } = fixture()
+  try {
+    const at = Date.parse('2026-11-15T00:00:00Z')
+    const put = (id, state, to, extra = {}) => insertOutbox(store, { id, state, to, kind: 'reply', body: id, attempts: 1, ...extra }, () => at)
+    put('scheduled', 'queued', 'session:s', { lastError: 'first failure', nextRetryAt: at + 2000 })
+    put('feishu-retry', 'recorded', 'feishu:chat:abc')
+    put('github-retry', 'recorded', 'github:org/repo#7')
+    put('waiting', 'recorded', 'feishu:chat:abc', { attempts: 0 })
+    put('internal', 'recorded', 'dsh:session:chief')
+    put('dead', 'failed', 'session:s', { lastError: 'final failure' })
+    for (let i = 0; i < 6; i++) put('problem-' + i, 'recorded', 'chief', { kind: 'system-problem' })
+    const health = buildOutboxHealth(store)
+    assert.deepEqual(health.retrying.map(row => row.id), ['scheduled', 'feishu-retry', 'github-retry'])
+    assert.equal(health.retrying[0].nextRetryAt, at + 2000)
+    assert.equal(health.retrying[0].lastError, 'first failure')
+    assert.equal(health.failed, health.failedList.length)
+    assert.equal(health.failedList[0].lastError, 'final failure')
+    assert.equal(health.systemProblems, 6)
+    assert.deepEqual(health.recentProblems.map(row => row.id), ['problem-5', 'problem-4', 'problem-3', 'problem-2', 'problem-1'])
+  } finally { cleanup() }
+})
+
+test('message details preserve full linked text without attributing replies by chat alone', async () => {
+  const { router, registry, store, cleanup } = fixture()
+  try {
+    const at = '2026-11-15T00:00:00.000Z'
+    const message = '开头\n' + '这是一段长消息。'.repeat(60) + '\n消息末尾'
+    const reply = '回复开头\n' + '这是一段长回复。'.repeat(40) + '\n回复末尾'
+    const put = store.db.prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)')
+    for (const id of ['long', 'same-chat', 'cross-chat']) {
+      const source = { chatId: id === 'cross-chat' ? 'other' : 'shared', messageId: 'om_' + id }
+      const trigger = { id, kind: 'feishu', at, message, source, authorization: { actor: 'ou_test', source: 'feishu', at } }
+      put.run(id, JSON.stringify(trigger), at)
+    }
+    const owner = registry.create({ kind: 'repo', workspace: 'Project', cwd: '/repos/Project' })
+    const { ticketId } = await router.routeToOwner({ ownerId: owner.id, triggerRef: 'long', message: 'Handle the long message' })
+    const sentAt = '2026-11-15T00:01:00.000Z'
+    const when = () => sentAt
+    insertOutbox(store, { kind: 'reply', state: 'sent', ticketId, to: 'feishu:chat:shared', body: reply, sentAt }, when)
+    insertOutbox(store, { kind: 'reply', state: 'failed', triggerId: 'long', to: 'feishu:chat:other', body: 'Wrong chat' }, when)
+    insertOutbox(store, { kind: 'reply', state: 'sent', to: 'feishu:chat:shared', body: 'No original message reference' }, when)
+    insertOutbox(store, { kind: 'reply', state: 'sent', triggerId: 'long', to: 'dsh:session:chief', body: 'Internal report' }, when)
+    const preview = buildOverview({ store, registry, now: when }).recentTriggers.find(row => row.id === 'long')
+    assert.equal(preview.message, message.slice(0, 160) + '…')
+    assert.equal(preview.reply.text, reply.slice(0, 120))
+    const detail = readMessageDetail(store, 'long')
+    assert.equal(detail.message, message)
+    assert.equal(detail.reply.text, reply)
+    assert.equal(detail.reply.sentAt, sentAt)
+    assert.equal(readMessageDetail(store, 'same-chat').reply, null)
+    assert.equal(readMessageDetail(store, 'same-chat').replyUnlinked, true)
+    assert.equal(readMessageDetail(store, 'cross-chat').reply, null)
+    assert.equal(readMessageDetail(store, 'missing'), null)
   } finally { cleanup() }
 })
 

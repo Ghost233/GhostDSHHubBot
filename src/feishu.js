@@ -79,6 +79,9 @@ export class FeishuSource {
     this.wsMetrics = this.store.get('feishu.wsMetrics') ?? { reconnects: 0, lastConnectedAt: null, lastErrorAt: null, lastError: null }
     this.client = null
     this.ws = null
+    this.connectionAttempt = null
+    this.registrationAttempt = null
+    this.registrationError = null
     this.#reloadCredentials()
   }
 
@@ -120,6 +123,7 @@ export class FeishuSource {
     writeFileSync(file, JSON.stringify({ appId, appSecret, boundAt: this.now() }, null, 2) + '\n', { mode: 0o600 })
     chmodSync(file, 0o600) // an existing file keeps its wider mode on rewrite without this
     this.#reloadCredentials()
+    this.client = null
   }
 
   /**
@@ -133,19 +137,22 @@ export class FeishuSource {
   status() {
     const bound = this.credentialState === 'ok' && this.credentials
     const appId = bound ? this.credentials.appId : null
+    const enabled = this.config.enabled === true
+    const wsState = enabled ? this.ws?.getConnectionStatus?.().state ?? this.wsState : 'off'
     return {
-      enabled: this.config.enabled === true,
+      enabled,
       credentialState: this.credentialState,
-      wsState: this.ws?.getConnectionStatus?.().state ?? this.wsState,
-      registration: this.registering ? 'pending' : undefined,
-      qr: this.lastQr ?? undefined,
+      wsState,
+      registration: enabled && this.registering ? 'pending' : undefined,
+      registrationError: enabled ? this.registrationError ?? undefined : undefined,
+      qr: enabled ? this.lastQr ?? undefined : undefined,
       preset: BOT_PRESET,
       permissions: DECLARED_PERMISSIONS,
       bot: bound ? {
         name: BOT_PRESET.name,
         appIdMasked: typeof appId === 'string' && appId.length > 10 ? appId.slice(0, 7) + '…' + appId.slice(-4) : appId,
         boundAt: this.credentials.boundAt ?? null,
-        connected: (this.ws?.getConnectionStatus?.().state ?? this.wsState) === 'connected',
+        connected: wsState === 'connected',
       } : undefined,
       botOpenId: this.config.botOpenId ?? undefined,
       metrics: { ...this.wsMetrics },
@@ -157,12 +164,20 @@ export class FeishuSource {
    * visible via status().qr while pending. Permission addon principle: 一次性全部申请 (im:message:send_as_bot,
    * im:message, im:chat:readonly + im.message.receive_v1).
    */
+  get registering() { return this.registrationAttempt !== null }
+
   async register() {
-    this.registering = true
+    if (this.config.enabled !== true) throw new Error('Enable Feishu before registering a bot')
+    if (this.registering) return { started: false, registration: 'pending' }
+    const registration = new AbortController()
+    this.registrationAttempt = registration
+    this.registrationError = null
     this.lastQr = null
     try {
       const lark = await this.#sdk()
+      registration.signal.throwIfAborted()
       const result = await lark.registerApp({
+        signal: registration.signal,
         createOnly: true, // 只允许创建新应用，避免误覆盖已有应用
         appPreset: { name: BOT_PRESET.name, desc: BOT_PRESET.desc },
         addons: {
@@ -170,14 +185,27 @@ export class FeishuSource {
           scopes: { tenant: ['im:message:send_as_bot', 'im:message', 'im:chat:readonly'] },
           events: { items: { tenant: ['im.message.receive_v1'] } },
         },
-        onQRCodeReady: info => { this.lastQr = { url: info.url, expireIn: info.expireIn } },
+        onQRCodeReady: info => {
+          if (!registration.signal.aborted) this.lastQr = { url: info.url, expireIn: info.expireIn }
+        },
       })
+      registration.signal.throwIfAborted()
+      this.#closeSocket()
       this.saveCredentials({ appId: result.client_id, appSecret: result.client_secret })
       await this.#configureEventMode()
+      registration.signal.throwIfAborted()
       await this.connect()
+      registration.signal.throwIfAborted()
       return { appId: result.client_id }
+    } catch (error) {
+      if (registration.signal.aborted) return { cancelled: true }
+      this.registrationError = String(error?.message ?? error).slice(0, 300)
+      throw error
     } finally {
-      this.registering = false
+      if (this.registrationAttempt === registration) {
+        this.registrationAttempt = null
+        this.lastQr = null
+      }
     }
   }
 
@@ -213,53 +241,78 @@ export class FeishuSource {
     return this.client
   }
 
-  /** Starts the WSClient long connection (主动连接，无需公网回调). Idempotent. */
-  async connect() {
-    if (this.ws) return { started: false, reason: 'already-connected' }
-    const lark = await this.#sdk()
-    if (!this.credentials) throw new Error('hub-bot feishu: no credentials — run register() first')
-    const client = await this.#client()
-    const WSClient = lark.WSClient
-    const EventDispatcher = lark.EventDispatcher
-    if (typeof WSClient !== 'function' || typeof EventDispatcher !== 'function') {
-      this.logger.warn('hub-bot feishu: SDK without WSClient/EventDispatcher — long connection skipped (手工降级)')
-      return { started: false, reason: 'sdk-incomplete' }
-    }
-    // 生命周期回调同步真实连接状态：wsState 不再是一次性乐观标志（实测 2026-11-16：断开后标志位停在
-    // connected 误导排查）。status() 读 ws.getConnectionStatus() 的派生态。
-    this.ws = new WSClient({
-      appId: this.credentials.appId,
-      appSecret: this.credentials.appSecret,
-      onReady: () => { this.wsState = 'connected'; this.wsMetrics.lastConnectedAt = this.now(); this.#saveWsMetrics() },
-      onReconnecting: () => { this.wsState = 'reconnecting'; this.logger.warn('hub-bot feishu: ws reconnecting…') },
-      onReconnected: () => { this.wsState = 'connected'; this.wsMetrics.reconnects += 1; this.wsMetrics.lastConnectedAt = this.now(); this.#saveWsMetrics(); this.logger.info('hub-bot feishu: ws reconnected') },
-      onError: error => { this.wsMetrics.lastErrorAt = this.now(); this.wsMetrics.lastError = String(error?.message ?? error).slice(0, 200); this.#saveWsMetrics(); this.logger.warn('hub-bot feishu: ws error: %s', error?.message ?? error) },
-    })
-    const dispatcher = new EventDispatcher({}).register({
-      'im.message.receive_v1': async data => {
-        this.logger.info('hub-bot feishu: event received message_id=%s chat_type=%s', data?.message?.message_id, data?.message?.chat_type)
-        try { await this.handleEvent(data) } catch (error) { this.logger.warn('hub-bot feishu: event handling failed: %s', error?.message ?? error) }
-      },
-    })
-    try {
-      await this.ws.start({ eventDispatcher: dispatcher })
-      this.wsState = 'connected'
-    } catch (error) {
-      this.ws = null
-      this.wsState = 'error'
-      // 凭据失效: surface it for the panel (系统健康吗) — the user re-scans.
-      if (/401|99991663|99991664|invalid.*credential|app.*ticket/i.test(String(error?.message ?? error))) {
-        this.credentialState = 'invalid'
-      }
-      throw error
-    }
-    return { started: true }
+  #recordWsError(error) {
+    const message = String(error?.message ?? error)
+    this.wsState = 'failed'
+    this.wsMetrics.lastErrorAt = this.now()
+    this.wsMetrics.lastError = message.slice(0, 200)
+    this.#saveWsMetrics()
+    if (/401|99991663|99991664|invalid.*credential|app.*ticket/i.test(message)) this.credentialState = 'invalid'
+    this.logger.warn('hub-bot feishu: ws error: %s', message)
   }
 
-  /** Stops the long connection (dispose path). */
-  async disconnect() {
-    if (this.ws) { try { this.ws.close?.() } catch { /* best effort */ } this.ws = null }
+  /** Starts one long connection. The SDK reports actual readiness through its callbacks. */
+  async connect() {
+    if (this.config.enabled !== true) return { started: false, reason: 'disabled' }
+    if (this.connectionAttempt) return { started: false, reason: 'already-connected' }
+    const attempt = {}
+    this.connectionAttempt = attempt
+    this.wsState = 'connecting'
+    const current = () => this.connectionAttempt === attempt && this.config.enabled === true
+    try {
+      const { WSClient, EventDispatcher } = await this.#sdk()
+      if (!current()) return { started: false, reason: 'superseded' }
+      if (!this.credentials) throw new Error('hub-bot feishu: no credentials — run register() first')
+      if (typeof WSClient !== 'function' || typeof EventDispatcher !== 'function') {
+        throw new Error('hub-bot feishu: the SDK does not provide a long connection client')
+      }
+      const ready = reconnect => {
+        if (!current()) return
+        this.wsState = 'connected'
+        this.wsMetrics.lastConnectedAt = this.now()
+        if (reconnect) this.wsMetrics.reconnects += 1
+        this.#saveWsMetrics()
+      }
+      const socket = new WSClient({
+        appId: this.credentials.appId, appSecret: this.credentials.appSecret,
+        onReady: () => ready(false),
+        onReconnecting: () => { if (current()) this.wsState = 'reconnecting' },
+        onReconnected: () => ready(true),
+        onError: error => { if (current()) this.#recordWsError(error) },
+      })
+      this.ws = socket
+      const dispatcher = new EventDispatcher({}).register({
+        'im.message.receive_v1': async data => {
+          if (!current()) return
+          this.logger.info('hub-bot feishu: event received message_id=%s chat_type=%s', data?.message?.message_id, data?.message?.chat_type)
+          try { await this.handleEvent(data) } catch (error) { this.logger.warn('hub-bot feishu: event handling failed: %s', error?.message ?? error) }
+        },
+      })
+      await socket.start({ eventDispatcher: dispatcher })
+      return current() ? { started: true } : { started: false, reason: 'superseded' }
+    } catch (error) {
+      if (!current()) return { started: false, reason: 'superseded' }
+      this.#closeSocket()
+      this.#recordWsError(error)
+      throw error
+    }
+  }
+
+  #closeSocket() {
+    this.connectionAttempt = null
+    const socket = this.ws
+    this.ws = null
     this.wsState = 'off'
+    try { socket?.close?.({ force: true }) } catch (error) { this.logger.warn('hub-bot feishu: could not close socket: %s', error?.message ?? error) }
+  }
+
+  /** Pausing preserves saved credentials and cancels outstanding registration and socket work. */
+  disconnect() {
+    this.registrationAttempt?.abort()
+    this.registrationAttempt = null
+    this.lastQr = null
+    this.registrationError = null
+    this.#closeSocket()
   }
 
   /**
@@ -392,12 +445,15 @@ export class FeishuSource {
    */
   async deliverReplies() {
     // 双轴审查 P1-2: 通道无关驱动在 outbox.js（顺序扫描/统一 attempts/失败阶梯一处维护）；这里只留通道差异。
+    if (this.config.enabled !== true) return { delivered: 0 }
+    const credentials = this.credentials
+    const client = await this.#client()
     return deliverRecordedReplies({
       store: this.store, logger: this.logger, now: this.now,
       channel: 'feishu', prefix: 'feishu:', maxAttempts: MAX_FEISHU_ATTEMPTS,
+      canContinue: () => !this.store.closed && this.config.enabled === true && this.credentials === credentials,
       parseTarget: to => to.startsWith('feishu:chat:') ? to.slice('feishu:chat:'.length) : to.slice('feishu:'.length),
       send: async (chatId, body) => {
-        const client = await this.#client()
         const resp = await client.im.message.create({
           params: { receive_id_type: 'chat_id' },
           data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text: body }) },

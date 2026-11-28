@@ -83,7 +83,7 @@ export function updateOutboxRow(store, row) {
  *   channel: string, prefix: string, maxAttempts: number,
  *   parseTarget: (to: string) => unknown,  // null = unparseable → the row fails immediately
  *   send: (target: unknown, body: string) => Promise<void>,
- *   prepareBody?: (body: string) => string }} deps
+ *   prepareBody?: (body: string) => string, canContinue?: () => boolean }} deps
  */
 /**
  * #74 P1-A: one delivery pass per channel at a time. The 1s tick does not await the previous pass, and a
@@ -95,23 +95,24 @@ export function updateOutboxRow(store, row) {
  */
 const channelPassInFlight = new Set()
 
-export async function deliverRecordedReplies({ store, logger, now, channel, prefix, maxAttempts, parseTarget, send, prepareBody }) {
+export async function deliverRecordedReplies({ store, logger, now, channel, prefix, maxAttempts, parseTarget, send, prepareBody, canContinue }) {
   if (channelPassInFlight.has(channel)) return { delivered: 0, skipped: 'in-flight' }
   channelPassInFlight.add(channel)
   try {
-    return await deliverRecordedRepliesPass({ store, logger, now, channel, prefix, maxAttempts, parseTarget, send, prepareBody })
+    return await deliverRecordedRepliesPass({ store, logger, now, channel, prefix, maxAttempts, parseTarget, send, prepareBody, canContinue })
   } finally {
     channelPassInFlight.delete(channel)
   }
 }
 
-async function deliverRecordedRepliesPass({ store, logger, now, channel, prefix, maxAttempts, parseTarget, send, prepareBody }) {
+async function deliverRecordedRepliesPass({ store, logger, now, channel, prefix, maxAttempts, parseTarget, send, prepareBody, canContinue }) {
   const rows = store.db.prepare('SELECT value FROM outbox ORDER BY rowid').all()
     .map(raw => JSON.parse(String(raw.value)))
     .filter(row => row.state === 'recorded' && typeof row.to === 'string' && row.to.startsWith(prefix))
   if (rows.length === 0) return { delivered: 0 }
   let delivered = 0
   for (const row of rows) {
+    if (canContinue?.() === false) break
     const target = parseTarget(row.to)
     if (!target) {
       updateOutboxRow(store, { ...row, state: 'failed', lastError: 'unparseable ' + channel + ' target' })
@@ -238,8 +239,9 @@ export class OutboxRunner {
       // A permanent failure (e.g. the ticket's authorization record is missing — 票面权威) must not be
       // retried: it fails out immediately and is reported as a system problem like any 3rd failure.
       const attempts = error?.permanent === true ? MAX_ATTEMPTS : row.attempts + 1
+      const lastError = String(error?.message ?? error)
       if (attempts >= MAX_ATTEMPTS) {
-        this.#writeRow({ ...row, attempts, state: 'failed', failedAt: new Date(this.now()).toISOString(), nextRetryAt: null })
+        this.#writeRow({ ...row, attempts, lastError, state: 'failed', failedAt: new Date(this.now()).toISOString(), nextRetryAt: null })
         const problem = { ticketId: row.ticketId, reason: 'delivery failed ' + attempts + ' times in a row (' + row.kind + ' → ' + row.to + ')', rowId: row.id }
         insertOutbox(this.store, { ticketId: row.ticketId, kind: 'system-problem', to: 'chief', body: problem.reason, state: 'recorded' }, this.now)
         this.onSystemProblem(problem)
@@ -247,7 +249,7 @@ export class OutboxRunner {
       }
       const cap = CAP_MS[row.kind] ?? CAP_MS.reply
       const delay = Math.min(BASE_MS * 2 ** (attempts - 1), cap)
-      this.#writeRow({ ...row, attempts, nextRetryAt: this.now() + delay })
+      this.#writeRow({ ...row, attempts, lastError, nextRetryAt: this.now() + delay })
       return false
     }
   }

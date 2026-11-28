@@ -91,6 +91,7 @@ export class GitHubSource {
     this.now = now ?? (() => new Date().toISOString())
     this.watermarks = { repos: {} }
     this.lastErrors = {}
+    this.resolveErrors = {}
     this.#loadWatermarks()
   }
 
@@ -124,19 +125,21 @@ export class GitHubSource {
   async #watchedRepos() {
     const watched = []
     const seen = new Set()
+    const resolveErrors = {}
     for (const owner of this.registry.list()) {
       if (owner.kind !== 'repo' || owner.recycled === true || owner.role === 'chief' || !owner.cwd) continue
       try {
         const remote = String(await this.git(['-C', owner.cwd, 'remote', 'get-url', 'origin'])).trim()
         const repo = parseGitHubRepo(remote)
-        if (!repo) { this.lastErrors['owner:' + owner.id] = 'origin is not a GitHub remote: ' + (remote || '(empty)'); continue }
+        if (!repo) { resolveErrors['owner:' + owner.id] = 'origin is not a GitHub remote: ' + (remote || '(empty)'); continue }
         if (seen.has(repo)) continue
         seen.add(repo)
         watched.push({ repo, ownerId: owner.id, workspace: owner.workspace, cwd: owner.cwd })
       } catch (error) {
-        this.lastErrors['owner:' + owner.id] = error?.message ?? String(error)
+        resolveErrors['owner:' + owner.id] = error?.message ?? String(error)
       }
     }
+    this.resolveErrors = resolveErrors
     this.lastWatched = watched
     return watched
   }
@@ -156,7 +159,7 @@ export class GitHubSource {
       mentionHandle: this.config.mentionHandle ?? null,
       repos,
       followed: watched.map(w => ({ repo: w.repo, ownerId: w.ownerId })),
-      resolveErrors: Object.fromEntries(Object.entries(this.lastErrors).filter(([k]) => k.startsWith('owner:'))),
+      resolveErrors: { ...this.resolveErrors },
     }
   }
 
@@ -166,7 +169,7 @@ export class GitHubSource {
     try {
       const raw = await this.gh(['api', 'user'])
       const login = JSON.parse(String(raw)).login
-      if (typeof login === 'string' && login) {
+      if (typeof login === 'string' && login && !(this.config.loginAllowlist ?? []).length) {
         this.config.loginAllowlist = [login]
         this.logger.info('hub-bot github: loginAllowlist resolved from gh auth → %s', login)
       }
@@ -182,6 +185,7 @@ export class GitHubSource {
     if (this.config.enabled !== true) return { ...totals, disabled: true }
     const watched = await this.#watchedRepos()
     for (const repoCfg of watched) {
+      if (!this.config.enabled) break
       try {
         const result = await this.pollRepo(repoCfg)
         totals.triggered += result.triggered ?? 0

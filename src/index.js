@@ -33,7 +33,7 @@ import { resolveConfig } from './config.js'
 const PKG_VERSION = createRequire(import.meta.url)('../package.json').version
 import {
   SETTINGS_FILE, applySettingsOverlay, applySettingsPatch, loadSettingsOverlay, mergeSettingsOverlay,
-  saveSettingsOverlay, buildOverview, buildSettingsView, feishuSelfTestMarker,
+  saveSettingsOverlay, buildOverview, buildOutboxHealth, buildSettingsView, feishuSelfTestMarker, readMessageDetail,
 } from './panel.js'
 import { discardOutboxRows, retryOutboxRows } from './outbox.js'
 import { Store, SCHEMA_VERSION } from './store.js'
@@ -229,16 +229,15 @@ export function apply(ctx, rawConfig) {
   // 飞书入口 (#68): OFF unless config.feishu.enabled. With credentials present the WSClient long connection
   // starts at boot; the same source scans recorded feishu reply intents on the 1s tick (阶段 2 留的通道).
   const feishu = new FeishuSource({ store, registry: hub.registry, sessions, config: config.feishu, chiefConfig: config.chief, logger: ctx.logger, placer })
-  if (config.feishu.enabled && feishu.credentialState === 'ok') {
-    void feishu.connect().catch(error => ctx.logger.warn('hub-bot feishu connect failed: %s (凭据可能失效 — 面板提示重新扫码)', error?.message ?? error))
+  const updateFeishuConnection = () => {
+    if (!config.feishu.enabled) { feishu.disconnect(); return }
+    if (feishu.credentialState === 'ok') void feishu.connect().catch(error => ctx.logger.warn('hub-bot feishu connect failed: %s', error?.message ?? error))
   }
+  updateFeishuConnection()
   // GitHub 自动处理闭环 (#71): OFF unless config.github.enabled. loginAllowlist 空时经 gh api user 解析为本人；
   // 每 intervalMs（默认 5min）一轮轮询，首轮只记水位线；recorded github 回复意图随 1s tick 实投。
   const github = new GitHubSource({ store, registry: hub.registry, router: hub.router, sessions, config: config.github, logger: ctx.logger })
-  if (config.github.enabled) {
-    // P2-4: 解析失败必须可闻 — 白名单恒空会让所有作者静默 record-drop，至少 warn 一次
-  void github.resolveSelfLogin().catch(error => ctx.logger.warn('hub-bot github: resolveSelfLogin failed: %s', error?.message ?? error))
-  }
+
   // 重启恢复（#66）: end running assignments "host restarted", then resume any queued stored work — and keep
   // driving the runner every second so backoff retries fire even when no new traffic arrives.
   // scratch 回收 (#70): router 回收触发段负责终态即时判定; sweep 挂 1s tick 兜底不经 Router 的终止
@@ -271,18 +270,23 @@ export function apply(ctx, rawConfig) {
   }, 1000)
   deliveryTimer.unref?.()
 
-  // #73 设置页: the poll loop is restartable — 轮询开关/间隔 changes via the settings API apply immediately.
   let githubPollTimer = null
-  const restartGithubPolling = () => {
-    if (githubPollTimer) { clearInterval(githubPollTimer); githubPollTimer = null }
-    if (config.github.enabled) {
-      githubPollTimer = setInterval(() => {
-        void github.pollAll().catch(error => ctx.logger.warn('hub-bot github poll tick failed: %s', error?.message ?? error))
-      }, config.github.intervalMs)
-      githubPollTimer.unref?.()
-    }
+  let githubPollTask = null
+  const pollGithub = () => {
+    if (!config.github.enabled || githubPollTask) return
+    githubPollTask = github.resolveSelfLogin().then(() => github.pollAll())
+      .catch(error => ctx.logger.warn('hub-bot github poll tick failed: %s', error?.message ?? error))
+      .finally(() => { githubPollTask = null })
   }
-  restartGithubPolling()
+  const restartGithubPolling = ({ immediate = false } = {}) => {
+    clearInterval(githubPollTimer)
+    githubPollTimer = null
+    if (!config.github.enabled) return
+    githubPollTimer = setInterval(pollGithub, config.github.intervalMs)
+    githubPollTimer.unref?.()
+    if (immediate) pollGithub()
+  }
+  restartGithubPolling({ immediate: true })
 
   let unregisterManagement
   // Dispose the root service and store even when the management API is disabled. Stop new work before closing them.
@@ -339,10 +343,17 @@ export function apply(ctx, rawConfig) {
    * live config → persist the merged overlay → live side effects (GitHub polling cadence, chief model).
    */
   const applySettingsCore = async patch => {
-    applySettingsPatch(config, patch) // SettingsError 上抛，两个入口各自包装
-    settingsOverlay = mergeSettingsOverlay(settingsOverlay, patch)
-    saveSettingsOverlay(config.stateDir, settingsOverlay)
-    restartGithubPolling() // 轮询开关/间隔即时生效（幂等重启）
+    const { enabled: githubWasEnabled, intervalMs: oldGithubInterval } = config.github
+    const feishuWasEnabled = config.feishu.enabled
+    applySettingsPatch(config, patch, applied => {
+      const next = mergeSettingsOverlay(settingsOverlay, applied)
+      saveSettingsOverlay(config.stateDir, next)
+      settingsOverlay = next
+    })
+    if (feishuWasEnabled !== config.feishu.enabled) updateFeishuConnection()
+    if (githubWasEnabled !== config.github.enabled || oldGithubInterval !== config.github.intervalMs) {
+      restartGithubPolling({ immediate: !githubWasEnabled && config.github.enabled })
+    }
     if (patch.chief?.model !== undefined) {
       // 总管模型即时生效：对已绑定的 L1 会话直接 selectModel；失败只告警（会话可能在跑，下条消息还会对齐）。
       const chiefRow = hub.registry.get('chief')
@@ -399,6 +410,13 @@ export function apply(ctx, rawConfig) {
     return { ...result, chatId, at: new Date().toISOString() }
   }
 
+  const startFeishuRegister = () => {
+    if (!config.feishu.enabled) throw new HttpError(400, '请先启用飞书，再扫码绑定。')
+    if (feishu.registering) return { started: false, registration: 'pending', qr: feishu.lastQr }
+    void feishu.register().catch(error => ctx.logger.warn('hub-bot feishu register failed: %s', error?.message ?? error))
+    return { started: true }
+  }
+
   const serviceDeps = {}
   const forwardDep = name => (...args) => serviceDeps[name](...args)
   new HubBotSettingsService(ctx, {
@@ -407,6 +425,7 @@ export function apply(ctx, rawConfig) {
     listOwners: forwardDep('listOwners'),
     modelCatalog: forwardDep('modelCatalog'),
     overview: forwardDep('overview'),
+    messageDetail: forwardDep('messageDetail'),
     resolveTicket: forwardDep('resolveTicket'),
     startFeishuRegister: forwardDep('startFeishuRegister'),
     listWorkspaces: forwardDep('listWorkspaces'),
@@ -446,17 +465,9 @@ export function apply(ctx, rawConfig) {
       } catch { return {} }
     },
     overview: async () => buildOverview({ store, registry: hub.registry, health: await buildHealth() }),
+    messageDetail: triggerId => readMessageDetail(store, triggerId),
     resolveTicket: request => resolveTicket(request),
-    startFeishuRegister: () => {
-      if (!config.feishu?.enabled) {
-        const error = new Error('飞书未启用（feishu.enabled 未配置为 true），无法发起扫码绑定')
-        error.name = 'SettingsError'
-        throw error
-      }
-      if (feishu.registering) return { started: false, registration: 'pending' }
-      void feishu.register().catch(error => ctx.logger.warn('hub-bot feishu register failed: %s', error?.message ?? error))
-      return { started: true }
-    },
+    startFeishuRegister,
   })
 
   const token = config.devApi?.token
@@ -574,31 +585,12 @@ export function apply(ctx, rawConfig) {
     res.end(body)
   }
 
-  /** 系统健康 (spec「安静默认」的反面数据): Source 状态 + outbox 队列计数 + 正在退避重试的行（模型/投递等待的可见信号）。 */
-  const buildHealth = async () => {
-    const rows = store.db.prepare('SELECT value FROM outbox').all().map(r => JSON.parse(String(r.value)))
-    const count = state => rows.filter(r => r.state === state).length
-    const retrying = rows
-      .filter(r => r.state === 'queued' && (r.attempts ?? 0) > 0)
-      .map(r => ({ id: r.id, ticketId: r.ticketId ?? null, to: r.to, attempts: r.attempts, nextRetryAt: r.nextRetryAt ?? null, lastError: r.lastError ?? null, text: String(r.body ?? r.text ?? '').slice(0, 120) }))
-    const problems = rows.filter(r => r.kind === 'system-problem')
-    // 死信投影（GUI 健康警告条展开用）: failed 行逐条列出——警告计数可点击查看原因，不再是个死数字。
-    const failedList = rows
-      .filter(r => r.state === 'failed')
-      .map(r => ({ id: r.id, ticketId: r.ticketId ?? null, to: r.to, attempts: r.attempts ?? 0, lastError: r.lastError ?? null, text: String(r.body ?? r.text ?? '').slice(0, 120) }))
-    return {
-      feishu: feishu.status(),
-      github: await github.status(),
-      outbox: {
-        queued: count('queued'), held: count('held'), recorded: count('recorded'),
-        failed: count('failed'), sent: count('sent'),
-        retrying,
-        failedList,
-        systemProblems: problems.length,
-        recentProblems: problems.slice(-5).map(r => ({ id: r.id, ticketId: r.ticketId ?? null, body: String(r.body ?? '').slice(0, 200), at: r.createdAt ?? null })),
-      },
-    }
-  }
+  const buildHealth = async () => ({
+    feishu: feishu.status(),
+    github: await github.status(),
+    outbox: buildOutboxHealth(store),
+  })
+
 
   /** HTTP 面板路由的薄包装：readBody → 共享核心；SettingsError → 400。 */
   const applySettings = async req => {
@@ -744,9 +736,8 @@ export function apply(ctx, rawConfig) {
         } else if (route === 'feishu/register' && method === 'POST') {
           // 扫码建应用: starts the device flow in the background; poll feishu/status for the QR url, then
           // for credentialState 'ok' once the user confirmed on the phone.
-          if (feishu.registering) { json(res, 200, { started: false, registration: 'pending', qr: feishu.lastQr ?? null }); return }
-          void feishu.register().catch(error => ctx.logger.warn('hub-bot feishu register failed: %s', error?.message ?? error))
-          json(res, 202, { started: true })
+          const reply = startFeishuRegister()
+          json(res, reply.started ? 202 : 200, reply)
         } else if (route === 'feishu/simulate' && method === 'POST') {
           // Dev proof aid: inject one mock im.message.receive_v1 event through the real normalization/policy path.
           const body = await readBody(req)

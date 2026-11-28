@@ -138,6 +138,15 @@ export class HubBotSettingsService extends TypertRemoteService {
     return await this.deps.overview()
   }
 
+  /** Read the original message and its attributed reply without extending the overview payload. */
+  async messageDetail(request) {
+    const id = request?.triggerId
+    if (typeof id !== 'string' || !id.trim()) throw new RemoteError('message/invalid', 'A message ID is required.', {})
+    const detail = await this.deps.messageDetail(id)
+    if (!detail) throw new RemoteError('message/not-found', 'This message record is no longer available.', {})
+    return detail
+  }
+
   /** Start the feishu scan-to-bind device flow (idempotent: a pending registration is not restarted). */
   async startFeishuRegister() {
     try {
@@ -172,5 +181,6 @@ markRemote(HubBotSettingsService, 'retryOutbox', {})
 markRemote(HubBotSettingsService, 'discardOutbox', {})
 markRemote(HubBotSettingsService, 'selfTest', {})
 markRemote(HubBotSettingsService, 'overview', {})
+markRemote(HubBotSettingsService, 'messageDetail', {})
 markRemote(HubBotSettingsService, 'resolveTicket', {})
 markRemote(HubBotSettingsService, 'startFeishuRegister', {})

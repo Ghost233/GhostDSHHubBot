@@ -40,7 +40,7 @@ function fixture({ botOpenId = 'ou_bot', larkOverrides = {}, chiefConfig } = {})
   }
   const source = new FeishuSource({
     store, registry, sessions,
-    config: { botOpenId },
+    config: { enabled: true, botOpenId },
     chiefConfig,
     logger: { info() {}, warn() {} },
     lark: fakeLark,
@@ -279,11 +279,14 @@ test('credentials persist with mode 0600 and reload; status reports missing/ok',
 
 test('register() runs the device flow: QR surfaced, credentials saved 0600, event-mode patch attempted (未验证)', async () => {
   const calls = { patch: [] }
+  const qr = Promise.withResolvers()
+  const complete = Promise.withResolvers()
   const { source, store, cleanup } = fixture({
     larkOverrides: {
       registerApp: async options => {
         options.onQRCodeReady({ url: 'https://accounts.feishu.cn/scan?x=1', expireIn: 300 })
-        return { client_id: 'cli_new', client_secret: 'secret_new' }
+        qr.resolve()
+        return complete.promise
       },
       client: {
         im: { message: { create: async () => ({ code: 0 }) } },
@@ -295,13 +298,105 @@ test('register() runs the device flow: QR surfaced, credentials saved 0600, even
   })
   try {
     const flow = source.register()
+    await qr.promise
+    assert.equal(source.status().qr.url, 'https://accounts.feishu.cn/scan?x=1')
+    complete.resolve({ client_id: 'cli_new', client_secret: 'secret_new' })
     const result = await flow
     assert.equal(result.appId, 'cli_new')
-    assert.equal(source.lastQr.url, 'https://accounts.feishu.cn/scan?x=1')
+    assert.equal(source.status().qr, undefined)
     assert.equal(statSync(credentialPath(store.stateDir)).mode & 0o777, 0o600)
     assert.equal(calls.patch.length, 1, 'event-subscription mode auto-config attempted once')
     assert.ok(String(calls.patch[0].url).includes('application'), 'application-config patch')
   } finally { cleanup() }
+})
+
+test('pausing Feishu closes the active socket and ignores stale callbacks', async () => {
+  const sockets = []
+  const f = fixture({ larkOverrides: {
+    WSClient: class {
+      constructor(options) { this.options = options; sockets.push(this) }
+      async start({ eventDispatcher }) { this.events = eventDispatcher.handlers }
+      close(options) { this.closed = options }
+    },
+    EventDispatcher: class { register(handlers) { this.handlers = handlers; return this } },
+  } })
+  try {
+    f.source.saveCredentials({ appId: 'fixture-app', appSecret: 'fixture-secret' })
+    const connect = f.source.connect()
+    assert.equal((await f.source.connect()).started, false)
+    await connect
+    const first = sockets[0]
+    assert.equal(f.source.status().wsState, 'connecting')
+    first.options.onReady()
+    assert.equal(f.source.status().bot.connected, true)
+    f.source.config.enabled = false
+    f.source.disconnect()
+    assert.deepEqual(first.closed, { force: true })
+    f.source.config.enabled = true
+    await f.source.connect()
+    first.options.onError(new Error('401 invalid credentials'))
+    first.options.onReconnected()
+    await first.events['im.message.receive_v1'](event())
+    assert.equal(f.calls.prompt.length, 0)
+    assert.equal(f.source.status().credentialState, 'ok')
+    assert.equal(f.source.status().wsState, 'connecting')
+    assert.equal(f.source.status().metrics.reconnects, 0)
+    sockets[1].options.onReady()
+    assert.equal(f.source.status().bot.connected, true)
+  } finally { f.source.disconnect(); f.cleanup() }
+})
+
+test('pausing Feishu aborts a scan and discards its late credentials', async () => {
+  const qr = Promise.withResolvers()
+  const late = Promise.withResolvers()
+  const f = fixture({ larkOverrides: {
+    registerApp: async options => {
+      options.onQRCodeReady({ url: 'https://example.invalid/scan', expireIn: 300 })
+      qr.resolve(options)
+      return late.promise
+    },
+  } })
+  try {
+    const registration = f.source.register()
+    const options = await qr.promise
+    assert.equal(f.source.status().registration, 'pending')
+    f.source.config.enabled = false
+    f.source.disconnect()
+    assert.equal(options.signal.aborted, true)
+    options.onQRCodeReady({ url: 'https://example.invalid/stale', expireIn: 1 })
+    late.resolve({ client_id: 'stale', client_secret: 'stale' })
+    assert.deepEqual(await registration, { cancelled: true })
+    assert.equal(f.source.status().credentialState, 'missing')
+    assert.equal(f.source.status().registration, undefined)
+    assert.equal(f.source.status().qr, undefined)
+  } finally { f.cleanup() }
+})
+
+test('pausing during a Feishu reply pass retains the remaining replies for resume', async () => {
+  const firstSend = Promise.withResolvers()
+  const release = Promise.withResolvers()
+  const sent = []
+  const f = fixture({ larkOverrides: { client: { im: { message: { create: async request => {
+    sent.push(JSON.parse(request.data.content).text)
+    if (sent.length === 1) { firstSend.resolve(); await release.promise }
+    return { code: 0 }
+  } } } } } })
+  try {
+    for (const body of ['first', 'second']) {
+      insertOutbox(f.store, { kind: 'reply', to: 'feishu:chat:fixture', body, state: 'recorded' })
+    }
+    const pass = f.source.deliverReplies()
+    await firstSend.promise
+    f.source.config.enabled = false
+    f.source.disconnect()
+    release.resolve()
+    assert.deepEqual(await pass, { delivered: 1 })
+    assert.deepEqual(sent, ['first'])
+    assert.deepEqual(await f.source.deliverReplies(), { delivered: 0 })
+    f.source.config.enabled = true
+    assert.deepEqual(await f.source.deliverReplies(), { delivered: 1 })
+    assert.deepEqual(sent, ['first', 'second'])
+  } finally { f.cleanup() }
 })
 
 test('deliverReplies sends recorded rows oldest-first (ORDER BY rowid — 收敛修漂移)', async () => {

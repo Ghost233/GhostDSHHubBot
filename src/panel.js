@@ -34,7 +34,7 @@ const SETTABLE = {
   concurrency: ['slotsPerOwner'],
   reporting: ['auto', 'intervalMs'],
   github: ['enabled', 'intervalMs', 'loginAllowlist'],
-  feishu: [],
+  feishu: ['enabled'],
   security: ['dangerousPatterns'],
   chief: ['model'],
   workspaces: ['enabled', 'chiefPath', 'chiefTitle', 'chiefWorkspaceId'],
@@ -53,15 +53,15 @@ function requireStringList(value, path) {
 }
 
 /**
- * Validates one settings patch against the whitelist, applies it onto the live resolved config, and returns
- * the storable overlay (exactly the validated patch). Unknown sections/keys and invalid values reject with
- * SettingsError and mutate nothing before the offending entry.
+ * Validates a patch and returns the storable overlay. The optional persistence callback runs before
+ * updating the shared configuration sections, so validation and persistence failures leave them intact.
  */
-export function applySettingsPatch(config, patch) {
+export function applySettingsPatch(config, patch, beforeApply) {
   if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) {
     throw new SettingsError('settings patch must be an object keyed by section')
   }
   const overlay = {}
+  const draft = {}
   for (const [section, body] of Object.entries(patch)) {
     const keys = SETTABLE[section]
     if (!keys) throw new SettingsError('hub-bot settings: unknown settings section "' + section + '"')
@@ -69,14 +69,17 @@ export function applySettingsPatch(config, patch) {
       throw new SettingsError('settings section "' + section + '" must be an object')
     }
     const applied = {}
+    draft[section] = { ...config[section] }
     for (const [key, value] of Object.entries(body)) {
       if (!keys.includes(key)) {
         throw new SettingsError('hub-bot does not know settings key "' + section + '.' + key + '"')
       }
-      applied[key] = applyOne(config, section, key, value)
+      applied[key] = applyOne(draft, section, key, value)
     }
     overlay[section] = applied
   }
+  beforeApply?.(overlay)
+  for (const [section, values] of Object.entries(overlay)) Object.assign(config[section], values)
   return overlay
 }
 
@@ -104,8 +107,8 @@ function applyOne(config, section, key, value) {
     config.reporting.intervalMs = value
     return value
   }
-  if (section === 'github' && key === 'enabled') {
-    config.github.enabled = requireBoolean(value, 'github.enabled')
+  if ((section === 'github' || section === 'feishu') && key === 'enabled') {
+    config[section].enabled = requireBoolean(value, section + '.enabled')
     return value
   }
   if (section === 'github' && key === 'intervalMs') {
@@ -248,6 +251,104 @@ export function feishuSelfTestMarker(messageId) {
   return '[hub-bot-check:' + messageId + ']'
 }
 
+
+/** Snapshot the queue for both management entry points. Recorded channel replies retry on the source tick. */
+export function buildOutboxHealth(store) {
+  const rows = store.db.prepare('SELECT value FROM outbox ORDER BY rowid').all().map(row => JSON.parse(String(row.value)))
+  const count = state => rows.filter(row => row.state === state).length
+  const problems = rows.filter(row => row.kind === 'system-problem')
+  const isRetrying = row => (row.attempts ?? 0) > 0 && (row.state === 'queued'
+    || (row.state === 'recorded' && /^(feishu|github):/.test(row.to ?? '')))
+  const delivery = row => ({
+    id: row.id, ticketId: row.ticketId ?? null, to: row.to, state: row.state, attempts: row.attempts ?? 0,
+    nextRetryAt: row.nextRetryAt ?? null, lastError: row.lastError ?? null, text: String(row.body ?? row.text ?? '').slice(0, 120),
+  })
+  return {
+    queued: count('queued'), held: count('held'), recorded: count('recorded'), failed: count('failed'), sent: count('sent'),
+    retrying: rows.filter(isRetrying).map(delivery),
+    failedList: rows.filter(row => row.state === 'failed').map(delivery),
+    systemProblems: problems.length,
+    recentProblems: problems.slice(-5).reverse().map(row => ({
+      id: row.id, ticketId: row.ticketId ?? null, body: String(row.body ?? '').slice(0, 200), at: row.createdAt ?? null,
+    })),
+  }
+}
+
+const REPLY_PRIORITY = { failed: 0, held: 1, queued: 1, recorded: 1, sent: 2 }
+const FEISHU_TEST_MARKER = /\[hub-bot-check:om_selftest-[0-9a-f]{32}\]/
+
+function storedMessage(trigger) {
+  if (typeof trigger.message === 'string') return trigger.message
+  return typeof trigger.title === 'string' ? trigger.title : null
+}
+
+function projectReply(row, limit) {
+  const text = String(row.body ?? row.text ?? '')
+  return {
+    id: row.id, state: row.state ?? 'queued', attempts: row.attempts ?? 0,
+    lastError: row.lastError ?? null, text: text.slice(0, limit),
+  }
+}
+
+/** Shared attribution for the overview and the on-demand message detail. */
+function indexMessageReplies(store, triggers, ticketTriggers) {
+  const linked = new Map()
+  const unlinkedByChat = new Map()
+  const testsByMarker = new Map()
+  function pick(index, key, row) {
+    if (!key) return
+    const previous = index.get(key)
+    const order = (REPLY_PRIORITY[row.state] ?? 3) - (REPLY_PRIORITY[previous?.state] ?? 3)
+    if (!previous || order < 0 || (order === 0 && (row.createdAt ?? '') >= (previous.createdAt ?? ''))) index.set(key, row)
+  }
+  const replies = store.db.prepare("SELECT value FROM outbox WHERE json_extract(value, '$.kind') = 'reply' ORDER BY rowid")
+  for (const raw of replies.iterate()) {
+    const row = JSON.parse(String(raw.value))
+    if (typeof row.to !== 'string') continue
+    const triggerId = row.triggerId ?? ticketTriggers.get(row.ticketId)
+    const trigger = triggers.get(triggerId)
+    if (row.to.startsWith('github:')) {
+      if (trigger) pick(linked, triggerId, row)
+      continue
+    }
+    if (!row.to.startsWith('feishu:')) continue
+    const chatId = row.to.replace(/^feishu:(chat:)?/, '')
+    const marker = String(row.body ?? row.text ?? '').match(FEISHU_TEST_MARKER)?.[0] ?? null
+    if (trigger?.kind === 'feishu' && trigger.source?.chatId === chatId) {
+      if (marker === feishuSelfTestMarker(trigger.source.messageId)) pick(linked, triggerId, row)
+    } else if (!row.triggerId && !row.ticketId) {
+      if (marker) pick(testsByMarker, chatId + ':' + marker, row)
+      else if (!unlinkedByChat.has(chatId) || (row.createdAt ?? '') >= (unlinkedByChat.get(chatId).createdAt ?? '')) unlinkedByChat.set(chatId, row)
+    }
+  }
+  return trigger => {
+    const marker = feishuSelfTestMarker(trigger.source?.messageId)
+    const chatId = trigger.source?.chatId
+    const historicalRun = marker && chatId ? testsByMarker.get(chatId + ':' + marker) : null
+    const row = linked.get(trigger.id)
+      ?? (historicalRun && (historicalRun.createdAt ?? '') >= trigger.at ? historicalRun : null)
+    const legacyReply = unlinkedByChat.get(chatId)
+    const unlinked = trigger.kind === 'feishu' && !trigger.dropped && !marker && !row
+      && Boolean(legacyReply && (legacyReply.createdAt ?? '') >= trigger.at)
+    return { row, unlinked, marker }
+  }
+}
+
+/** Read full stored text only when a user opens the message. */
+export function readMessageDetail(store, triggerId) {
+  const record = store.db.prepare('SELECT value FROM trigger WHERE id = ?').get(triggerId)
+  if (!record) return null
+  const trigger = JSON.parse(String(record.value))
+  const tickets = store.db.prepare("SELECT id FROM ticket WHERE json_extract(value, '$.triggerId') = ?").all(triggerId)
+  const ticketTriggers = new Map(tickets.map(ticket => [ticket.id, triggerId]))
+  const { row, unlinked } = indexMessageReplies(store, new Map([[triggerId, trigger]]), ticketTriggers)(trigger)
+  return {
+    id: triggerId, message: storedMessage(trigger), at: trigger.at ?? null,
+    dropped: trigger.dropped ?? null, replyUnlinked: unlinked,
+    reply: row ? { ...projectReply(row), sentAt: row.sentAt ?? null } : null,
+  }
+}
+
 /**
  * The 三问 overview (spec「观测性：独立 web 面板」):
  *  1. 什么状态 — every ticket with its stage + stageText 朗读, grouped client-side (计数 = 列表长度);
@@ -294,66 +395,25 @@ export function buildOverview({ store, registry, health, now, listDir }) {
     }
     return row
   })
-  // 最近消息流（GUI 面板「最近消息」区）: trigger 按时间倒序前 12 条，带上票面的 owner/阶段——
-  // 让「刚才飞书那句话进来没有、派给谁了、现在什么状态」一眼可查，不用翻任务流。
-  const ticketsById = new Map(tickets.map(ticket => [ticket.id, ticket]))
-  const ticketByTriggerId = new Map(tickets.filter(t => t.trigger?.id).map(t => [t.trigger.id, t]))
-  const replyPriority = { failed: 0, held: 1, queued: 1, recorded: 1, sent: 2 }
-  const linkedReplies = new Map()
-  const legacyReplies = new Map()
-  const legacyMarkers = new Map()
-  const markerPattern = /\[hub-bot-check:om_selftest-[0-9a-f]{32}\]/
-  function pickReply(index, key, row) {
-    if (!key) return
-    const prior = index.get(key)
-    const priority = replyPriority[row.state] ?? 3
-    if (!prior || priority < (replyPriority[prior.state] ?? 3)
-      || (priority === (replyPriority[prior.state] ?? 3) && (row.createdAt ?? '') >= (prior.createdAt ?? ''))) {
-      index.set(key, row)
-    }
-  }
-  for (const row of readAll('outbox')) {
-    if (row.kind !== 'reply' || typeof row.to !== 'string') continue
-    if (row.to.startsWith('github:')) {
-      const ticket = row.ticketId && ticketsById.get(row.ticketId)
-      pickReply(linkedReplies, row.triggerId ?? ticket?.trigger?.id, row)
-      continue
-    }
-    if (!row.to.startsWith('feishu:')) continue
-    const chatId = row.to.replace(/^feishu:(chat:)?/, '')
-    const ticket = row.ticketId && ticketsById.get(row.ticketId)
-    const triggerId = row.triggerId ?? ticket?.trigger?.id
-    const trigger = triggerId && triggers.get(triggerId)
-    const marker = String(row.body ?? row.text ?? '').match(markerPattern)?.[0] ?? null
-    if (trigger?.kind === 'feishu' && trigger.source?.chatId === chatId) {
-      if (marker === feishuSelfTestMarker(trigger.source.messageId)) pickReply(linkedReplies, triggerId, row)
-    } else if (!row.triggerId && !row.ticketId) {
-      if (marker) pickReply(legacyMarkers, chatId + ':' + marker, row)
-      else if (!legacyReplies.has(chatId) || (row.createdAt ?? '') >= (legacyReplies.get(chatId).createdAt ?? '')) legacyReplies.set(chatId, row)
-    }
-  }
+  const ticketTriggers = new Map(tickets.map(ticket => [ticket.id, ticket.trigger?.id]))
+  const ticketByTriggerId = new Map(tickets.filter(ticket => ticket.trigger?.id).map(ticket => [ticket.trigger.id, ticket]))
+  const replyFor = indexMessageReplies(store, triggers, ticketTriggers)
   const generatedAt = (now ?? (() => new Date().toISOString()))()
   const nowMs = Date.parse(generatedAt) || Date.now()
   function projectTrigger(trigger) {
     const ticket = ticketByTriggerId.get(trigger.id)
-    const marker = feishuSelfTestMarker(trigger.source?.messageId)
-    const chatId = trigger.source?.chatId
-    const historicalRun = marker && chatId ? legacyMarkers.get(chatId + ':' + marker) : null
-    const row = linkedReplies.get(trigger.id)
-      ?? (historicalRun && (historicalRun.createdAt ?? '') >= trigger.at ? historicalRun : null)
-    const legacyReply = chatId && legacyReplies.get(chatId)
-    const unlinked = trigger.kind === 'feishu' && !trigger.dropped && !marker && !row
-      && Boolean(legacyReply && (legacyReply.createdAt ?? '') >= trigger.at)
+    const { row, unlinked, marker } = replyFor(trigger)
+    const message = storedMessage(trigger)
     const age = nowMs - Date.parse(trigger.at ?? '')
     return {
-      id: trigger.id, kind: trigger.kind ?? null, at: trigger.at ?? null,
-      message: typeof trigger.message === 'string' ? (trigger.message.length > 160 ? trigger.message.slice(0, 160) + '…' : trigger.message) : null,
+      id: trigger.id, at: trigger.at ?? null,
+      kind: trigger.kind === 'github-dropped' || trigger.authorization?.source === 'github' ? 'github' : trigger.kind ?? null,
+      message: message?.length > 160 ? message.slice(0, 160) + '…' : message,
       dropped: trigger.dropped ?? null,
       injectedAt: trigger.injectedAt ?? null,
       ticketId: ticket?.id ?? null, ownerLabel: ticket?.ownerLabel ?? null,
       stage: ticket?.stage ?? null, stageText: ticket?.stageText ?? null,
-      reply: row ? { state: row.state ?? 'queued', id: row.id, attempts: row.attempts ?? 0,
-        lastError: row.lastError ?? null, text: String(row.body ?? row.text ?? '').slice(0, 120) } : null,
+      reply: row ? projectReply(row, 120) : null,
       replyUnlinked: unlinked,
       unprocessed: !trigger.dropped && !marker && !ticket && !row && age > 5 * 60_000
         && (!unlinked || Object.hasOwn(trigger, 'injectedAt')),
