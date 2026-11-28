@@ -561,10 +561,31 @@ export class Router {
     try { this.onTicketTerminal?.(ticketId) } catch { /* 回收失败不阻断任务完成 — sweep 兜底 */ }
   }
 
+  /** S01 结案判定：票已走到终态（done/failed）—— 终态票绝不再注入，也不再被旧快照改写。 */
+  #isTerminalTicket(ticket) {
+    return ticket !== undefined && (ticket.stage === 'done' || ticket.stage === 'failed')
+  }
+
+  /**
+   * S01 元数据合并（快照竞态的唯一安全写法）：先读库里最新的票面，再把 patch 合上去写回。
+   * 绝不拿 await 之前的旧快照整行覆盖 —— 旧快照会把已经结案（done/failed）的票「复活」成 working，
+   * 也会抹掉等待期间新增的审计历史（transitions / lastDelivery / confirmOutcome / failed / targetSession）。
+   * 票已不存在时返回 undefined（不凭空新建行）。
+   */
+  #mergeTicket(ticketId, patch) {
+    const latest = this.tasks.getTicket(ticketId)
+    if (latest === undefined) return undefined
+    return this.#updateTicket({ ...latest, ...patch, updatedAt: this.now() })
+  }
+
   /**
    * The runner's deliverer. kind 'inject' prompts the owner Session (rebuilding it once when the registry's
    * pointer dangles) and flips idle → working (待触发 → 进行中）. Reply/escalation rows are recorded durable
    * intents until a real channel deliverer (Feishu) lands — storing them already satisfies 先存后做.
+   *
+   * S01 取消/失败竞态： 行是「先存后做」入库的，投递前它可能在库里已经等了一段时间。票面在每一个 await
+   * 边界都重新读一次权威值：已结案（done/failed，取消也走 done）就安静跳过 —— 不注入、不抛错（这不是
+   * 投递故障，不需要重试或系统告警），行由 runner 记成终态，票面与审计历史原样保留。
    */
   async #deliverRow(row) {
     if (row.kind === 'digest') return this.#deliverDigest(row)
@@ -573,6 +594,8 @@ export class Router {
     const ticket = this.tasks.getTicket(row.ticketId)
     const permanent = (message) => { const error = new Error(message); error.permanent = true; return error }
     if (!ticket) throw permanent('outbox ' + row.id + ': ticket ' + row.ticketId + ' is gone')
+    // S01：入队之后票可能已被取消/失败/关闭 —— 结案的票一次都不许注入（也不算投递成功，记 recorded）。
+    if (this.#isTerminalTicket(ticket)) return { recorded: true, skipped: 'ticket-terminal' }
     // 缺上下文升级不编造： no authorization record → fail the ticket, never execute on a guess.
     if (!ticket.authorization) {
       try {
@@ -584,35 +607,55 @@ export class Router {
     const owner = this.registry.get(ticket.owner)
     if (!owner) throw permanent('ticket ' + ticket.id + ': owner ' + ticket.owner + ' is gone from the registry')
     const ensured = await this.#ensureSession(owner)
+    // S01： #ensureSession 是异步的（可能真的新建了一个 Session）。等它回来时票可能已经结案 —— 以库里
+    // 当前的票面为准再判一次，结案就安静跳过：不注入、不抛错、不改票面。
+    const latest = this.tasks.getTicket(ticket.id)
+    if (latest === undefined) throw permanent('outbox ' + row.id + ': ticket ' + row.ticketId + ' is gone')
+    if (this.#isTerminalTicket(latest)) return { recorded: true, skipped: 'ticket-terminal' }
     // 重启恢复 (same discipline as follow-ups): a row stored BEFORE a crash carries no recovery note in its
     // body — prepend it at redelivery time, and clear the flag only after the prompt actually lands (a
     // failed attempt keeps the flag so the next retry still carries the note — 恰好一次 = delivered once).
-    const needsNote = ticket.recoveryPending === true
+    const needsNote = latest.recoveryPending === true
     const body = needsNote ? RECOVERY_NOTE + '\n\n' + row.body : row.body
-    const delivered = await this.#promptOwner(owner.id, ensured, ticket, row.requestId, body)
+    const delivered = await this.#promptOwner(owner.id, ensured, ticket.id, row.requestId, body)
+    if (!delivered) return { recorded: true, skipped: 'ticket-terminal' }
+    // The host admitted the prompt even if the ticket closed while admission was pending.
+    const settled = this.tasks.getTicket(ticket.id)
+    if (!settled || this.#isTerminalTicket(settled)) return
     if (needsNote) this.tasks.noteRecoveryCarried(ticket.id)
-    const updated = this.tasks.markDelivered(ticket.id) // 待触发 → 进行中 (no-op for later injections)
-    this.#updateTicket({ ...updated, targetSession: delivered.sessionId, lastDelivery: { state: 'sent', rebuilt: delivered.rebuilt, at: this.now() }, updatedAt: this.now() })
+    this.tasks.markDelivered(ticket.id)
+    this.#mergeTicket(ticket.id, {
+      targetSession: delivered.sessionId,
+      lastDelivery: { state: 'sent', rebuilt: delivered.rebuilt, at: this.now() },
+    })
   }
 
-  /**
-   * Admits one prompt to the owner Session, rebuilding the Session once when the registry's pointer dangles
-   * (deleted Session) and retargeting the Ticket at the replacement. Shared by first routing and follow-ups.
-   * ticket may be null (chief-bound digest/reply rows carry no ticket — nothing to retarget).
-   */
-  async #promptOwner(ownerId, ensured, ticket, requestId, text) {
-    let sessionId = ensured.sessionId
+  /** Admit a prompt, retrying a missing binding only while the originating ticket is active. */
+  async #promptOwner(ownerId, ensured, ticketId, requestId, text) {
+    const sessionId = ensured.sessionId
+    const ticketClosed = () => {
+      if (ticketId === null) return false
+      const latest = this.tasks.getTicket(ticketId)
+      return !latest || this.#isTerminalTicket(latest)
+    }
     try {
       await this.sessions.prompt({ sessionId, requestId, text })
       return { sessionId, rebuilt: false }
     } catch (error) {
+      if (ticketClosed()) return null
       if (!isMissingSession(error)) throw error
-      this.registry.markSessionMissing(ownerId)
-      const replacement = await this.#ensureSession(this.registry.get(ownerId))
-      sessionId = replacement.sessionId
-      if (ticket) this.#updateTicket({ ...ticket, targetSession: sessionId, updatedAt: this.now() })
-      await this.sessions.prompt({ sessionId, requestId, text })
-      return { sessionId, rebuilt: true }
+    }
+    const current = this.registry.get(ownerId)
+    if (!current) throw new RouterError('unknown-owner', 'owner ' + ownerId + ' is no longer registered')
+    if (current.sessionId === sessionId) this.registry.markSessionMissing(ownerId)
+    const replacement = await this.#ensureSession(this.registry.get(ownerId))
+    if (ticketClosed()) return null
+    try {
+      await this.sessions.prompt({ sessionId: replacement.sessionId, requestId, text })
+      return { sessionId: replacement.sessionId, rebuilt: replacement.sessionId !== sessionId }
+    } catch (error) {
+      if (ticketClosed()) return null
+      throw error
     }
   }
 

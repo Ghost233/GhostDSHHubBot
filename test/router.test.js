@@ -546,3 +546,215 @@ test('restart auto-resume respects execution slots: the overflow demotes to queu
     assert.equal(router.getTicket(b.ticketId).recoveryPending, undefined)
   } finally { cleanup() }
 })
+
+// ---------- S01 (#32 stage01-reliability): 取消/失败与投递竞态 ----------
+
+/**
+ * S01 (#32 stage01-reliability) 取消后仍在排队的重试行 / a cancelled ticket's still-queued retry row.
+ * 先存后做 stores the injection row BEFORE delivery, so a transient failure leaves a 'queued' row with a 2s
+ * backoff. If a human cancels the ticket while that retry is pending, the retry must NOT inject: the ticket
+ * face (票面权威) is 'done', and the row must land terminal instead of staying queued forever. The same
+ * verdict must hold after a restart: a fresh Router over the same store re-scans 'queued' rows and must
+ * reach the same conclusion. Deferred promises only (no timers), nothing asserted before the awaits settle.
+ */
+test('S01 regression: a cancelled ticket is never injected again by its queued retry row, not even after a restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-router-'))
+  const store = new Store(dir)
+  const registry = new OwnerRegistry(store, { scratchRoot: join(dir, 'scratch') })
+  registry.ensureChief({ cwd: '/Volumes/home', workspace: 'Ghost233HomeRepo' })
+  const owner = registry.create({ kind: 'repo', workspace: 'W', cwd: '/w' })
+  registry.bindSession(owner.id, 'session-live')
+  let nowMs = Date.parse('2026-11-15T00:00:00.000Z')
+  const clock = () => new Date(nowMs).toISOString()
+  let prompts = 0
+  const router = new Router({ store, registry, now: clock, sessions: {
+    create: async () => { throw new Error('must not be called') },
+    prompt: async () => { prompts++; const error = new Error('provider overloaded'); error.name = 'RemoteError'; throw error },
+  } })
+  try {
+    const receipt = await router.routeToOwner({ ownerId: owner.id, message: '一个会被取消的活' })
+    assert.equal(receipt.stage, 'idle', '首次投递失败 → 票停在待触发（先存后做）')
+    const row = router.listOutbox().find(r => r.ticketId === receipt.ticketId)
+    assert.equal(row.state, 'queued', '重试仍在 queued 等 2s 退避')
+    // 人在退避期间取消任务：票面走到终态 done
+    router.tasks.cancel(receipt.ticketId, { by: 'user', reason: '人取消了这个任务' })
+    assert.equal(router.getTicket(receipt.ticketId).stage, 'done', '前置条件：退避期间票被取消')
+    // 退避到期后的下一轮 tick：绝不注入（也不抛错），行落终态而不是永远排队
+    nowMs += 2000
+    await router.tick()
+    assert.equal(prompts, 1, '取消后到期的那次重试不得再注入（票面权威）')
+    assert.notEqual(router.listOutbox().find(r => r.id === row.id).state, 'queued', '被跳过的行必须落终态，不得永远 queued')
+    const cancelled = router.getTicket(receipt.ticketId)
+    assert.equal(cancelled.stage, 'done', '票面仍是 done（旧快照没有复活它）')
+    assert.ok((cancelled.transitions ?? []).some(t => t.to === 'done'), '取消这一步留在审计历史里')
+    // 重启/重载：同一 store 上的一台新 Router 重新扫描存行 —— 结论必须一样
+    const restartPrompts = []
+    const restarted = new Router({ store, registry, now: clock, sessions: {
+      create: async () => { throw new Error('must not be called') },
+      prompt: async request => { restartPrompts.push(request); return { accepted: true } },
+    } })
+    restarted.runner.enqueue({ ticketId: receipt.ticketId, kind: 'inject', to: 'session:session-live', body: '重启后才被扫到的旧存行', requestId: 'req-s01-restart' })
+    await restarted.tick()
+    assert.equal(restartPrompts.length, 0, '重启后重新扫描也不得给已取消的票注入')
+    assert.equal(restarted.getTicket(receipt.ticketId).stage, 'done', '重启后票面仍是 done')
+    assert.notEqual(restarted.listOutbox().find(r => r.requestId === 'req-s01-restart').state, 'queued', '重启后跳过的行同样落终态')
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+/**
+ * S01 (#32 stage01-reliability) 重建 Session 期间被取消 / cancelled while an awaited Session rebuild is in
+ * flight. The delivery sits inside `await sessions.create(...)` (the owner Session was deleted, so the first
+ * prompt failed and the router is rebuilding it) and the human cancels the ticket during that await. The stale
+ * snapshot taken BEFORE the await must not be written back: the ticket stays done, the rebuild is never
+ * injected a second time, and the stored row lands terminal instead of staying queued. The deferred rebuild
+ * gate is released BEFORE any assertion so a red run fails on a count, never hangs.
+ */
+test('S01 regression: a cancel during an awaited Session rebuild is honoured once and the terminal stage is kept', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-router-'))
+  const store = new Store(dir)
+  const registry = new OwnerRegistry(store, { scratchRoot: join(dir, 'scratch') })
+  registry.ensureChief({ cwd: '/Volumes/home', workspace: 'Ghost233HomeRepo' })
+  const owner = registry.create({ kind: 'repo', workspace: 'W', cwd: '/w' })
+  registry.bindSession(owner.id, 'session-live')
+  let nowMs = Date.parse('2026-11-15T00:00:00.000Z')
+  let prompts = 0
+  let creates = 0
+  let releaseRebuild
+  const rebuildGate = new Promise(resolve => { releaseRebuild = resolve })
+  let markRebuildStarted
+  const rebuildStarted = new Promise(resolve => { markRebuildStarted = resolve })
+  const router = new Router({ store, registry, now: () => new Date(nowMs).toISOString(), sessions: {
+    create: async () => { creates++; markRebuildStarted(); await rebuildGate; return { sessionId: 'session-rebuilt' } },
+    prompt: async request => {
+      prompts++
+      if (request.sessionId === 'session-live') {
+        const error = new Error('session ' + request.sessionId + ' is absent from persistence')
+        error.name = 'ApiSessionNotFound'
+        throw error
+      }
+      return { accepted: true }
+    },
+  } })
+  try {
+    const routing = router.routeToOwner({ ownerId: owner.id, message: '会话被删了要重建' })
+    await rebuildStarted // 投递已进入「重建 Session」的 await（纯 promise 同步点，无定时器）
+    const ticketId = router.queryTasks({})[0].id
+    router.tasks.cancel(ticketId, { by: 'user', reason: '重建在途时人取消了' })
+    assert.equal(router.getTicket(ticketId).stage, 'done', '前置条件：重建在途时票被取消')
+    releaseRebuild() // 先放行再断言：红灯只会挂在计数上，绝不卡死
+    const receipt = await routing
+    assert.equal(receipt.stage, 'done', '收据朗读票面真实状态（取消就是 done，不假装送达）')
+    assert.equal(creates, 1, '只重建一次 Session')
+    assert.equal(prompts, 1, '重建之后绝不再注入第二次（一次投递决定）')
+    const settled = router.getTicket(ticketId)
+    assert.equal(settled.stage, 'done', '旧快照不得把已取消的票复活成 working/idle')
+    assert.ok((settled.transitions ?? []).some(t => t.to === 'done'), '取消的审计记录保留')
+    assert.equal(settled.lastDelivery, undefined, '没注入就不许记 lastDelivery（不假装送达 #64）')
+    assert.notEqual(router.listOutbox().find(r => r.ticketId === ticketId).state, 'queued', '被跳过的存行必须落终态，不得永远 queued')
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+/**
+ * S01 (#32 stage01-reliability) 重建期间上游失败 / a failure recorded while the awaited rebuild is in
+ * flight. The ticket face becomes 'failed' (with its reason and audit trail) before the deliverer's stale
+ * pre-await snapshot would be merged back. A metadata-only merge must never resurrect the terminal stage nor
+ * erase the recorded history (transitions / failed / authorization / trigger binding) — and the ticket must
+ * not be injected afterwards. The rebuild gate is released BEFORE any assertion (red fails on a count).
+ */
+test('S01 regression: an old delivery snapshot cannot resurrect a failed ticket nor erase its recorded history', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-router-'))
+  const store = new Store(dir)
+  const registry = new OwnerRegistry(store, { scratchRoot: join(dir, 'scratch') })
+  registry.ensureChief({ cwd: '/Volumes/home', workspace: 'Ghost233HomeRepo' })
+  const owner = registry.create({ kind: 'repo', workspace: 'W', cwd: '/w' })
+  registry.bindSession(owner.id, 'session-live')
+  let nowMs = Date.parse('2026-11-15T00:00:00.000Z')
+  let prompts = 0
+  let creates = 0
+  let releaseRebuild
+  const rebuildGate = new Promise(resolve => { releaseRebuild = resolve })
+  let markRebuildStarted
+  const rebuildStarted = new Promise(resolve => { markRebuildStarted = resolve })
+  const router = new Router({ store, registry, now: () => new Date(nowMs).toISOString(), sessions: {
+    create: async () => { creates++; markRebuildStarted(); await rebuildGate; return { sessionId: 'session-rebuilt' } },
+    prompt: async request => {
+      prompts++
+      if (request.sessionId === 'session-live') {
+        const error = new Error('session ' + request.sessionId + ' is absent from persistence')
+        error.name = 'ApiSessionNotFound'
+        throw error
+      }
+      return { accepted: true }
+    },
+  } })
+  try {
+    const routing = router.routeToOwner({ ownerId: owner.id, message: '重建在途时会失败的活' })
+    await rebuildStarted // 投递已进入「重建 Session」的 await
+    const ticketId = router.queryTasks({})[0].id
+    const before = router.getTicket(ticketId)
+    router.tasks.fail({ ticketId, reason: '上游执行失败（票面权威）' })
+    assert.equal(router.getTicket(ticketId).stage, 'failed', '前置条件：重建在途时票面失败')
+    releaseRebuild() // 先放行再断言：红灯只会挂在计数上，绝不卡死
+    const receipt = await routing
+    assert.equal(receipt.stage, 'failed', '收据朗读票面真实状态（失败就是 failed，不假装送达）')
+    assert.equal(creates, 1, '只重建一次 Session')
+    assert.equal(prompts, 1, '重建之后绝不再注入（失败是终态）')
+    const settled = router.getTicket(ticketId)
+    assert.equal(settled.stage, 'failed', '旧快照不得把失败的票复活成 idle/working')
+    assert.equal(settled.failed?.reason, '上游执行失败（票面权威）', '失败原因（审计历史）原样保留')
+    assert.ok((settled.transitions ?? []).some(t => t.to === 'failed'), '失败这一步留在审计历史里')
+    assert.deepEqual(settled.authorization, before.authorization, '授权记录不因元数据合并而丢失')
+    assert.equal(settled.triggerId, before.triggerId, '触发绑定不因元数据合并而丢失')
+    assert.equal(settled.createdAt, before.createdAt, '创建时间不因元数据合并而改写')
+    assert.equal(settled.lastDelivery, undefined, '没注入就不许记 lastDelivery（不假装送达 #64）')
+    assert.notEqual(router.listOutbox().find(r => r.ticketId === ticketId).state, 'queued', '被跳过的存行必须落终态，不得永远 queued')
+    // 之后再 tick 也不得给这张终态票补注入
+    await router.tick()
+    assert.equal(prompts, 1, '失败终态票在后续 tick 中同样不得被注入')
+    assert.equal(router.getTicket(ticketId).stage, 'failed', '后续 tick 也不得复活终态票')
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+for (const outcome of ['accepted', 'missing']) {
+  test('S01 records the ' + outcome + ' initial prompt accurately after cancellation', { timeout: 2500 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hub-bot-s01-in-flight-'))
+    const store = new Store(dir)
+    const registry = new OwnerRegistry(store, { scratchRoot: join(dir, 'scratch') })
+    const owner = registry.create({ kind: 'repo', workspace: 'Fixture', cwd: dir })
+    registry.bindSession(owner.id, 'existing-owner')
+    const started = Promise.withResolvers()
+    const settle = Promise.withResolvers()
+    let creates = 0
+    const sessions = {
+      create: async () => { creates++; return { sessionId: 'replacement-owner' } },
+      prompt: async () => {
+        started.resolve()
+        await settle.promise
+        if (outcome === 'missing') {
+          throw Object.assign(new Error('fixture source session not found'), { name: 'ApiSessionNotFound' })
+        }
+        return { accepted: true }
+      },
+    }
+    const router = new Router({ store, registry, sessions })
+    try {
+      const request = router.routeToOwner({ ownerId: owner.id, message: 'fixture work' })
+      await started.promise
+      const row = router.listOutbox().find(entry => entry.kind === 'inject')
+      const cancelled = router.tasks.cancel(row.ticketId, { by: 'user', reason: 'fixture cancellation' })
+      settle.resolve()
+      await request
+      const saved = router.listOutbox().find(entry => entry.id === row.id)
+      const ticket = router.getTicket(row.ticketId)
+      assert.equal(ticket.stage, 'done')
+      assert.deepEqual(ticket.transitions, cancelled.transitions)
+      assert.equal(creates, 0)
+      assert.equal(saved.state, outcome === 'accepted' ? 'sent' : 'recorded')
+      if (outcome === 'missing') assert.equal(saved.skipReason, 'ticket-terminal')
+    } finally {
+      settle.resolve()
+      store.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}

@@ -376,3 +376,37 @@ test('discardOutboxRows removes only failed rows and returns the count (round 41
     assert.equal(discardOutboxRows(store, ['out-missing', rows[2].id]), 0)
   } finally { cleanup() }
 })
+
+/**
+ * S01 (#32 stage01-reliability) 重叠 tick 不得重复投递同一行 / an overlapping tick must not re-enter the
+ * deliverer for the same row: the 1s OutboxRunner tick is not awaited by its caller, and a real delivery
+ * (gh api / feishu im / a DSH inject) routinely outlasts one tick. While that first delivery is still in
+ * flight the row is still state 'queued' in the store — the row only flips to 'sent' after the deliverer
+ * returns — so the next overlapping tick re-scans it and enters the deliverer a SECOND time for the same
+ * row. One queued row must be delivered exactly once across overlapping ticks. Deferred promise only:
+ * no timers, and the gate is released BEFORE any assertion so a red run fails on the count, never hangs.
+ */
+test('S01 regression: an overlapping tick never re-enters the deliverer for the same queued row', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-outbox-'))
+  const store = new Store(dir)
+  try {
+    const entries = []
+    let releaseDelivery
+    const deliveryGate = new Promise((resolve) => { releaseDelivery = resolve })
+    const deliver = async (row) => {
+      entries.push(row.id)
+      await deliveryGate // 第一次投递一直挂着——模拟真实发送慢于一个 tick 间隔
+    }
+    const runner = new OutboxRunner({ store, deliver, now: () => 1_000_000 })
+    const row = runner.enqueue({ ticketId: 'tsk-s01', kind: 'inject', to: 'session-x', body: 'once only', requestId: 'req-s01' })
+    const firstTick = runner.tick() // 不 await：第一轮投递还在飞
+    await Promise.resolve() // 一个微任务冲刷，确保第一轮已进入投递器
+    assert.equal(entries.length, 1, '第一轮 tick 已经进入投递器（前置条件）')
+    const secondTick = runner.tick() // 重叠 tick：此时该行在 store 里仍是 state 'queued'
+    releaseDelivery() // 先放行再断言：红灯只会挂在计数上，绝不会卡死
+    await Promise.all([firstTick, secondTick])
+    assert.equal(entries.length, 1, '同一 queued 行在重叠 tick 下只投递一次（不得重复送达）')
+    const stored = JSON.parse(String(store.db.prepare('SELECT value FROM outbox WHERE id = ?').get(row.id).value))
+    assert.equal(stored.state, 'sent', '投递成功后该行落为 sent')
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
+})
