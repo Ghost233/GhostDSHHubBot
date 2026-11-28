@@ -406,3 +406,14 @@ test('create_session refuses a displaced owner after directory lookup', { timeou
     assert.equal(h.creates.length, 0)
   } finally { directory.resolve(f.owner.cwd); f.cleanup() }
 })
+
+test('create_session validates the normalized absolute worker directory', async () => {
+  const f = fixture()
+  try {
+    const h = ownerToolsHarness(f)
+    const tool = h.tools.get('create_session')
+    const adjacentDirectory = f.owner.cwd + '/sandbox/../../another-project'
+    await assert.rejects(tool.execute({ cwd: adjacentDirectory }, h.exec), /outside this/)
+    assert.equal(h.creates.length, 0)
+  } finally { f.cleanup() }
+})
