@@ -9,10 +9,15 @@
 <body>
 <header class="topbar">
   <h1>hub-bot</h1>
-  <nav class="tabs" role="tablist">
-    <button class="tab is-active" data-tab="board" role="tab">三问</button>
-    <button class="tab" data-tab="settings" role="tab">设置</button>
+  <nav id="navigation" class="tabs" aria-label="Hub Bot 导航" hidden>
+    <a class="tab" href="#board" data-page="board">总览</a>
+    <a class="tab" href="#owner-workspace" data-page="owner-workspace">负责人</a>
+    <a class="tab" href="#timers-page" data-page="timers-page">提醒</a>
+    <a class="tab" href="#run-history" data-page="run-history">运行记录</a>
+    <a class="tab" href="#connections" data-page="connections">连接</a>
+    <a class="tab" href="#settings" data-page="settings">设置</a>
   </nav>
+  <a id="connection-status" class="connection-status" href="#connections" hidden></a>
   <span id="refreshed" class="refreshed" title="上次刷新时间"></span>
 </header>
 
@@ -26,21 +31,132 @@
     <p id="token-error" class="error" hidden></p>
   </section>
 
-  <section id="board" class="page" hidden>
+  <div id="load-state" class="load-state" hidden>
+    <p id="load-message" role="status"></p>
+    <button id="retry-load" class="btn" type="button" hidden>重试</button>
+  </div>
+
+  <section id="board" class="page" aria-labelledby="board-title" hidden>
+    <h2 id="board-title" class="page-title">工作总览</h2>
     <div id="health" class="health" hidden></div>
-    <h2 class="q">有需要我的吗？</h2>
-    <div id="needs-me" class="cards"></div>
-    <h2 class="q">什么状态？</h2>
-    <div id="by-stage" class="groups"></div>
-    <h2 class="q">结果在哪？</h2>
-    <div id="outcomes" class="cards"></div>
-    <h2 class="q">谁在干活？</h2>
-    <div id="owners" class="cards"></div>
-    <h2 class="q">最近听到了什么？</h2>
-    <div id="triggers" class="cards"></div>
+    <div class="overview-layout">
+      <div class="overview-work">
+        <section class="overview-card" aria-labelledby="needs-title">
+          <h3 id="needs-title" class="q">需要您处理</h3>
+          <div id="needs-me" class="cards"></div>
+        </section>
+        <section class="overview-card" aria-labelledby="progress-title">
+          <h3 id="progress-title" class="q">工作进展</h3>
+          <div id="by-stage" class="groups"></div>
+        </section>
+        <section class="overview-card" aria-labelledby="results-title">
+          <h3 id="results-title" class="q">结果</h3>
+          <div id="outcomes" class="cards"></div>
+        </section>
+        <details id="ticket-history" class="overview-card">
+          <summary>任务历史</summary>
+          <div id="history-tickets" class="groups"></div>
+        </details>
+      </div>
+      <aside class="overview-side">
+        <section class="overview-card" aria-labelledby="owners-title">
+          <h3 id="owners-title" class="q">负责人</h3>
+          <div id="owners" class="cards"></div>
+        </section>
+        <section class="overview-card" aria-labelledby="next-wake-title">
+          <h3 id="next-wake-title" class="q">下次唤醒</h3>
+          <div id="next-wake"></div>
+        </section>
+        <section class="overview-card" aria-labelledby="recent-title">
+          <h3 id="recent-title" class="q">最近触发</h3>
+          <div id="triggers" class="cards"></div>
+        </section>
+        <section class="overview-card" aria-labelledby="intake-title">
+          <h3 class="q" id="intake-title" hidden>投喂口径（只读）</h3>
+          <div id="intake" class="cards"></div>
+        </section>
+      </aside>
+    </div>
   </section>
 
-  <section id="settings" class="page" hidden></section>
+  <section id="owner-workspace" class="page" aria-labelledby="workspace-title" hidden>
+    <div class="workspace-toolbar">
+      <h2 id="workspace-title" class="page-title">负责人工作区</h2>
+      <label for="workspace-select">负责人</label>
+      <select id="workspace-select"></select>
+    </div>
+    <div id="workspace-status" class="load-state"></div>
+    <div id="workspace-content" hidden>
+      <section class="overview-card workspace-session" aria-labelledby="workspace-session-title">
+        <h3 id="workspace-session-title" class="q">负责人会话</h3>
+        <div id="workspace-session"></div>
+      </section>
+      <div class="overview-layout">
+        <div id="workspace-work" class="overview-work">
+          <section class="overview-card" aria-labelledby="workspace-needs-title">
+            <h3 id="workspace-needs-title" class="q">需要您处理</h3>
+            <div id="workspace-needs" class="cards"></div>
+          </section>
+          <section class="overview-card" aria-labelledby="workspace-progress-title">
+            <h3 id="workspace-progress-title" class="q">工作进展</h3>
+            <div id="workspace-progress" class="groups"></div>
+          </section>
+          <section class="overview-card" aria-labelledby="workspace-results-title">
+            <h3 id="workspace-results-title" class="q">结果</h3>
+            <div id="workspace-results" class="cards"></div>
+          </section>
+          <details id="workspace-ticket-history" class="overview-card">
+            <summary>任务历史</summary>
+            <div id="workspace-history-tickets" class="groups"></div>
+          </details>
+        </div>
+        <aside class="overview-side">
+          <section class="overview-card" aria-labelledby="workspace-timers-title">
+            <h3 id="workspace-timers-title" class="q">提醒</h3>
+            <div id="workspace-timers" class="cards"></div>
+          </section>
+          <section class="overview-card" aria-labelledby="workspace-runs-title">
+            <h3 id="workspace-runs-title" class="q">后台运行记录</h3>
+            <div id="workspace-runs" class="cards" aria-live="polite"></div>
+          </section>
+        </aside>
+      </div>
+    </div>
+  </section>
+
+  <section id="timers-page" class="page" aria-labelledby="timers-title" hidden>
+    <h2 class="page-title" id="timers-title">提醒</h2>
+    <div id="timers" class="cards"></div>
+  </section>
+
+  <section id="run-history" class="page" aria-labelledby="runs-title" hidden>
+    <h2 id="runs-title" class="page-title">后台运行记录</h2>
+    <div class="run-filters">
+      <label>通知状态 <select id="run-status">
+        <option value="">全部</option><option value="silent">未通知</option><option value="waiting">待发送或汇总</option>
+        <option value="sent">发送成功</option><option value="failed">发送失败</option><option value="in-progress">无发送记录</option>
+      </select></label>
+      <label>来源 <select id="run-source">
+        <option value="">全部</option><option value="github">GitHub</option><option value="timer">提醒</option>
+      </select></label>
+      <button id="run-refresh" class="btn" type="button">刷新运行记录</button>
+    </div>
+    <form id="notification-form" class="run-filters">
+      <label>通知编号 <input id="notification-id" type="text" required autocomplete="off" maxlength="200"></label>
+      <button class="btn" type="submit">查找通知</button>
+    </form>
+    <div id="notification-index" aria-live="polite"></div>
+    <div id="run-list" class="cards" aria-live="polite"></div>
+  </section>
+
+  <section id="connections" class="page" aria-labelledby="connections-title" hidden>
+    <h2 id="connections-title" class="page-title">连接</h2>
+    <div id="connection-content"></div>
+  </section>
+  <section id="settings" class="page" aria-labelledby="settings-title" hidden>
+    <h2 id="settings-title" class="page-title">设置</h2>
+    <div id="settings-content"></div>
+  </section>
 </main>
 
 <script src="/hub-bot/panel/vendor/qrcode.cjs"></script>

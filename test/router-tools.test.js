@@ -15,6 +15,7 @@ function fixture() {
     config: { homeRepo: '/tmp/home-repo' },
     registry: {
       list: () => [],
+      findByCurrentSession: id => id === 'chief-fixture' ? { id: 'chief' } : undefined,
       create: o => ({ id: 'scr-stub', kind: o.kind, status: 'created', cwd: o.cwd ?? '/tmp/scratch-stub' }),
     },
     router: {
@@ -37,11 +38,12 @@ test('#74 P1-B: reply_source output schema declares every property execute retur
   const { registered } = fixture()
   const tool = registered.get('reply_source')
   assert.ok(tool, 'reply_source is registered')
+  await assert.rejects(tool.execute({ text: 'fixture' }, { agent: { id: 'unbound-replacement' } }), /current chief/)
   const declared = new Set(Object.keys(tool.output.schema.properties))
   assert.ok(declared.has('truncated'), 'router.replySource returns truncated — the output schema must declare it')
 
   for (const text of ['短答复', '长'.repeat(200)]) {
-    const value = await tool.execute({ text })
+    const value = await tool.execute({ text }, { agent: { id: 'chief-fixture' } })
     for (const key of Object.keys(value)) {
       assert.ok(declared.has(key),
         'execute returns "' + key + '" but the output schema does not declare it (additionalProperties:false → every call errors model-side)')

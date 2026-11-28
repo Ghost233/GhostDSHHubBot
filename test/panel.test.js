@@ -5,18 +5,22 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync, statSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, statSync, openSync, closeSync, readFileSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Store } from '../src/store.js'
 import { insertOutbox } from '../src/outbox.js'
 import { OwnerRegistry } from '../src/registry.js'
+import { OwnerSwitch } from '../src/owner-switch.js'
+import { buildOwnerFacts, formatOwnerFacts } from '../src/owner-facts.js'
+import { TimerService } from '../src/timers.js'
 import { Router } from '../src/router.js'
 import { resolveConfig } from '../src/config.js'
 import {
   SETTINGS_FILE, SettingsError,
   applySettingsPatch, applySettingsOverlay, loadSettingsOverlay, saveSettingsOverlay, mergeSettingsOverlay,
-  buildSettingsView, buildOverview, buildOutboxHealth, readMessageDetail,
+  buildSettingsView, buildOverview, buildOutboxHealth, readMessageDetail, readTicketDetail, buildIntakePolicy,
+  readOwnerWorkspace,
 } from '../src/panel.js'
 
 /** A fully resolved config with feishu/github sections on — the shape the panel mutates. */
@@ -41,7 +45,11 @@ function fixture() {
     prompt: async () => ({ accepted: true }),
   }
   const router = new Router({ store, registry, sessions, now: () => new Date(nowMs).toISOString() })
-  return { router, registry, store, cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }) } }
+  return {
+    router, registry, store,
+    advance: milliseconds => { nowMs += milliseconds },
+    cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }) },
+  }
 }
 
 test('settings patch applies whitelisted keys live and returns the storable overlay', () => {
@@ -211,6 +219,229 @@ test('overview answers the three questions from ticket faces: state / doing / ou
   }
 })
 
+test('Overview shows answers, confirmations, reviews, and attention before work in stable order', async () => {
+  const { router, registry, store, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Overview', cwd: '/repos/Overview' })
+    const first = await router.routeToOwner({ ownerId: owner.id, message: 'Started first' })
+    const queued = await router.routeToOwner({ ownerId: owner.id, message: 'Waiting for a slot' })
+    router.tasks.demote(queued.ticketId)
+    const review = await router.routeToOwner({ ownerId: owner.id, message: 'Ready for review' })
+    router.tasks.report({ ticketId: review.ticketId, summary: 'Ready' })
+    const confirm = await router.routeToOwner({ ownerId: owner.id, message: 'Needs confirmation' })
+    router.tasks.askConfirm({ ticketId: confirm.ticketId, question: 'Proceed?' })
+    const answer = await router.routeToOwner({ ownerId: owner.id, message: 'Needs an answer' })
+    router.tasks.ask({ ticketId: answer.ticketId, question: 'Which file?' })
+    const nextAnswer = await router.routeToOwner({ ownerId: owner.id, message: 'Needs another answer' })
+    router.tasks.ask({ ticketId: nextAnswer.ticketId, question: 'Which branch?' })
+    const attention = await router.routeToOwner({ ownerId: owner.id, message: 'Needs attention' })
+    router.tasks.fail({ ticketId: attention.ticketId, reason: 'Test failure' })
+
+    const overview = buildOverview({ store, registry, compact: true })
+    assert.deepEqual(overview.tickets.map(ticket => ticket.id), [
+      answer.ticketId, nextAnswer.ticketId, confirm.ticketId, review.ticketId, attention.ticketId, first.ticketId, queued.ticketId,
+    ])
+  } finally {
+    cleanup()
+  }
+})
+
+test('large Overview history keeps report previews and opens one full result on demand', async () => {
+  const { router, registry, store, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Results', cwd: '/repos/Results' })
+    const result = await router.routeToOwner({ ownerId: owner.id, message: 'Build the result' })
+    registry.bindSession(owner.id, 'session-current-owner')
+    const evidence = ('Verification log: ' + 'full result and artifacts. '.repeat(250)).trimEnd()
+    const report = { summary: 'Ready for review', evidence,
+      sections: { result: 'Success', changes: 'Artifacts', verification: evidence, risks: 'None' } }
+    router.tasks.report({ ticketId: result.ticketId, ...report })
+
+    // Seed retained records directly so the fixture can represent a long-running installation.
+    const insert = store.db.prepare('INSERT INTO ticket (id, value) VALUES (?, ?)')
+    store.db.exec('BEGIN')
+    for (let i = 0; i < 1000; i++) {
+      const id = 'historical-' + i
+      insert.run(id, JSON.stringify({ id, owner: owner.id, stage: 'done', report,
+        routedMessage: 'Completed task ' + i, assignments: [{ note: evidence }] }))
+    }
+    store.db.exec('COMMIT')
+
+    let directoryReads = 0
+    const listDir = () => { directoryReads += 1; return ['proof.txt'] }
+    const overview = buildOverview({ store, registry, compact: true, listDir })
+    assert.equal(overview.tickets.length, 1001)
+    assert.equal(overview.tickets[0].id, result.ticketId)
+    assert.equal(overview.tickets[0].report.summary, report.summary)
+    assert.equal(overview.tickets.at(-1).id, 'historical-999')
+    assert.ok(JSON.stringify(overview).length < 600_000, 'the list stays compact across retained results')
+    assert.equal(directoryReads, 0, 'directory is read when the report opens')
+
+    const detail = readTicketDetail({ store, registry, ticketId: result.ticketId, listDir })
+    assert.equal(detail.message, 'Build the result')
+    assert.equal(detail.report.sections.verification, evidence)
+    assert.equal(detail.report.evidence, evidence)
+    assert.deepEqual(detail.dirListing, ['proof.txt'])
+    assert.equal(detail.ownerSessionId, 'session-current-owner')
+    assert.equal(directoryReads, 1)
+    assert.equal(readTicketDetail({ store, registry, ticketId: 'missing' }), null)
+  } finally {
+    cleanup()
+  }
+})
+
+test('S19: the owner workspace keeps tickets and result detail across owner sessions', async () => {
+  const { router, registry, store, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Results', cwd: '/repos/shared' })
+    const neighbor = registry.create({ kind: 'repo', workspace: 'Other', cwd: '/repos/shared' })
+    const workspace = ownerId => readOwnerWorkspace({
+      store, registry, ownerId, timers: [], runs: { runs: [], nextOffset: null }, switchOperation: null,
+    })
+    const empty = workspace(owner.id)
+    assert.equal(empty.owner.sessionId, null)
+    assert.deepEqual(empty.tickets, [])
+    assert.deepEqual(empty.timers, [])
+    assert.deepEqual(empty.runs, [])
+    assert.equal(empty.nextRunOffset, null)
+    assert.equal(empty.switchOperation, null)
+    registry.bindSession(owner.id, 'session-results-old')
+    const result = await router.routeToOwner({ ownerId: owner.id, message: 'Prepare result' })
+    router.tasks.bindWorkerSession(result.ticketId, { sessionId: 'session-result-worker', cwd: '/repos/shared' })
+    const evidence = 'Retained verification log. '.repeat(20)
+    router.tasks.report({ ticketId: result.ticketId, summary: 'Ready for review', evidence })
+    const pending = await router.routeToOwner({ ownerId: owner.id, message: 'Pick a branch' })
+    router.tasks.ask({ ticketId: pending.ticketId, question: 'Which branch?' })
+    const other = await router.routeToOwner({ ownerId: neighbor.id, message: 'Unrelated work' })
+
+    const before = workspace(owner.id)
+    assert.equal(before.owner.sessionId, 'session-results-old')
+    assert.deepEqual(before.tickets.map(ticket => ticket.id), [pending.ticketId, result.ticketId])
+    assert.deepEqual(workspace(neighbor.id).tickets.map(ticket => ticket.id), [other.ticketId])
+
+    const binding = registry.bindSession(owner.id, 'session-results-new')
+    const started = await router.routeToOwner({ ownerId: owner.id, message: 'Continue work' })
+    const after = workspace(owner.id)
+    assert.deepEqual(after.owner, {
+      id: owner.id, role: 'owner', kind: 'repo', workspace: 'Results', cwd: '/repos/shared',
+      sessionId: 'session-results-new', status: 'created', transient: false, recycled: false,
+      createdAt: owner.createdAt, updatedAt: binding.updatedAt,
+    })
+    assert.deepEqual(after.tickets.map(ticket => ticket.id), [pending.ticketId, result.ticketId, started.ticketId])
+    assert.ok(after.tickets.every(ticket => ticket.owner === owner.id && ticket.ownerSessionId === 'session-results-new'))
+    assert.equal(after.tickets[0].question.text, 'Which branch?')
+    assert.equal(after.tickets[1].message, 'Prepare result')
+    assert.equal(after.tickets[1].trigger.kind, 'route')
+    assert.deepEqual(after.tickets[1].report, { summary: 'Ready for review', at: router.now() })
+    assert.equal(after.tickets[1].workerSession.sessionId, 'session-result-worker')
+
+    const detail = readTicketDetail({ store, registry, ticketId: result.ticketId, listDir: () => ['proof.txt'] })
+    assert.equal(detail.report.evidence, evidence)
+    assert.deepEqual(detail.dirListing, ['proof.txt'])
+    assert.equal(workspace('session-results-old'), null)
+  } finally {
+    cleanup()
+  }
+})
+
+test('S19: the workspace preserves active timers, run pages, and exact switch receipts', async t => {
+  const { router, registry, store, advance, cleanup } = fixture()
+  t.after(cleanup)
+  const owner = registry.create({ kind: 'repo', workspace: 'Operations', cwd: '/repos/operations' })
+  const other = registry.create({ kind: 'repo', workspace: 'Neighbor', cwd: '/repos/neighbor' })
+  const oldSessionId = 'session-operations-old'
+  const otherSessionId = 'session-neighbor'
+  registry.bindSession(owner.id, oldSessionId)
+  registry.bindSession(other.id, otherSessionId)
+
+  const timers = new TimerService({ store, now: router.now, getOwner: id => registry.get(id),
+    getTicket: id => router.getTicket(id), routeBackground: request => router.routeBackground(request) })
+  router.timerDeliveryState = (id, ref) => timers.deliveryState(id, ref)
+  const schedule = { frequency: 'daily', time: '08:01' }
+  const timer = timers.create({ ownerId: owner.id, createdBy: other.id, message: 'Check this workspace', schedule })
+  const otherTimer = timers.create({ ownerId: other.id, createdBy: owner.id, message: 'Check another workspace', schedule })
+  advance(60_000)
+  await timers.tick()
+  const timerRun = timers.get(timer.id).delivery
+  const otherRun = timers.get(otherTimer.id).delivery
+  assert.equal(timerRun.state, 'sent')
+  assert.equal(otherRun.state, 'sent')
+
+  advance(1000)
+  const source = { kind: 'github', repo: 'fixture/workspace', event: 'issue', issueNumber: 7 }
+  const result = await router.routeBackground({
+    ownerId: owner.id, source, triggerRef: 'github:fixture/workspace:issue:7', message: 'Produce a result',
+    authorization: { actor: 'fixture-user', source: 'github', at: router.now() },
+  })
+  const evidence = 'Recorded verification for issue 7'
+  await router.reportBackground({ ticketId: result.ticketId, sessionId: result.workerSession.sessionId,
+    summary: 'Result for issue 7', evidence })
+
+  const sessionStates = new Map([[oldSessionId, 'busy'], [otherSessionId, 'busy']])
+  const switches = new OwnerSwitch({
+    store, registry, now: router.now,
+    buildFacts: ({ ownerId }) => formatOwnerFacts(buildOwnerFacts({ store, ownerId })),
+    sessions: {
+      status: async ({ sessionId }) => sessionStates.get(sessionId) ?? 'missing',
+      create: async ({ sessionId }) => {
+        sessionStates.set(sessionId, 'idle')
+        return { sessionId, agentPreset: 'hub-bot-owner' }
+      },
+      prompt: router.sessions.prompt,
+      archive: async () => { throw new Error('Fixture archive failure') },
+    },
+  })
+  const requested = switches.request({ ownerId: owner.id, expectedSessionId: oldSessionId })
+  const foreign = switches.request({ ownerId: other.id, expectedSessionId: otherSessionId })
+  const workspace = () => readOwnerWorkspace({
+    store, registry, ownerId: owner.id, timers: timers.list({ ownerId: owner.id }),
+    runs: { runs: router.runs.list({ ownerId: owner.id, limit: 1 }), nextOffset: 1 },
+    switchOperation: switches.list({ ownerId: owner.id })[0],
+  })
+
+  await switches.tick()
+  const before = workspace()
+  assert.equal(before.owner.sessionId, oldSessionId)
+  assert.deepEqual(before.switchOperation, requested)
+  assert.equal(before.switchOperation.status, 'waiting')
+
+  sessionStates.set(oldSessionId, 'idle')
+  await switches.tick()
+  await switches.tick()
+  const after = workspace()
+  assert.equal(after.owner.id, before.owner.id)
+  assert.equal(after.owner.sessionId, requested.newSessionId)
+  assert.equal(after.switchOperation.operationId, requested.operationId)
+  assert.equal(after.switchOperation.oldSessionId, oldSessionId)
+  assert.equal(after.switchOperation.status, 'archive-failed')
+  assert.deepEqual(after.tickets.map(ticket => ticket.id), [result.ticketId, timerRun.ticketId])
+  assert.deepEqual(after.timers, before.timers)
+  assert.equal(after.timers[0].id, timer.id)
+  assert.equal(after.timers[0].delivery.workerSession.sessionId, timerRun.workerSession.sessionId)
+  assert.deepEqual(after.runs, before.runs)
+  assert.equal(after.nextRunOffset, 1)
+  const older = router.runs.list({ ownerId: owner.id, limit: 1, offset: after.nextRunOffset })
+  assert.deepEqual(older.map(run => run.id), ['run-' + timerRun.ticketId])
+
+  const [preview] = after.runs
+  assert.equal(preview.id, 'run-' + result.ticketId)
+  assert.equal(preview.status, 'waiting')
+  assert.equal(preview.notification.channelAccepted, false)
+  const runDetail = router.runs.get(preview.id)
+  assert.deepEqual(runDetail.notification, preview.notification)
+  assert.equal(runDetail.results[0].kind, 'result')
+  const ticket = readTicketDetail({ store, registry, ticketId: runDetail.ticketId, listDir: () => null })
+  assert.equal(ticket.report.evidence, evidence)
+
+  const mixed = readOwnerWorkspace({
+    store, registry, ownerId: owner.id, timers: timers.list(),
+    runs: { runs: router.runs.list(), nextOffset: null }, switchOperation: foreign,
+  })
+  assert.deepEqual(mixed.timers.map(row => row.id), [timer.id])
+  assert.deepEqual(mixed.runs.map(row => row.id), [preview.id, older[0].id])
+  assert.equal(mixed.switchOperation, null)
+})
+
 test('overview lists artifacts for working tickets too (round 45)', async () => {
   const { router, registry, store, cleanup } = fixture()
   try {
@@ -305,6 +536,28 @@ test('recent messages separate dispatch, legacy chat replies and replies to a si
     assert.equal(msg('old').replyUnlinked, true)
     assert.equal(msg('old').unprocessed, false)
     assert.equal(view.recentTriggers.find(t => t.ticketId === route.ticketId).reply, null)
+  } finally { cleanup() }
+})
+
+test('combined run notifications stay out of the legacy chat reply fallback', () => {
+  const { store, registry, cleanup } = fixture()
+  try {
+    const at = '2026-11-19T11:00:00.000Z'
+    const insert = store.db.prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)')
+    for (const chatId of ['batch-chat', 'legacy-chat']) {
+      insert.run(chatId, JSON.stringify({ id: chatId, kind: 'feishu', message: 'Question', at, source: { chatId } }), at)
+    }
+    const sent = () => '2026-11-19T11:01:00.000Z'
+    insertOutbox(store, { kind: 'reply', state: 'sent', to: 'feishu:chat:batch-chat', body: 'Runs summary',
+      ticketId: null, triggerId: null, notificationWindowMs: 60000 }, sent)
+    insertOutbox(store, { kind: 'reply', state: 'sent', to: 'feishu:chat:legacy-chat', body: 'Old reply' }, sent)
+
+    const overview = buildOverview({ store, registry, now: () => '2026-11-19T12:00:00.000Z', compact: true })
+    const batch = overview.recentTriggers.find(row => row.id === 'batch-chat')
+    assert.equal(batch.replyUnlinked, false)
+    assert.equal(batch.unprocessed, true)
+    assert.equal(overview.recentTriggers.find(row => row.id === 'legacy-chat').replyUnlinked, true)
+    assert.equal(readMessageDetail(store, 'batch-chat').replyUnlinked, false)
   } finally { cleanup() }
 })
 
@@ -403,6 +656,213 @@ test('overview skips directory listings for recycled owners (目录已删除)', 
   }
 })
 
+test('S02 regression: saving a new overlay replaces the settings file instead of rewriting the inode a reader holds', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-settings-'))
+  let fd = null
+  try {
+    // 设置写入必须是「整文件替换」(temp file + rename)：并发读取者手里已打开的句柄要一直看到完整的旧快照。
+    const previous = { reporting: { auto: true, intervalMs: 60000 }, github: { enabled: false, loginAllowlist: ['ghost'] } }
+    const next = { reporting: { auto: false, intervalMs: 90000 }, github: { enabled: true, loginAllowlist: ['ghost', 'hub-bot-app'] } }
+    saveSettingsOverlay(dir, previous)
+    fd = openSync(join(dir, SETTINGS_FILE), 'r')
+    saveSettingsOverlay(dir, next)
+    const heldText = readFileSync(fd, 'utf8')
+    assert.doesNotThrow(() => JSON.parse(heldText), '已打开句柄读到的仍是完整 JSON — 保存不能原地截断同一个 inode')
+    assert.deepEqual(JSON.parse(heldText), previous, '已打开句柄看到的是完整的上一版快照，不是新内容或截断内容')
+    assert.deepEqual(loadSettingsOverlay(dir), next, '新路径加载到的是新设置')
+    assert.equal(statSync(join(dir, SETTINGS_FILE)).mode & 0o777, 0o600, '替换后的新文件仍是 owner-only 0600')
+  } finally {
+    if (fd !== null) closeSync(fd)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('S02 regression: a failed settings write keeps the previous file and the in-memory config unchanged', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-settings-'))
+  try {
+    // 持久化失败必须是「整体回退」：上一份有效文件还在、内存里的 config 一点没变、临时文件不残留。
+    // 失败注入走 saveSettingsOverlay 的 io 替身（同 workspaces.js 的 mkdir 替身约定），不 mock 模块。
+    const previous = { reporting: { auto: true, intervalMs: 60000 }, github: { enabled: false, loginAllowlist: ['ghost'] } }
+    const config = baseConfig()
+    applySettingsOverlay(config, previous)
+    saveSettingsOverlay(dir, previous)
+    const snapshot = structuredClone(config)
+    const failingIo = {
+      renameSync: () => {
+        const error = new Error('EACCES: simulated rename failure')
+        error.code = 'EACCES'
+        throw error
+      },
+    }
+    assert.throws(
+      () => applySettingsPatch(config, { reporting: { auto: false, intervalMs: 90000 } }, applied => {
+        saveSettingsOverlay(dir, mergeSettingsOverlay(previous, applied), failingIo)
+      }),
+      /simulated rename failure/,
+      '持久化失败必须抛给调用方，不能吞掉变成半成功',
+    )
+    assert.deepEqual(config, snapshot, '写入失败后内存里的配置保持原样（不能先改内存再写盘）')
+    assert.deepEqual(loadSettingsOverlay(dir), previous, '下一次加载拿到的仍是最后一份有效设置')
+    assert.deepEqual(readdirSync(dir), [SETTINGS_FILE], '失败路径不能留下临时文件')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('S02 regression: an accepted settings change survives a reopen of the state dir', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-settings-'))
+  try {
+    // 正常路径：写盘 → 重新加载（等价于重启）→ 覆盖层原样重放，改动不会随进程消失。
+    const config = baseConfig()
+    const patch = { reporting: { auto: true, intervalMs: 120000 }, github: { loginAllowlist: ['ghost', 'hub-bot-app'] } }
+    applySettingsPatch(config, patch, applied => {
+      saveSettingsOverlay(dir, mergeSettingsOverlay(loadSettingsOverlay(dir), applied))
+    })
+    assert.equal(config.reporting.auto, true, '内存里立即生效')
+    const reopened = baseConfig()
+    applySettingsOverlay(reopened, loadSettingsOverlay(dir))
+    assert.equal(reopened.reporting.auto, true, '重开后 reporting.auto 保持')
+    assert.equal(reopened.reporting.intervalMs, 120000, '重开后 reporting.intervalMs 保持')
+    assert.deepEqual(reopened.github.loginAllowlist, ['ghost', 'hub-bot-app'], '重开后 github.loginAllowlist 保持')
+    assert.equal(statSync(join(dir, SETTINGS_FILE)).mode & 0o777, 0o600, '落盘文件仍是 owner-only 0600')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('S06: overview projects both intake entries (飞书入口 + 负责人路由) read-only from stored facts', async () => {
+  const { router, registry, store, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'DSH-Workflow', cwd: '/repos/DSH-Workflow' })
+    const put = store.db.prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)')
+    const droppedAt = '2026-11-15T00:00:00.000Z'
+    const keptAt = '2026-11-15T00:01:00.000Z'
+    // 丢弃的群聊消息也落库（只记录不处理）——它不能被当成「最近一次受理」。
+    put.run('feishu-om_drop', JSON.stringify({
+      id: 'feishu-om_drop', kind: 'feishu', message: '没 @ 的消息', at: droppedAt, dropped: 'no-mention',
+      source: { kind: 'feishu', chatId: 'oc_x', messageId: 'om_drop', openId: 'ou_a', addressing: 'none' },
+    }), droppedAt)
+    // 更早的一条已经注入过（injectedAt 有真实时间戳）；最新一条只落了 injectedAt: null（键在 = 还没注入）。
+    put.run('feishu-om_old', JSON.stringify({
+      id: 'feishu-om_old', kind: 'feishu', message: '昨天的消息', at: '2026-11-14T23:00:00.000Z', injectedAt: '2026-11-14T23:00:05.000Z',
+      source: { kind: 'feishu', chatId: 'oc_x', messageId: 'om_old', openId: 'ou_a', addressing: 'mention' },
+    }), '2026-11-14T23:00:00.000Z')
+    put.run('feishu-om_keep', JSON.stringify({
+      id: 'feishu-om_keep', kind: 'feishu', message: '看一下状态', at: keptAt, injectedAt: null,
+      source: { kind: 'feishu', chatId: 'oc_x', messageId: 'om_keep', openId: 'ou_a', addressing: 'direct' },
+      authorization: { actor: 'ou_a', source: 'feishu', addressing: 'direct', messageId: 'om_keep', at: keptAt },
+    }), keptAt)
+    const receipt = await router.routeToOwner({ ownerId: owner.id, message: '检查当前队列' })
+    const routeTrigger = store.db.prepare('SELECT value FROM trigger').all()
+      .map(raw => JSON.parse(String(raw.value)))
+      .find(trigger => trigger.kind === 'route')
+    assert.equal(routeTrigger.ownerId, owner.id, 'route 触发行由 router 落库（先存后做）')
+    // 投递行在 routeToOwner 之后才落库：routeToOwner 内部会 tick 一次，早落库的 queued 行会被它投掉。
+    insertOutbox(store, { triggerId: 'feishu-om_keep', kind: 'reply', to: 'feishu:chat:oc_x', body: '处理中', state: 'sent' }, () => keptAt)
+    insertOutbox(store, {
+      triggerId: 'feishu-om_keep', kind: 'reply', to: 'feishu:chat:oc_x', body: '还在排队', state: 'queued',
+      attempts: 1, nextRetryAt: Date.parse(keptAt) + 4000, lastError: 'socket hang up',
+    }, () => keptAt)
+
+    const overview = buildOverview({ store, registry })
+    assert.equal(overview.intake.generatedAt, overview.generatedAt, '同一次快照生成，时间戳一致')
+    assert.deepEqual(overview.intake.sources.map(s => s.source), ['feishu', 'route'], '两个入口：飞书与负责人路由')
+    const [feishu, route] = overview.intake.sources
+    assert.equal(feishu.label, '飞书入口')
+    assert.equal(route.label, '负责人路由')
+
+    assert.equal(feishu.at, keptAt, '最近一次受理取最新的触发行（旧的丢弃记录不覆盖）')
+    assert.equal(feishu.triggerId, 'feishu-om_keep')
+    assert.equal(feishu.dedupKey, 'feishu-om_keep', '去重键就是触发行 id（feishu 侧 = feishu-<messageId>）')
+    assert.equal(feishu.addressing, 'direct', '受理口径来自触发行自带的 addressing')
+    assert.equal(feishu.dropped, null)
+    assert.equal(feishu.injectedAt, null)
+    assert.equal(feishu.ownerId, null)
+    assert.equal(feishu.ticketId, null)
+    assert.deepEqual(feishu.counts, { triggers: 3, dropped: 1, injected: 1 },
+      '计数就是列表长度：丢弃也记账；注入只认真的注入过的行（injectedAt: null 的占位不算）')
+    assert.equal(feishu.queue.state, 'queued', '最相关的投递行优先：失败 > 在途 > 已送达')
+    assert.equal(feishu.queue.attempts, 1)
+    assert.equal(feishu.queue.nextRetryAt, Date.parse(keptAt) + 4000)
+    assert.equal(feishu.queue.lastError, 'socket hang up')
+    assert.equal(feishu.queue.rows, 2, '链接到该触发的全部投递行')
+
+    assert.equal(route.triggerId, routeTrigger.id)
+    assert.equal(route.dedupKey, routeTrigger.id)
+    assert.equal(route.at, routeTrigger.at)
+    assert.equal(route.ownerId, owner.id)
+    assert.equal(route.ticketId, receipt.ticketId)
+    assert.equal(route.addressing, 'direct', '路由入口保留到达时的寻址方式')
+    assert.equal(route.dropped, null)
+    assert.equal(route.injectedAt, null)
+    assert.deepEqual(route.counts, { triggers: 1, dropped: 0, injected: 1 },
+      'routeToOwner 真的把注入投进宿主了（票面 lastDelivery.state === sent）→ 计数为已注入')
+    assert.equal(route.queue.state, 'sent', 'routeToOwner 已投递的注入行是 sent')
+    assert.equal(route.queue.rows, 1)
+    assert.deepEqual(Object.keys(feishu).sort(), [
+      'addressing', 'at', 'counts', 'dedupKey', 'disposition', 'dropped', 'injectedAt', 'label', 'ownerId', 'policy', 'queue', 'source', 'ticketId', 'triggerId',
+    ], '只读投影的字段集合固定 —— 没有任何可写开关')
+    assert.equal(feishu.disposition, 'pending', '已受理但 injectedAt 还是 null = 等注入（重启会重放，不是丢了）')
+    assert.equal(route.disposition, 'injected', '票面 lastDelivery.state === sent 才算真的注入了')
+
+    // 到达时的口径快照由 router 落库在触发行顶层 `policy` 上（s06-core 契约）；面板原样透传，
+    // 没落库就是 null —— 不发明字段名、不补值。
+    assert.equal(feishu.policy, null)
+    assert.deepEqual(route.policy, routeTrigger.policy)
+    const snapshot = { source: 'dsh', addressing: 'direct', admitted: true }
+    store.db.prepare('UPDATE trigger SET value = ? WHERE id = ?')
+      .run(JSON.stringify({ ...routeTrigger, policy: snapshot }), routeTrigger.id)
+    const projected = buildIntakePolicy(store, { now: () => '2026-11-15T00:02:00.000Z' })
+    assert.equal(projected.generatedAt, '2026-11-15T00:02:00.000Z')
+    assert.deepEqual(projected.sources[1].policy, snapshot, '口径快照原样透传，面板不重算')
+    assert.equal(projected.sources[0].policy, null, '飞书触发行没有快照 → null')
+    // 只认顶层 policy：别的键（曾经的猜测字段）不会被当成口径快照，投影不猜字段名。
+    store.db.prepare('UPDATE trigger SET value = ? WHERE id = ?')
+      .run(JSON.stringify({ ...routeTrigger, policy: undefined, intake: { addressing: 'direct' }, policySnapshot: { allowed: true } }), routeTrigger.id)
+    const guessed = buildIntakePolicy(store, { now: () => '2026-11-15T00:02:00.000Z' })
+    assert.equal(guessed.sources[1].policy, null, 'intake/policySnapshot 不是契约字段，不能被当成快照')
+  } finally {
+    cleanup()
+  }
+})
+
+test('S06: intake projection is read-only — empty entries stay null, no settings key or allowlist appears', () => {
+  const { store, cleanup } = fixture()
+  try {
+    const empty = buildIntakePolicy(store, { now: () => '2026-11-15T00:00:00.000Z' })
+    assert.deepEqual(empty.sources.map(s => s.source), ['feishu', 'route'])
+    for (const source of empty.sources) {
+      assert.equal(typeof source.label, 'string', '每个入口都带中文标签')
+      assert.ok(source.label.length > 0)
+      assert.equal(source.at, null, '没有触发行 → null（面板渲染 —），不编造受理时间')
+      assert.equal(source.triggerId, null)
+      assert.equal(source.dedupKey, null)
+      assert.equal(source.addressing, null)
+      assert.equal(source.dropped, null)
+      assert.equal(source.injectedAt, null)
+      assert.equal(source.ownerId, null)
+      assert.equal(source.ticketId, null)
+      assert.equal(source.policy, null)
+      assert.equal(source.disposition, null, '没有触发行 → 处置是 null（面板渲染 —），不假装已注入/已丢弃')
+      assert.deepEqual(source.counts, { triggers: 0, dropped: 0, injected: 0 })
+      assert.deepEqual(source.queue, { state: null, attempts: 0, nextRetryAt: null, lastError: null, rows: 0 },
+        '没有投递行时队列状态是 null —— 不假装 queued/sent')
+    }
+  } finally {
+    cleanup()
+  }
+  // 只读投影不能顺带长出一个新的设置键/白名单：写层仍旧只认既有键。
+  const config = baseConfig()
+  assert.throws(() => applySettingsPatch(config, { feishu: { openIdAllowlist: ['ou_a'] } }), /does not know settings key/)
+  assert.throws(() => applySettingsPatch(config, { feishu: { intakePolicy: { addressing: 'direct' } } }), /does not know settings key/,
+    '投喂口径只读展示，不新增可写的 feishu.intakePolicy')
+  assert.throws(() => applySettingsPatch(config, { intake: { enabled: true } }), /unknown settings section "intake"/)
+  const view = buildSettingsView(config)
+  assert.equal(view.feishu.openIdAllowlist, undefined, '面板视图里没有 openId 白名单')
+  assert.equal(view.intake, undefined, '设置视图里没有投喂面开关')
+  assert.deepEqual(Object.keys(view.feishu).sort(), ['enabled', 'status'])
+})
+
 test('settings view merges the effective config with live source status', () => {
   const config = baseConfig()
   const view = buildSettingsView(config, {
@@ -419,4 +879,32 @@ test('settings view merges the effective config with live source status', () => 
   assert.deepEqual(view.github.loginAllowlist, ['ghost'])
   assert.deepEqual(view.github.followed, [{ repo: 'o/r', ownerId: 'repo-w' }], '监听清单跟随注册表（只读）')
   assert.equal(view.github.status.lastPollError, null)
+})
+
+test('message detail distinguishes pending, failed, and admitted intake for the same event', () => {
+  const { store, cleanup } = fixture()
+  try {
+    const trigger = { id: 'feishu-fixture-detail', kind: 'feishu', at: '2026-11-15T00:00:00.000Z', message: 'fixture', policy: { mode: 'queue' }, injectedAt: null }
+    store.db.prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)').run(trigger.id, JSON.stringify(trigger), trigger.at)
+    const intent = insertOutbox(store, { kind: 'inbox', to: 'owner:chief', state: 'queued', triggerId: trigger.id })
+    assert.equal(readMessageDetail(store, trigger.id).intake.disposition, 'pending')
+    const save = store.db.prepare('UPDATE outbox SET value = ? WHERE id = ?')
+    save.run(JSON.stringify({ ...intent, state: 'failed', lastError: 'fixture timeout' }), intent.id)
+    assert.deepEqual(readMessageDetail(store, trigger.id).intake, { disposition: 'failed', queueState: 'failed', lastError: 'fixture timeout' })
+    save.run(JSON.stringify({ ...intent, state: 'sent' }), intent.id)
+    store.db.prepare('UPDATE trigger SET value = ? WHERE id = ?').run(JSON.stringify({ ...trigger, injectedAt: trigger.at }), trigger.id)
+    assert.equal(readMessageDetail(store, trigger.id).intake.disposition, 'injected')
+  } finally { cleanup() }
+})
+
+test('message detail agrees with the overview after routing an owner request', async () => {
+  const { router, registry, store, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Details fixture', cwd: '/repos/details' })
+    const triggerId = 'fixture-route-detail'
+    await router.routeToOwner({ ownerId: owner.id, triggerRef: triggerId, message: 'fixture routing request' })
+    const overview = buildOverview({ store, registry })
+    assert.equal(overview.intake.sources.find(entry => entry.triggerId === triggerId)?.disposition, 'injected')
+    assert.equal(readMessageDetail(store, triggerId)?.intake?.disposition, 'injected')
+  } finally { cleanup() }
 })

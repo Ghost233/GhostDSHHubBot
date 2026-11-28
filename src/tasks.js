@@ -66,6 +66,24 @@ const RELEASABLE = ['person/answer', 'person/confirm', 'person/review', 'blocked
 /** 确认超时（spec「错误场景」+ #69）: a person/confirm request left unanswered for 24h auto-cancels. */
 export const CONFIRM_TIMEOUT_MS = 24 * 60 * 60 * 1000
 
+/**
+ * S11 延迟确认登记: the facts of a deferred request that must never change once stored （先存后做 + 票面权威）.
+ * A re-attach carrying any different value is refused, so an accepted action can never be pointed at a new target.
+ */
+export const DEFERRED_IMMUTABLE_FIELDS = ['ticketId', 'requestId', 'type', 'action', 'source', 'requester', 'target', 'receiver', 'expiresAt', 'openedAt']
+
+/** S11 延迟确认登记: a request in one of these statuses is closed — it never reactivates （重复/取消/过期不重新激活）. */
+export const DEFERRED_TERMINAL_STATUSES = ['fulfilled', 'rejected', 'cancelled', 'expired']
+
+/** S11: bounded history on the ticket face — a closed request is displaced, a refused decision is remembered. */
+const DEFERRED_HISTORY_LIMIT = 10
+const DEFERRED_REFUSAL_LIMIT = 20
+
+/** The canonical JSON reading of one fact, so immutability checks compare values rather than object identity. */
+function sameFact(a, b) {
+  return JSON.stringify(a ?? null) === JSON.stringify(b ?? null)
+}
+
 /** A lifecycle failure with a machine-readable code for tool/API surfaces. */
 export class TaskError extends Error {
   constructor(code, message) {
@@ -85,8 +103,12 @@ export function translateTaskError(error, wrap) {
 }
 
 /** True when a stage transition is legal in the lifecycle. */
-export function canTransition(from, to) {
-  return (TRANSITIONS[from] ?? []).includes(to)
+const BACKGROUND_NO_RESULT = 'background-no-result'
+
+export function canTransition(from, to, { background, reason } = {}) {
+  const stage = normalizeStage(from)
+  if (reason === BACKGROUND_NO_RESULT) return Boolean(background && stage === 'working' && to === 'done')
+  return (TRANSITIONS[stage] ?? []).includes(to)
 }
 
 /** Legacy rows from the minimal loop (#65) read as their full-model stage. */
@@ -123,13 +145,13 @@ export class TaskBoard {
   }
 
   /** Applies one guarded transition, recording it on the ticket's audit trail. */
-  #transition(ticketId, to, by) {
+  #transition(ticketId, to, by, reason) {
     const ticket = this.#mustGet(ticketId)
-    if (!canTransition(ticket.stage, to)) {
+    if (!canTransition(ticket.stage, to, { background: ticket.background, reason })) {
       throw new TaskError('illegal-transition', 'ticket ' + ticketId + ': cannot move ' + ticket.stage + ' → ' + to)
     }
     const at = this.now()
-    const transitions = [...(ticket.transitions ?? []), { from: ticket.stage, to, by, at }]
+    const transitions = [...(ticket.transitions ?? []), { from: ticket.stage, to, by, at, ...(reason && { reason }) }]
     return this.#updateTicket({ ...ticket, stage: to, transitions, updatedAt: at })
   }
 
@@ -235,6 +257,11 @@ export class TaskBoard {
     return this.#transition(ticketId, 'working', by ?? 'route')
   }
 
+  /** A background check without a new result has nothing for the user to accept. */
+  finishBackgroundCheck(ticketId) {
+    return this.#transition(ticketId, 'done', 'system', BACKGROUND_NO_RESULT)
+  }
+
   /** The user accepts the reported result (person/review → done; 等用户验收是挡板）. */
   accept(ticketId) {
     return this.#transition(ticketId, 'done', 'user')
@@ -257,9 +284,9 @@ export class TaskBoard {
    * The owner escalates instead of executing (越界/缺上下文/无法继续 → 被卡住）. Escalation IS the blocked
    * stage (#66): the ticket waits for a human; a follow-up message releases it back to working.
    */
-  escalate({ ticketId, reason }) {
+  escalate({ ticketId, reason, by = 'owner' }) {
     if (typeof reason !== 'string' || !reason.trim()) throw new TaskError('reason-required', 'escalate: reason must be a non-empty string')
-    const ticket = this.#transition(ticketId, 'blocked', 'owner')
+    const ticket = this.#transition(ticketId, 'blocked', by)
     return this.#updateTicket({ ...ticket, escalated: { reason: reason.trim(), at: this.now() } })
   }
 
@@ -285,6 +312,156 @@ export class TaskBoard {
     }
     if (mechanism !== undefined) next.mechanism = mechanism
     return this.#updateTicket(next)
+  }
+
+  /**
+   * S11 延迟确认登记: the deferred request currently on the ticket face, or undefined.
+   * The facts live under `ticket.deferred` — never inside pendingConfirm.action/text — so the legacy
+   * fork / dangerous-inject payloads keep their exact shape.
+   */
+  getDeferred(ticketId) {
+    return this.#mustGet(ticketId).deferred
+  }
+
+  /**
+   * S11 先存后做: attaches a deferred request's immutable facts to the ticket face.
+   *  - first attach wins;
+   *  - re-attaching the SAME facts is an idempotent no-op (重复登记不产生第二份请求）;
+   *  - a re-attach that changes any immutable fact is refused (the stored action target is never rewritten);
+   *  - a request that already reached a terminal status is displaced into deferredHistory, never reactivated.
+   */
+  attachDeferred(ticketId, request) {
+    if (typeof request !== 'object' || request === null || Array.isArray(request)) {
+      throw new TaskError('deferred-invalid', 'deferred: request must be an object')
+    }
+    const ticket = this.#mustGet(ticketId)
+    const facts = {}
+    for (const field of DEFERRED_IMMUTABLE_FIELDS) {
+      facts[field] = field === 'ticketId' ? ticketId : (request[field] ?? null)
+    }
+    const existing = ticket.deferred
+    const history = ticket.deferredHistory ?? []
+    const recorded = existing?.requestId === facts.requestId ? existing : history.find(row => row.requestId === facts.requestId)
+    const active = existing && !DEFERRED_TERMINAL_STATUSES.includes(existing.status)
+    if (recorded || active) {
+      const previous = recorded ?? existing
+      if (recorded) facts.openedAt ??= recorded.openedAt
+      const drift = DEFERRED_IMMUTABLE_FIELDS.filter(field => !sameFact(previous[field], facts[field]))
+      if (drift.length > 0) {
+        if (previous === existing && active) {
+          const refusals = [...(existing.refusals ?? []), { kind: 'immutable-drift', fields: drift, at: this.now() }].slice(-DEFERRED_REFUSAL_LIMIT)
+          this.#updateTicket({ ...ticket, deferred: { ...existing, refusals }, updatedAt: this.now() })
+        }
+        throw new TaskError('deferred-immutable', 'ticket ' + ticketId + ': deferred request facts are immutable — refused to change ' + drift.join(', '))
+      }
+      return previous
+    }
+    const deferred = { ...facts, status: 'pending', openedAt: facts.openedAt ?? this.now(), refusals: [] }
+    const deferredHistory = existing ? [...history, existing].slice(-DEFERRED_HISTORY_LIMIT) : history
+    this.#updateTicket({ ...ticket, deferred, deferredHistory, updatedAt: this.now() })
+    return deferred
+  }
+
+  /**
+   * S11: records mutable progress on the pending deferred request (decision facts, refusals, fulfillment).
+   * Immutable facts can never be patched, and a terminal request is closed for good （关闭后不再改写）.
+   */
+  noteDeferred(ticketId, patch = {}) {
+    const ticket = this.#mustGet(ticketId)
+    const deferred = ticket.deferred
+    if (!deferred) throw new TaskError('no-deferred', 'ticket ' + ticketId + ' has no deferred request')
+    if (DEFERRED_TERMINAL_STATUSES.includes(deferred.status)) {
+      throw new TaskError('deferred-closed', 'ticket ' + ticketId + ': deferred request is already ' + deferred.status)
+    }
+    if ('status' in patch && patch.status !== deferred.status && !(deferred.status === 'pending' && patch.status === 'accepted')) {
+      throw new TaskError('deferred-status-invalid', 'deferred: invalid status change from ' + deferred.status + ' to ' + patch.status)
+    }
+    if (deferred.status === 'accepted' && ['decidedAt', 'outcome', 'waitRevision'].some(key => key in patch && !sameFact(deferred[key], patch[key]))) {
+      throw new TaskError('deferred-immutable', 'deferred: the accepted decision cannot change')
+    }
+    const drift = DEFERRED_IMMUTABLE_FIELDS.filter(field => field in patch && !sameFact(deferred[field], patch[field]))
+    if (drift.length > 0) {
+      throw new TaskError('deferred-immutable', 'ticket ' + ticketId + ': deferred request facts are immutable — refused to change ' + drift.join(', '))
+    }
+    const next = { ...deferred }
+    for (const [key, value] of Object.entries(patch)) {
+      if (!DEFERRED_IMMUTABLE_FIELDS.includes(key)) next[key] = value
+    }
+    this.#updateTicket({ ...ticket, deferred: next, updatedAt: this.now() })
+    return next
+  }
+
+  /**
+   * S11: closes the deferred request with one terminal status plus its durable outcome.
+   * Idempotent — closing an already-closed request returns it untouched ({ duplicate: true }), so a
+   * duplicate decision can never reopen or re-run an accepted action.
+   */
+  closeDeferred(ticketId, { status, outcome, decidedAt, executedAt } = {}) {
+    if (!DEFERRED_TERMINAL_STATUSES.includes(status)) {
+      throw new TaskError('deferred-status-invalid', 'deferred: status must be one of ' + DEFERRED_TERMINAL_STATUSES.join('/'))
+    }
+    const ticket = this.#mustGet(ticketId)
+    const deferred = ticket.deferred
+    if (!deferred) throw new TaskError('no-deferred', 'ticket ' + ticketId + ' has no deferred request')
+    if (DEFERRED_TERMINAL_STATUSES.includes(deferred.status)) {
+      return { deferred, duplicate: true }
+    }
+    if (deferred.status === 'accepted' && ['expired', 'rejected'].includes(status)) {
+      throw new TaskError('deferred-status-invalid', 'deferred: an accepted decision cannot become ' + status)
+    }
+    const closed = { ...deferred, status, closedAt: this.now(), outcome: outcome ?? null }
+    if (decidedAt !== undefined) closed.decidedAt = decidedAt
+    if (executedAt !== undefined) closed.executedAt = executedAt
+    this.#updateTicket({ ...ticket, deferred: closed, updatedAt: this.now() })
+    return { deferred: closed, duplicate: false }
+  }
+
+  /** Mirrors a delivery receipt on the closed answer still shown on the ticket. */
+  recordDeferredAnswerDelivery(ticketId, { requestId, delivery }) {
+    const ticket = this.getTicket(ticketId)
+    const deferred = ticket?.deferred
+    if (!deferred || deferred.requestId !== requestId) return
+    if (deferred.status !== 'fulfilled' || deferred.outcome?.decision !== 'answer') {
+      throw new TaskError('deferred-status-invalid', 'deferred: delivery receipt requires a fulfilled answer')
+    }
+    const previous = deferred.outcome.delivery
+    if (previous && previous.state !== 'queued') {
+      if (sameFact(previous, delivery)) return
+      throw new TaskError('deferred-status-invalid', 'deferred: answer delivery is already ' + previous.state)
+    }
+    const transitions = ticket.transitions ?? []
+    const resumed = transitions.at(-1)
+    const originalRun = deferred.waitRevision === undefined
+      ? resumed?.at === deferred.decidedAt && !transitions.slice(0, -1).some(event =>
+        event.from === 'person/answer' && Date.parse(event.at) >= Date.parse(deferred.openedAt))
+      : transitions.length === deferred.waitRevision + 1
+    const block = delivery.state === 'failed' && ticket.stage === 'working' && originalRun
+      && resumed?.from === 'person/answer' && resumed.to === 'working' && resumed.by === 'route'
+    const nextTicket = block ? this.escalate({ ticketId, reason: delivery.reason, by: 'system' }) : ticket
+    const next = { ...deferred, outcome: { ...deferred.outcome, delivery } }
+    this.#updateTicket({ ...nextTicket, deferred: next, updatedAt: this.now() })
+  }
+
+  /** Adds execution evidence to a completed approval on the current face or in its history. */
+  recordDeferredExecution(ticketId, { requestId, executedAt, result }) {
+    const ticket = this.getTicket(ticketId)
+    if (!ticket) return
+    const history = ticket.deferredHistory ?? []
+    const current = ticket.deferred?.requestId === requestId
+    const previous = current ? ticket.deferred : history.find(row => row.requestId === requestId)
+    if (!previous) return
+    if (previous.status !== 'fulfilled' || previous.outcome?.decision !== 'approve') {
+      throw new TaskError('deferred-status-invalid', 'deferred: execution evidence requires a fulfilled approval')
+    }
+    if (previous.outcome.executed) return
+    const outcome = { ...previous.outcome, executed: true, execution: result ?? null }
+    const next = { ...previous, executedAt, outcome }
+    this.#updateTicket({
+      ...ticket,
+      deferred: current ? next : ticket.deferred,
+      deferredHistory: current ? history : history.map(row => row.requestId === requestId ? next : row),
+      updatedAt: this.now(),
+    })
   }
 
   /**

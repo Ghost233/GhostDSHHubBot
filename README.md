@@ -66,7 +66,7 @@ patch 结构测试复用仓内先例 `scripts/test-runtime.mjs` 的解析链：`
 ## 任务三态与 L2 执行闭环（#65）
 
 - **三态机（src/tasks.js）**：`working → review → done`；review 是挡板，done 只能由 review 经用户验收（resolution:"accept"）到达。追问把 review 恢复为 working（resume, by:'route'），验收 by:'user'；非法迁移拒绝（如 working 直接 accept、done 后追问、double-report）。全部迁移记 transitions 审计数组。
-- **L2 六工具（src/owner-tools.js，owner preset 静态行）**：search_sessions / read_session / inject_session / create_session / report / escalate。身份解析：工具执行的 exec.agent 经 workingDirectory.ensure 拿会话 cwd，须等于注册表某 owner 的 cwd，否则拒执。
+- **L2 负责人管理工具**有 `search_sessions`、`read_session`、`inject_session`、`create_session`、`fork_session`、`report` 和 `escalate`。调用需要当前注册绑定。执行会话须是该负责人创建或工单绑定的受管会话。指定工单时校验它保存的工作会话和授权。搜索标明负责人历史绑定，报告和升级提交前会复核当前绑定。
 - **越界拒执**：create/inject/read 的目标会话（或 create_session 的目标 cwd）必须落在 owner 责任子树内（isWithinCwd 路径段感知，`/a/b` 不含 `/a/bc`）；越界抛错并指向 escalate。escalate 不改票阶段、打 escalated 标记并写 outbox(kind=escalation)，L1 经 query_tasks 可见。
 - **执行会话保持用户 preset**：create_session 不传 agentPreset（部署默认），插件永不改写执行会话配置。
 - **授权不可变**：Ticket 创建时记 authorization{actor,source,at}，注入执行会话的文本自动携带它；追问注入文本带"改完请再次 report"提示（首跑实证：L2 追问后忘了再次 report，票卡在 working）。
@@ -75,7 +75,7 @@ patch 结构测试复用仓内先例 `scripts/test-runtime.mjs` 的解析链：`
 
 ## 等待状态模型与可靠性硬化（#66）
 
-- **九态一票**（src/tasks.js）：待触发 idle、排队中 queued、进行中 working、等您回复 person/answer、等您确认 person/confirm、等您验收 person/review、被卡住 blocked、失败 failed、完成 done。任何时刻恰处一个阶段；全部迁移经 TRANSITIONS 守卫并记 transitions 审计（含 by/at）。等您验收是挡板：done 只能由 person/review（验收）或 person/confirm（取消）到达；人的追问把 person/*、blocked、failed 释放回 working（spec：人的消息直接释放）。#65 旧票 stage 'review' 读出时归一为 person/review，不做迁移。
+- **九态一票**（src/tasks.js）：待触发 idle、排队中 queued、进行中 working、等您回复 person/answer、等您确认 person/confirm、等您验收 person/review、被卡住 blocked、失败 failed、完成 done。任何时刻恰处一个阶段；全部迁移经 TRANSITIONS 守卫并记 transitions 审计（含 by/at）。等您验收是挡板：正常结果到等您验收，再由用户验收结束。明确的待投递取消和无新结果的后台终结各有独立的状态守卫。人的追问把 person/*、blocked、failed 释放回 working（spec：人的消息直接释放）。#65 旧票 stage 'review' 读出时归一为 person/review，不做迁移。
 - **状态摘要 = 状态朗读**：STAGE_TEXT 逐字文案（进行中/等您验收/被卡住/…），query_tasks 每行带 stageText，summarize 只回 朗读 + 票面既有事实（report 摘要/escalation 原因等），LLM 不即兴总结。
 - **先存后做（src/outbox.js OutboxRunner）**：建票先存 idle（待触发），注入先落 outbox 行再投递；投递成功才转 working。失败 2 秒首次重试、指数退避、上限注入 5 分钟/回复 1 分钟；同一任务的注入严格保序（前一条未送达后一条等待）；连续失败 3 次才记 system-problem 行并绕过（一次性错误不惊动人）；重试沿用行内稳定 requestId。permanent 失败（如票面授权缺失）立即终判不重试。插件启动时 markRestart（working/idle/queued 票的 running assignment 以 "host restarted" 结束、打 recoveryPending）并自动恢复投递，另有 1 秒 tick 定时器；devApi 增 POST /deliver 手动驱动（实证用）。
 - **触发与授权不可变（票面权威）**：追问不绑定新 Trigger；追问带 authorization 参数直接拒绝（authorization-immutable）；票面授权缺失的票拒绝执行——路由侧转 blocked 并拒注入，投递侧 permanent fail 转 failed；会话叙事声称的授权不扩展权限（owner persona 明文 + L2 工具硬约束）。
@@ -94,18 +94,21 @@ patch 结构测试复用仓内先例 `scripts/test-runtime.mjs` 的解析链：`
 
 ## 飞书入口（#68）
 
-- **扫码一键建应用**：`POST /hub-bot/api/feishu/register` 启动 `lark.registerApp()` 设备授权流程（RFC 8628）；`GET /hub-bot/api/feishu/status` 轮询拿 `qr.url`（面板可渲染二维码），用户手机飞书确认后 `client_id/client_secret` 写入 `stateDir/feishu-credentials.json`（**0600**）并自动建立长连接。权限一次申请：im:message:send_as_bot / im:message / im:chat:readonly + 事件 im.message.receive_v1。
-- **长连接配置**：凭证落地后插件尝试 application-config patch 设长连接模式——**实测不可行**（2026-11-16：设备流权限包不含 `application:application:patch`，返回 404）；**正式路径是手工一次性配置**：open.feishu.cn/app → 应用 → 事件与回调 → 订阅方式 → 使用长连接接收事件/回调。失败只记日志不阻断。
-- **来信关联**：`im.message.receive_v1` 写入 `feishu-<messageId>` 后交给 L1 总负责人。调用 `reply_source` 或新建任务时使用来信给出的 `triggerRef`，最近消息就能显示对应的回复状态或工单。相同 `triggerRef` 只派单一次。
-- **Policy 代码强制**：bot 自己的消息丢弃；**授权边界在飞书侧**——应用的可用范围与可见成员由飞书管理后台配置，能与 bot 说话即已授权，插件不做二次过滤（原 `openIdAllowlist` 已移除，残留该键的旧配置会被严格校验拒绝）；群聊只有 @bot 的消息成请求（botOpenId 缺省时任何 @ 宽松算）；非文本消息回「暂不支持该消息类型」。
-- **回复投递**：`reply_source` 带飞书 `triggerRef` 时从来信读取聊天地址，投递成功后显示「已回复」。连续失败五次后可从面板重投。历史记录只有聊天地址时显示「回复未关联」。
-- **凭据失效**：`status().credentialState` 为 missing/invalid 时面板提示重新扫码（devApi `feishu/status` 同源）。
+- **扫码绑定**：设备授权回调取得的应用绑定先写入 DSH 宿主凭据记录，成功后才建立长连接。面板通过飞书状态接口查看进度和二维码。权限包含发送消息、读取消息、读取会话基本信息和长连接事件订阅。
+- **沿用已有 Bot**：在当前 profile 所用的 DSH 凭据库中，将原应用的 `appId` 和 `appSecret` 存为 `hub-bot/feishu` 下的 `grant` 记录，两项均放在 `payload` 中，可选填 `boundAt`。如果使用其他记录名，将 `feishu.credentialRef` 设置为对应的 `hub-bot/<id>`。保存引用后重新加载插件。请从插件配置中移除旧的 `feishu.appId` 和 `feishu.appSecret`。原绑定来自 `stateDir/feishu-credentials.json` 时也使用相同的迁移步骤。安装版 DSH 默认将宿主凭据库放在对应 `DSH_HOME` 的 `.credentials.yaml`，权限需为 0600。
+- **长连接配置**：绑定保存后，插件尝试设置长连接事件订阅。只有飞书确认成功时状态为 `configured`。返回失败或缺少权限时状态为 `manual`，面板会提示在飞书开放平台的「事件与回调 → 订阅方式」里一次性开启长连接。配置失败后仍可检查实际连接状态。
+- **来信关联**：先在同一次 SQLite 写入中保存 `feishu-<messageId>`、到达时的来源及策略和投递意图，再确认收录。现有投递泵依序把消息交给总负责人的 DSH 队列，待投递记录可在重启后恢复。回复或派单时使用原来信的 `triggerRef`，以便面板显示关联结果。
+- **飞书受理规则**：应用可用范围由飞书管理后台配置。只受理私聊或明确 @ 本 Bot 的群消息。缺少真实 `botOpenId` 或 @ 对象不同，会记录丢弃原因。非文本消息记一条「暂不支持该消息类型」回复。明确输入「停」或「停止」会请求停止当前总负责人回合，保留已排队消息。
+- **回复投递**：`reply_source` 带飞书 `triggerRef` 时从来信读取聊天地址，投递成功后显示「已回复」。连续失败五次后可从面板重投。历史记录只有聊天地址时显示「回复未关联」。 每条持久回复使用固定的飞书消息去重标识，重试沿用同一标识。去重有效期由飞书决定。
+- **凭据状态**：`credentialReason` 区分缺少记录、记录格式不正确和宿主凭据服务不可用。保存失败会显示错误，已有绑定保留最后一次确认的记录。旧明文插件配置在启动时被拒绝并给出迁移提示。
+- **绑定状态（`registration`）**：`pending` = 扫码绑定进行中，状态里带本次二维码（面板只在 `pending` 且本次状态确实返回了二维码时才渲染，过期后立即收起，不会拿旧二维码继续展示）；`expired` = 二维码过期、绑定没走完——不自动重开扫码，只给提示和「重新生成二维码」显式重试，已有绑定不受影响、已绑定的 Bot 照常工作，不会被说成需要更换；`failed` = 绑定失败并附 `registrationError`。字段缺省表示没有进行中的绑定流。已绑定时更换 Bot 是显式操作，二次确认后才重新走注册流；此时 `pending`/`expired`/`failed` 都只描述「这次更换」没走完，绑定与现有 Bot 均不变。
+- **验收边界**：设备流绑定固定 `createOnly`，只在飞书上创建新应用，不会修改、也不会验证已存在的旧 Bot；因此「对真实旧 Bot 走一遍创建设备流」这类验收在自动化里做不到，只能由人按上面「沿用已有 Bot」的迁移步骤在真实环境确认。
 - dev 实证探针：`POST /hub-bot/api/feishu/simulate` 注入 mock 事件走真实归一化/Policy/注入路径（无真实飞书时实证全链）。
 
 ## fork 路径与确认流程（#69）
 
 - **fork 是重操作，永远先确认**：L2 用 `fork_session` 工具只发起**确认**——意图以结构化 action 落票面 `pendingConfirm`（先存后做），票转「等您确认」，确认文本由代码生成（src/fork.js：对象+预期结果+原因，原样呈用户）；确认请求随汇报链 digest 到 L1。确认前 L2 停手，不重复发起、不注入。
-- **确认后由代码执行，不靠模型自觉**：L1 `route_to_owner(ticketId, resolution:"confirm")` → Router 调 sessionController `fork()`（缺省取最近完成回合前缀；`atSeq` 可指定含边界切点，丢掉污染的尾巴）→ 票回进行中、`mechanism:'fork'`、绑新会话（新 Assignment）→ 唤醒 L2 注入续作。fork 失败票保持「等您确认」，可重试/拒绝/取消。
+- **确认后由代码执行**：已登记的请求由面板或飞书按 `requestId` 提交。fork 调用宿主 `fork()`，按原 `atSeq` 切分事件，成功后把票绑到新会话并唤醒负责人。原先没有请求编号的票继续支持 `route_to_owner` 的确认入口。已记录批准但执行结果不明时，界面保留该状态并拒绝重复执行。
 - **否定与取消**：`resolution:"reject"` 票转被卡住、**保持原会话**，等用户下一句释放；`resolution:"cancel"` 是终态（票转完成）。两种决议与确认一样记 `confirmOutcome` 于票面供审计。
 - **24h 确认超时自动取消**（spec「错误场景」）：1 秒 tick 顺带清扫超时的「等您确认」票——自动取消（by system）并经 L1 统一出口回复「已取消」（先存后做、恰好一次）。
 - **互不干扰**：fork 只读源会话事件切前缀，原会话保留可查、全程不再注入；两个会话用户都可打开。默认注入（inject_session）不改变会话拓扑。
@@ -114,12 +117,28 @@ patch 结构测试复用仓内先例 `scripts/test-runtime.mjs` 的解析链：`
 ## GitHub 自动处理闭环（#71）
 
 - **轮询**：监听清单跟随 owner 注册表（repo 负责人的 cwd 解析 `git remote get-url origin` → GitHub 仓库，无需配置；无 origin/非 GitHub 记 resolveErrors 跳过）；REST 轮询复用本机 `gh auth`（认证限额 5000 次/小时，`config.github.intervalMs` 默认 5min，下限 30s）。**首轮只记水位线**（stateDir/github-watermarks.json），历史存量不触发；之后只处理编号更大的新 Issue/PR，重启不重放。
-- **自动处理闭环**：本人新 Issue = 显式请求豁免（无确认）——插件先记 ack 回复意图（先存后做，deliverReplies 实投并强制 dsh-badge）→ 路由进 L2 仓库负责人（triggerRef `github:<repo>:issue:<n>` 幂等）→ 注入文本携带完整链路指令（worktree 修复 → 提 PR → 汇报链通知审核；**永不直推主分支，合并永远由人**）。新 PR 路由初审指令（摘要+风险点）。
+- **自动处理闭环**：接受 Issue、PR 或工作评论后，保存原始来源和授权，按已注册的仓库负责人建票，每个事件交给独立执行会话。该会话受负责人执行槽约束，使用部署的执行 preset。Issue 的受理评论先落库再发送。改动走 worktree 和 PR，由用户审核并合并。完成活动用 `report_background` 把结果记到账，并通知该负责人的当前实例。
 - **Policy**：`loginAllowlist` 默认空 = 启动时经 `gh api user` 解析为本人；非白名单作者与 `bot:ignore` 标签只记录不处理（github-dropped 行）。
-- **喊停与关闭**：白名单评论「停」→ 任务终止（让位于人，人的消息仍可释放）+ chief 通知；普通评论归入已有任务（follow-up 不产生新 Trigger）；`mentionHandle` 提及 → 新 Trigger（mention 寻址）；轮询发现源头关闭/合并 → 自动终止 + 通知。
+- **喊停与关闭**。白名单评论「停」结束该条目关联的任务。已在途的投递先结算，随后按该任务的请求号移除排队输入或请求停止已核对的执行回合。源条目关闭或合并时结束关联任务，运行记录保存结果，并通知总负责人。插件按仓库和评论 ID 识别自己发出的回执。关闭监听或移除仓库也会拦住尚未受理的工作。
 - **回复回投**：`reply_source to='github:<repo>:<n>'` 的 recorded 行经 deliverReplies 用 `gh api` 实投为评论——body 缺 badge 由代码补上——实投成功才标 sent；连续 5 次失败标 failed 并报 system-problem。
 - **dsh-badge**：bot 在 GitHub 的一切产出结尾带 powered-by-dsh 徽标（ack/回复由代码强制；PR 描述等 L2/L3 自然产出由注入文本与 persona 约束）。
 - dev 实证探针：`GET github/status`（跟随清单/水位线/解析失败留痕）、`POST github/poll {repo?}`（立即一轮）、`POST github/simulate {kind, repo, item}`（mock 事件走真实归一化/Policy/路由）。
+
+## 提醒、结构化答复与后台记录
+
+- 对负责人说清跟进内容和时间，由当前 L1/L2 调用 `timer_create`。一次性提醒用带时区的 `fireAt`。周期提醒用 `schedule`，可选 `daily` 或 `weekly`，时间按 `Asia/Shanghai` 的 `HH:mm`。每周的 `weekday` 从周一 `1` 到周日 `7`，省略时采用创建当天的上海星期。
+- 飞书交代的提醒可关联原消息，执行时沿用该消息的授权。飞书对话和面板都能查看、暂停、恢复和取消。停机后一次性提醒补火一次，周期提醒只补最近一次。同一提醒后续继续用已有执行会话，取消后已经接管的工作照常完成。
+- 负责人会话确实丢失时，系统保留原投递请求号，在新实例的首条消息中加载当前任务、原待答期限、执行会话和汇报索引。当前负责人可用 `read_owner_fact` 按页浏览和按 ID 查详情。
+- 后台执行会话用 `report_background` 记录结果、失败或明确的静默原因。面板的后台运行记录可按来源、通知状态筛选并进入关联工单。发送成功表示通道已经接受消息。
+- 普通后台成果按同一飞书聊天或 GitHub 条目共享发送窗口，默认 60 秒。可在插件配置中设 `notifications.windowMs`。首条可立即发送，窗口内等待的不同任务逐项保留。按消息中的通知编号打开运行记录可查完整索引。问答、失败和用户明确约定的提醒独立投递。
+- 只有用户明确操作才更换负责人。在面板选择「更换负责人」后可等旧会话空闲，也可明确请求停止旧处理再接管。飞书使用 `/hub-switch wait <负责人ID>` 或 `/hub-switch stop <负责人ID>`，用 `/hub-switch status <负责人ID>` 查看状态。
+- 飞书用 `/hub-switch cancel <操作编号> <负责人ID>` 取消等待，用 `/hub-switch retry-archive <操作编号> <负责人ID>` 重试归档。新会话收到事实清单后才接管。归档失败时仍由新会话服务，原会话可查。
+- 负责人卡片中的「交接摘要」会显示原会话和摘录的事件截止点。可先生成、预览、编辑和确认，再选择「携摘要更换」。摘要用于补充旧讨论背景。新会话始终加载当前事实清单。
+- 飞书私聊可用 `/hub-switch summary <负责人ID>` 生成草稿。回执显示编号和版本。所有后续命令以 `/hub-switch` 开头，可用 `preview <草稿编号> <页码>`、`edit-summary <草稿编号> <版本> <新正文>`、`confirm-summary <草稿编号> <版本>` 或 `discard-summary <草稿编号> <版本>`。确认后用 `wait-summary` 或 `stop-summary` 加草稿编号和确认版本发起更换。只有发起该草稿的账号在原私聊中可以操作。
+- 原待答保留请求编号和截止时间。等待旧会话空闲时，必要答复仍交当前负责人。准备期间保存的决定由更换结果决定接收方。原 L3 的待答继续交给它原来的有效执行会话，已确认动作的目标仍按原请求核对。
+- 绑定任务的执行会话可通过 `ask_user` 提问。面板按请求编号接受回复或确认，飞书从原聊天和原发送者接收 `/hub-answer <requestId> answer <回复>`，确认用 `approve` 或 `reject`。问题默认有效 24 小时，宿主可配置 `deferred.ttlMs` 及 `deferred.ttlByAction`。
+- 负责人提问由其当前实例接续，执行会话提问由原会话接续。危险动作使用确认时保存的目标，目标失效时须重新发起确认。面板显示答复待投递、已接管或失败。
+- 从总览的负责人卡片进入工作区，可集中处理待答、验收报告、更换、提醒与后台运行。工作区按稳定负责人 ID 查询，接管后继续在同一处查看已保存的工单与结果。
 
 ## 三类负责人与 scratch 回收（#70）
 
@@ -164,4 +183,4 @@ patch 结构测试复用仓内先例 `scripts/test-runtime.mjs` 的解析链：`
 - 插件配置校验为手写 resolveConfig，未引 schemastery——零运行时依赖的取舍；后续若接 DSH 设置 UI 再评估。
 - 危险命令黑名单是**大小写不敏感子串匹配**的启发式兜底：减少误操作与明显危险注入，不能防御刻意混淆（base64/变量拼接等）；真正的边界仍是渠道侧授权 + preset 工具面 + 用户确认裁决。
 - 被删重建依赖"注入失败"这一信号：`session "<id>" not found` 与 `ApiSessionNotFound` 之外的删除表现（如静默丢弃）不会被识别为重建触发。
-- **owner 重建后的孤儿会话**（#65 首跑实证）：负责人会话被删重建后，旧会话仍在且保持 owner preset；它出现在 search_sessions 结果里（registry 已指向新会话，无法标记 role:'owner'），可能被 L2 误当执行会话注入，形成嵌套委托。功能上闭环仍成立（嵌套层也是 owner，最终完成并 report），但属噪声；后续可考虑按会话的 preset 名或启动侧写登记来识别孤儿。
+- **旧负责人会话**：注册表保留近期历史绑定。未记录在注册表里的旧负责人也可通过 DSH 保存的负责人 preset 识别。清单和内容搜索均标记这些会话的角色。

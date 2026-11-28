@@ -5,14 +5,16 @@
  *  1. Settings write-back — the panel patches a WHITELIST of settings (concurrency, reporting, feishu/github
  *     switches and allowlists). The patch mutates the live resolved config (every reader — Router slots,
  *     auto-report tick, Source policy — reads these same objects), and the validated patch is persisted as an
- *     overlay file under stateDir (0600, like the credentials file). At boot the overlay replays onto the
- *     profile config, so panel changes survive restarts without the plugin ever editing the profile.
+ *     overlay file under stateDir (0600, like the credentials file) by writing a same-directory temp file and
+ *     renaming it over the target — an already-open reader keeps the complete previous snapshot instead of
+ *     observing a truncated in-place rewrite. At boot the overlay replays onto the profile config, so panel
+ *     changes survive restarts without the plugin ever editing the profile.
  *  2. The 三问 overview — assembled from ticket FACES (stageText 朗读, report facts, authorization) plus the
  *     owner registry; the panel never invents state the tickets do not carry (诚实状态: 计数 = 列表长度).
  */
-import { readFileSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, renameSync, unlinkSync, chmodSync } from 'node:fs'
 import { join } from 'node:path'
-import { STAGE_TEXT } from './tasks.js'
+import { normalizeStage, STAGE_TEXT } from './tasks.js'
 import { validateChiefModel } from './config.js'
 
 /** The overlay file holding panel-written settings (stateDir, 0600). */
@@ -197,10 +199,46 @@ export function loadSettingsOverlay(stateDir) {
   }
 }
 
-/** Persists the settings overlay owner-only (0600) — it can carry allowlists, like the credentials file. */
-export function saveSettingsOverlay(stateDir, overlay) {
+/** 原子替换时临时文件的序号：同进程内保证临时名唯一，并发写不会互相踩到同一个临时文件。 */
+let settingsTempSeq = 0
+
+/**
+ * Persists the settings overlay owner-only (0600) — it can carry allowlists, like the credentials file.
+ *
+ * 写入是「整文件替换」：先把完整内容写进同目录的临时文件，再 rename 覆盖目标。rename 换的是目录项
+ * （新 inode），已经打开旧文件的读者继续看到完整的上一版快照，绝不会读到被截断的一半内容。
+ * 任何一步失败都会清掉临时文件并抛出：目标文件与内存里的配置都保持原样，不出现半成功。
+ *
+ * @param {string} stateDir - state 目录（不存在则创建）。
+ * @param {object} overlay - 已通过 applySettingsPatch 校验的覆盖层。
+ * @param {{ writeFileSync?: (path: string, text: string, options?: { mode?: number }) => void,
+ *   chmodSync?: (path: string, mode: number) => void,
+ *   renameSync?: (from: string, to: string) => void,
+ *   unlinkSync?: (path: string) => void }} [io] 测试替身；缺省用 node:fs 的同名同步函数。
+ */
+export function saveSettingsOverlay(stateDir, overlay, io = {}) {
+  const write = io.writeFileSync ?? writeFileSync
+  const chmod = io.chmodSync ?? chmodSync
+  const rename = io.renameSync ?? renameSync
+  const unlink = io.unlinkSync ?? unlinkSync
   mkdirSync(stateDir, { recursive: true })
-  writeFileSync(join(stateDir, SETTINGS_FILE), JSON.stringify(overlay, null, 2) + '\n', { mode: 0o600 })
+  const target = join(stateDir, SETTINGS_FILE)
+  // 临时文件必须与目标同目录：跨文件系统的 rename 会退化成「拷贝 + 删除」，原子性就没了。
+  settingsTempSeq += 1
+  const tmp = join(stateDir, '.' + SETTINGS_FILE + '.' + process.pid + '.' + settingsTempSeq)
+  try {
+    write(tmp, JSON.stringify(overlay, null, 2) + '\n', { mode: 0o600 })
+    // writeFileSync 的 mode 会被 umask 削掉，显式 chmod 才保证替换后的文件仍是 owner-only 0600。
+    chmod(tmp, 0o600)
+    rename(tmp, target)
+  } catch (error) {
+    try {
+      unlink(tmp)
+    } catch {
+      // 临时文件可能根本没建起来；清理失败不能掩盖原始错误。
+    }
+    throw error
+  }
 }
 
 /** A capped directory listing for the 结果在哪 view; null when the directory cannot be read. */
@@ -262,6 +300,7 @@ export function buildOutboxHealth(store) {
   const delivery = row => ({
     id: row.id, ticketId: row.ticketId ?? null, to: row.to, state: row.state, attempts: row.attempts ?? 0,
     nextRetryAt: row.nextRetryAt ?? null, lastError: row.lastError ?? null, text: String(row.body ?? row.text ?? '').slice(0, 120),
+    ...(row.retryable === false && { retryable: false }),
   })
   return {
     queued: count('queued'), held: count('held'), recorded: count('recorded'), failed: count('failed'), sent: count('sent'),
@@ -316,7 +355,7 @@ function indexMessageReplies(store, triggers, ticketTriggers) {
     const marker = String(row.body ?? row.text ?? '').match(FEISHU_TEST_MARKER)?.[0] ?? null
     if (trigger?.kind === 'feishu' && trigger.source?.chatId === chatId) {
       if (marker === feishuSelfTestMarker(trigger.source.messageId)) pick(linked, triggerId, row)
-    } else if (!row.triggerId && !row.ticketId) {
+    } else if (!row.triggerId && !row.ticketId && !(row.notificationWindowMs > 0)) {
       if (marker) pick(testsByMarker, chatId + ':' + marker, row)
       else if (!unlinkedByChat.has(chatId) || (row.createdAt ?? '') >= (unlinkedByChat.get(chatId).createdAt ?? '')) unlinkedByChat.set(chatId, row)
     }
@@ -339,64 +378,292 @@ export function readMessageDetail(store, triggerId) {
   const record = store.db.prepare('SELECT value FROM trigger WHERE id = ?').get(triggerId)
   if (!record) return null
   const trigger = JSON.parse(String(record.value))
-  const tickets = store.db.prepare("SELECT id FROM ticket WHERE json_extract(value, '$.triggerId') = ?").all(triggerId)
+  const tickets = store.db.prepare("SELECT id, value FROM ticket WHERE json_extract(value, '$.triggerId') = ? ORDER BY rowid").all(triggerId)
   const ticketTriggers = new Map(tickets.map(ticket => [ticket.id, triggerId]))
+  const ticket = tickets.length ? JSON.parse(String(tickets.at(-1).value)) : null
   const { row, unlinked } = indexMessageReplies(store, new Map([[triggerId, trigger]]), ticketTriggers)(trigger)
+  const intakeRows = store.db.prepare(
+    "SELECT value FROM outbox WHERE json_extract(value, '$.triggerId') = ? "
+    + "AND json_extract(value, '$.kind') IN ('inbox', 'stop', 'inject')",
+  ).all(triggerId).map(record => JSON.parse(String(record.value)))
+  const delivery = pickQueueRow(intakeRows)
   return {
     id: triggerId, message: storedMessage(trigger), at: trigger.at ?? null,
     dropped: trigger.dropped ?? null, replyUnlinked: unlinked,
+    intake: trigger.policy || delivery || trigger.intakeCohort ? {
+      disposition: delivery?.state === 'failed' ? 'failed' : intakeDisposition(trigger, ticket),
+      queueState: delivery?.state ?? null, lastError: delivery?.lastError ?? null,
+      ...(trigger.intakeCohort && { cohort: {
+        ...trigger.intakeCohort,
+        messages: trigger.intakeCohort.triggerIds.map(id => {
+          const linked = store.db.prepare('SELECT value FROM trigger WHERE id = ?').get(id)
+          return { triggerId: id, message: linked ? storedMessage(JSON.parse(String(linked.value))) : null,
+            ticketIds: store.db.prepare("SELECT id FROM ticket WHERE json_extract(value, '$.triggerId') = ?").all(id).map(ticket => ticket.id) }
+        }),
+      } }),
+    } : null,
     reply: row ? { ...projectReply(row), sentAt: row.sentAt ?? null } : null,
   }
 }
 
 /**
- * The 三问 overview (spec「观测性：独立 web 面板」):
- *  1. 什么状态 — every ticket with its stage + stageText 朗读, grouped client-side (计数 = 列表长度);
- *  2. 在干什么 — the ticket face facts (report 四段, pendingConfirm, question, assignments);
- *  3. 结果在哪 — 等验收票 additionally carry the owner directory listing (产物在哪).
- * @param {{ store: import('./store.js').Store, registry: import('./registry.js').OwnerRegistry,
- *   health?: object, now?: () => string, listDir?: (cwd: string) => string[] | null }} args
+ * S06 投喂面（只读投影）: the two intake entries — the Feishu source and the normal owner route — described
+ * ONLY by what the router already persisted (trigger rows + outbox rows). Nothing here is computed from
+ * settings, nothing here is writable, and a fact the router did not record stays null so the panel renders
+ * 「—」 instead of inventing a value (诚实状态). The arrival-time policy snapshot is passed through verbatim
+ * under whatever key the router chose; the panel never guesses or fills it in.
  */
-export function buildOverview({ store, registry, health, now, listDir }) {
-  const readAll = table => store.db.prepare('SELECT value FROM ' + table).all().map(r => JSON.parse(String(r.value)))
-  const triggers = new Map(readAll('trigger').map(t => [t.id, t]))
-  const owners = registry.list().map(o => ({
-    id: o.id, role: o.role, kind: o.kind, workspace: o.workspace ?? null, cwd: o.cwd,
-    sessionId: o.sessionId ?? null, status: o.status, transient: o.transient === true, recycled: o.recycled === true,
-    createdAt: o.createdAt ?? null, updatedAt: o.updatedAt ?? null,
-  }))
-  const ownerById = new Map(owners.map(o => [o.id, o]))
-  const tickets = readAll('ticket').map(t => {
-    const trigger = t.triggerId ? triggers.get(t.triggerId) : undefined
-    const owner = ownerById.get(t.owner)
-    const row = {
-      id: t.id,
-      owner: t.owner,
-      ownerLabel: owner ? (owner.workspace ?? owner.id) : t.owner,
-      stage: t.stage,
-      stageText: STAGE_TEXT[t.stage] ?? t.stage,
-      message: t.routedMessage ?? (typeof trigger?.message === 'string' ? trigger.message : null),
-      createdAt: t.createdAt ?? null,
-      updatedAt: t.updatedAt ?? null,
-      recoveryPending: t.recoveryPending === true,
-      // 授权记录 (AC 11: 谁授权的、什么时候、基于哪条消息) 与任务历史都在票面上
-      authorization: t.authorization ?? null,
-      trigger: trigger ? { id: trigger.id, kind: trigger.kind ?? null, at: trigger.at ?? null, sourceRef: trigger.sourceRef ?? null } : null,
-      assignments: t.assignments ?? [],
-      question: t.question ?? null,
-      pendingConfirm: t.pendingConfirm ?? null,
-      report: t.report ?? null,
-      dirListing: null,
+const INTAKE_SOURCES = [
+  ['feishu', '飞书入口'],
+  ['route', '负责人路由'],
+]
+
+/** Most relevant delivery row first: failures, then in-flight, then delivered (mirrors REPLY_PRIORITY). */
+const QUEUE_PRIORITY = { failed: 0, held: 1, queued: 1, recorded: 1, sent: 2 }
+
+/**
+ * The arrival-time policy snapshot, if the router persisted one on the trigger row (read-only pass-through).
+ * 契约（s06-core 确认）: 快照是触发行上的顶层 `policy` 字段（{ addressing, chatType, msgType, allowed, reason }），
+ * 没有 `intake`/`policySnapshot` 之类的外层包装。没落库就是 null —— 面板不补、不猜。
+ */
+function policySnapshot(trigger) {
+  const value = trigger.policy
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : null
+}
+
+function pickQueueRow(rows) {
+  let best = null
+  for (const row of rows) {
+    const order = QUEUE_PRIORITY[row.state] ?? 3
+    if (!best) { best = row; continue }
+    const bestOrder = QUEUE_PRIORITY[best.state] ?? 3
+    if (order < bestOrder || (order === bestOrder && String(row.createdAt ?? '') >= String(best.createdAt ?? ''))) best = row
+  }
+  return best
+}
+
+/**
+ * 处置口径 — 只从已落库的事实里选一个词，两个入口共用同一套判断（面板与客户端不再各自猜）:
+ *  - 'dropped'  触发行自带 dropped（router 当场丢弃并记账）
+ *  - 'injected' 触发行有真实注入时间戳（飞书侧注入成功才回写）或票面 lastDelivery.state === 'sent'
+ *               （router markDelivered 只在 prompt 真被宿主接纳后才写）
+ *  - 'pending'  触发行已落库但上面两条都不成立 —— 已受理、等注入（重启会重放，不是丢失）
+ *  - null       这个入口还没有任何触发行
+ */
+function intakeDisposition(trigger, ticket) {
+  if (!trigger) return null
+  if (trigger.dropped) return 'dropped'
+  if (trigger.policy?.mode === 'interrupt') return trigger.interruptAt ? 'interrupt-requested' : 'interrupt'
+  if (trigger.injectedAt != null) return 'injected'
+  if (ticket?.lastDelivery?.state === 'sent') return 'injected'
+  if (trigger.intakeDiscarded === true) return 'discarded'
+  return 'pending'
+}
+
+function intakeProjection({ triggers, tickets, outbox, generatedAt }) {
+  const ticketByTrigger = new Map()
+  for (const ticket of tickets) if (ticket.triggerId) ticketByTrigger.set(ticket.triggerId, ticket)
+  const rowsByTicket = new Map()
+  const rowsByTrigger = new Map()
+  const push = (map, key, row) => { const list = map.get(key); if (list) list.push(row); else map.set(key, [row]) }
+  for (const row of outbox) {
+    if (row.ticketId) push(rowsByTicket, row.ticketId, row)
+    if (row.triggerId) push(rowsByTrigger, row.triggerId, row)
+  }
+  const emptyQueue = { state: null, attempts: 0, nextRetryAt: null, lastError: null, rows: 0 }
+  const sources = INTAKE_SOURCES.map(([source, label]) => {
+    const mine = triggers.filter(trigger => (trigger.kind ?? null) === source)
+    // 计数就是列表长度，口径与「处置」列一致：飞书侧注入成功才回写 injectedAt；route 侧由票面
+    // lastDelivery.state === 'sent' 判定（router markDelivered 只在 prompt 真被宿主接纳后才写）。
+    const counts = {
+      triggers: mine.length,
+      dropped: mine.filter(trigger => Boolean(trigger.dropped)).length,
+      injected: mine.filter(trigger => intakeDisposition(trigger, ticketByTrigger.get(trigger.id) ?? null) === 'injected').length,
     }
-    // 结果在哪: list artifacts for review/working tickets whose owner directory still exists (recycled 已删).
-    // review 行内展示，working 收进详情折叠——干活干到一半也能瞄一眼产物。
-    if ((t.stage === 'person/review' || t.stage === 'working') && owner && !owner.recycled) {
-      row.dirListing = (listDir ?? listDirCapped)(owner.cwd)
+    const last = mine.reduce((best, trigger) => (!best || String(trigger.at ?? '') >= String(best.at ?? '') ? trigger : best), null)
+    if (!last) {
+      return { source, label, at: null, triggerId: null, addressing: null, dropped: null, injectedAt: null,
+        ownerId: null, ticketId: null, policy: null, dedupKey: null, disposition: null, queue: { ...emptyQueue }, counts }
     }
-    return row
+    const ticket = ticketByTrigger.get(last.id) ?? null
+    const linked = new Map()
+    for (const row of rowsByTrigger.get(last.id) ?? []) linked.set(row.id, row)
+    for (const row of ticket ? rowsByTicket.get(ticket.id) ?? [] : []) linked.set(row.id, row)
+    const queueRow = pickQueueRow([...linked.values()])
+    return {
+      source,
+      label,
+      at: last.at ?? null,
+      triggerId: last.id,
+      // 到达时的受理口径: 触发行自带的 addressing（feishu 源归一化产物 / 授权记录），没有就是 null。
+      addressing: last.source?.addressing ?? last.authorization?.addressing ?? null,
+      dropped: last.dropped ?? null,
+      injectedAt: last.injectedAt ?? null,
+      // 归属人：触发行自己写了就用它，否则用这张票面上的 owner（都是已落库的事实，不推断）。
+      ownerId: last.ownerId ?? ticket?.owner ?? null,
+      ticketId: ticket?.id ?? null,
+      policy: policySnapshot(last),
+      // 去重键 = 触发行 id（feishu 侧是 feishu-<messageId>；route 侧是 router 生成/回填的引用）。
+      dedupKey: last.id,
+      disposition: intakeDisposition(last, ticket),
+      queue: {
+        state: queueRow?.state ?? null,
+        attempts: queueRow?.attempts ?? 0,
+        nextRetryAt: queueRow?.nextRetryAt ?? null,
+        lastError: queueRow?.lastError ?? null,
+        rows: linked.size,
+      },
+      counts,
+    }
   })
-  const ticketTriggers = new Map(tickets.map(ticket => [ticket.id, ticket.trigger?.id]))
-  const ticketByTriggerId = new Map(tickets.filter(ticket => ticket.trigger?.id).map(ticket => [ticket.trigger.id, ticket]))
+  return { generatedAt, sources }
+}
+
+/** Standalone entry point for callers that hold only a Store (tests, dev API). */
+export function buildIntakePolicy(store, { now } = {}) {
+  const readAll = table => store.db.prepare('SELECT value FROM ' + table).all().map(r => JSON.parse(String(r.value)))
+  return intakeProjection({
+    triggers: readAll('trigger'),
+    tickets: readAll('ticket'),
+    outbox: readAll('outbox'),
+    generatedAt: (now ?? (() => new Date().toISOString()))(),
+  })
+}
+
+const OVERVIEW_STAGES = new Map([
+  'person/answer', 'person/confirm', 'person/review', 'blocked', 'failed', 'working', 'queued', 'idle', 'done', 'canceled',
+].map((stage, index) => [stage, index]))
+
+function excerpt(text, limit) {
+  return typeof text === 'string' && text.length > limit ? text.slice(0, limit) + '…' : text
+}
+
+function projectOwner(owner) {
+  return {
+    id: owner.id, role: owner.role, kind: owner.kind, workspace: owner.workspace ?? null, cwd: owner.cwd,
+    sessionId: owner.sessionId ?? null, status: owner.status, transient: owner.transient === true, recycled: owner.recycled === true,
+    createdAt: owner.createdAt ?? null, updatedAt: owner.updatedAt ?? null,
+  }
+}
+
+function compareTicketStage(a, b) {
+  return (OVERVIEW_STAGES.get(a.stage) ?? OVERVIEW_STAGES.size) - (OVERVIEW_STAGES.get(b.stage) ?? OVERVIEW_STAGES.size)
+}
+
+function projectTicket(ticket, { trigger, owner, findAnswer, compact, listDir }) {
+  const stage = normalizeStage(ticket.stage)
+  const message = ticket.routedMessage ?? (typeof trigger?.message === 'string' ? trigger.message : null)
+  const deferred = ticket.deferred
+  let answerDelivery = deferred?.outcome?.delivery ?? null
+  if (answerDelivery?.state === 'queued') {
+    const row = findAnswer('out-answer-' + deferred.requestId)
+    if (!row) answerDelivery = { state: 'discarded' }
+    else if (row.state === 'failed') answerDelivery = { state: 'failed', reason: row.lastError ?? null }
+  }
+  const report = ticket.report ?? null
+  const attentionReason = stage === 'failed' ? ticket.failed?.reason
+    : stage === 'blocked' ? ticket.escalated?.reason ?? ticket.confirmOutcome?.reason : null
+  return {
+    id: ticket.id, owner: ticket.owner, ownerLabel: owner?.workspace ?? ticket.owner,
+    ownerSessionId: owner?.sessionId ?? null, stage, stageText: STAGE_TEXT[stage] ?? stage,
+    message,
+    createdAt: ticket.createdAt ?? null, updatedAt: ticket.updatedAt ?? null,
+    recoveryPending: ticket.recoveryPending === true,
+    ...(attentionReason && { attentionReason: compact ? excerpt(attentionReason, 240) : attentionReason }),
+    authorization: compact ? null : ticket.authorization ?? null,
+    trigger: trigger ? { id: trigger.id, kind: trigger.kind ?? null, at: trigger.at ?? null, sourceRef: trigger.sourceRef ?? null } : null,
+    assignments: compact ? [] : ticket.assignments ?? [],
+    workerSession: ticket.workerSession ?? null,
+    lastDelivery: ticket.lastDelivery ? { state: ticket.lastDelivery.state ?? null } : null,
+    background: ticket.background ? { kind: ticket.background.kind, timerId: ticket.background.timerId ?? null } : null,
+    question: !compact || stage === 'person/answer' ? ticket.question ?? null : null,
+    pendingConfirm: !compact || stage === 'person/confirm' ? ticket.pendingConfirm ?? null : null,
+    deferred: deferred ? { requestId: deferred.requestId, type: deferred.type, status: deferred.status, expiresAt: deferred.expiresAt,
+      target: deferred.target ?? null,
+      answer: !compact && deferred.outcome?.decision === 'answer' ? deferred.outcome.text ?? null : null,
+      delivery: answerDelivery, reason: deferred.outcome?.reason ?? ticket.failed?.reason ?? null } : null,
+    report: compact && report ? { summary: excerpt(report.summary ?? report.text, 240), at: report.at ?? null } : report,
+    dirListing: !compact && (stage === 'person/review' || stage === 'working') && owner && !owner.recycled
+      ? listDir(owner.cwd) : null,
+  }
+}
+
+/** Read a full report and ticket facts by ID without evaluating the Overview or reading other tickets. */
+export function readTicketDetail({ store, registry, ticketId, listDir = listDirCapped }) {
+  const ticket = readStoredRow(store, 'ticket', ticketId)
+  if (!ticket) return null
+  return projectTicket(ticket, {
+    trigger: ticket.triggerId ? readStoredRow(store, 'trigger', ticket.triggerId) : null,
+    owner: ticket.owner == null ? null : registry.get(ticket.owner),
+    findAnswer: id => readStoredRow(store, 'outbox', id),
+    listDir,
+  })
+}
+
+function readStoredRow(store, table, id) {
+  const raw = store.db.prepare('SELECT value FROM ' + table + ' WHERE id = ?').get(id)
+  return raw ? JSON.parse(String(raw.value)) : null
+}
+
+/**
+ * Read compact tickets for one stable owner and attach the scoped management records.
+ * `runs` is the existing run page with `runs` and `nextOffset`.
+ */
+export function readOwnerWorkspace({ store, registry, ownerId, timers, runs, switchOperation }) {
+  const registered = registry.get(ownerId)
+  if (!registered) return null
+  const owner = projectOwner(registered)
+  const rows = store.db.prepare(`
+    SELECT ticket.value, trigger.value AS triggerValue FROM ticket
+    LEFT JOIN trigger ON trigger.id = json_extract(ticket.value, '$.triggerId')
+    WHERE json_extract(ticket.value, '$.owner') = ?
+    ORDER BY ticket.rowid
+  `).all(ownerId)
+  const tickets = rows.map(({ value, triggerValue }) => projectTicket(JSON.parse(value), {
+    trigger: triggerValue ? JSON.parse(triggerValue) : null,
+    owner,
+    findAnswer: id => readStoredRow(store, 'outbox', id),
+    compact: true,
+  })).sort(compareTicketStage)
+  return {
+    owner, tickets,
+    timers: timers.filter(timer => timer.ownerId === ownerId),
+    runs: runs.runs.filter(run => run.ownerId === ownerId),
+    nextRunOffset: runs.nextOffset,
+    switchOperation: switchOperation?.ownerId === ownerId ? switchOperation : null,
+  }
+}
+
+/**
+ * The shared Overview lists tickets in priority order, retaining arrival order within each stage.
+ * Polling clients request compact ticket previews and load complete reports and artifacts by ID.
+ * @param {{ store: import('./store.js').Store, registry: import('./registry.js').OwnerRegistry,
+ *   health?: object, now?: () => string, listDir?: (cwd: string) => string[] | null, compact?: boolean }} args
+ */
+
+export function buildOverview({ store, registry, health, now, listDir = listDirCapped, compact = false }) {
+  const readAll = table => store.db.prepare('SELECT value FROM ' + table + ' ORDER BY rowid').all().map(r => JSON.parse(String(r.value)))
+  const triggerRows = readAll('trigger')
+  const triggers = new Map(triggerRows.map(t => [t.id, t]))
+  const owners = registry.list().map(projectOwner)
+  const ownerById = new Map(owners.map(o => [o.id, o]))
+  const outboxRows = readAll('outbox')
+  const answersById = new Map(outboxRows.filter(row => row.kind === 'deferred-answer').map(row => [row.id, row]))
+  const tickets = []
+  const ticketTriggers = new Map()
+  const ticketByTriggerId = new Map()
+  const ticketValues = store.db.prepare('SELECT value FROM ticket ORDER BY rowid')
+  for (const { value } of ticketValues.iterate()) {
+    const ticket = JSON.parse(String(value))
+    const row = projectTicket(ticket, { trigger: triggers.get(ticket.triggerId), owner: ownerById.get(ticket.owner),
+      findAnswer: id => answersById.get(id), compact, listDir })
+    tickets.push(row)
+    if (row.trigger) {
+      ticketTriggers.set(row.id, row.trigger.id)
+      ticketByTriggerId.set(row.trigger.id, row)
+    }
+  }
+  tickets.sort(compareTicketStage)
   const replyFor = indexMessageReplies(store, triggers, ticketTriggers)
   const generatedAt = (now ?? (() => new Date().toISOString()))()
   const nowMs = Date.parse(generatedAt) || Date.now()
@@ -425,6 +692,9 @@ export function buildOverview({ store, registry, health, now, listDir }) {
     .filter(row => row.kind === 'feishu' && feishuSelfTestMarker(triggers.get(row.id)?.source?.messageId) && nowMs - Date.parse(row.at) <= 120_000)
     .map(({ id, dropped, reply }) => ({ id, dropped, reply }))
   const unprocessedTriggers = projected.filter(row => row.unprocessed).length
+  // S06: 投喂面口径只读投影 — 完全由上面已读出的 trigger/ticket/outbox 行推导，不读设置、不写任何东西。
+  const intakeTickets = [...ticketByTriggerId].map(([triggerId, ticket]) => ({ ...ticket, triggerId }))
+  const intake = intakeProjection({ triggers: triggerRows, tickets: intakeTickets, outbox: outboxRows, generatedAt })
   return {
     generatedAt,
     owners,
@@ -432,6 +702,7 @@ export function buildOverview({ store, registry, health, now, listDir }) {
     recentTriggers,
     selfTests,
     unprocessedTriggers,
+    intake,
     health: health ?? {},
   }
 }

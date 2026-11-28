@@ -68,6 +68,7 @@ async function seedPendingFork({ router }) {
   const owner = router.registry.get('repo-W') ?? router.registry.create({ kind: 'repo', workspace: 'W', cwd: '/w' })
   const receipt = await router.routeToOwner({ ownerId: owner.id, message: '开发登录功能' })
   const action = buildForkAction({ sessionId: 'session-l3-polluted', cwd: '/w', reason: '原会话上下文被无关实验污染，fork 干净副本续作' })
+  router.tasks.bindWorkerSession(receipt.ticketId, { sessionId: action.sessionId, cwd: action.cwd })
   router.tasks.askConfirm({ ticketId: receipt.ticketId, question: forkConfirmText(action, receipt.ticketId), action })
   return { owner, ticketId: receipt.ticketId, action }
 }
@@ -191,6 +192,20 @@ test('resolution:"confirm" executes the fork, rebinds the task and wakes the own
   } finally { cleanup() }
 })
 
+test('a pending legacy fork cannot use a worker after its ticket binding changes', async () => {
+  const { router, calls, cleanup } = routerFixture()
+  try {
+    const { owner, ticketId } = await seedPendingFork({ router })
+    const original = router.getTicket(ticketId)
+    router.tasks.bindWorkerSession(ticketId, { sessionId: 'fixture-new-worker', cwd: owner.cwd })
+    await assert.rejects(router.routeToOwner({ ownerId: owner.id, ticketId, resolution: 'confirm', message: 'Approve the old fixture' }),
+      { code: 'legacy-confirm-target-invalid' })
+    assert.deepEqual(calls.fork, [])
+    assert.equal(router.getTicket(ticketId).stage, 'person/confirm')
+    assert.deepEqual(router.getTicket(ticketId).pendingConfirm, original.pendingConfirm)
+  } finally { cleanup() }
+})
+
 test('resolution:"confirm" on a fork failure keeps person/confirm and reports fork-failed', async () => {
   const { router, cleanup } = routerFixture({ forkImpl: async () => { throw new Error('session "session-l3-polluted" not found') } })
   try {
@@ -287,5 +302,74 @@ test('fork 会话与原会话互不干扰：fork 只读源会话事件，原会�
     const injected = calls.prompt.map(p => p.sessionId)
     assert.ok(!injected.includes(original), '原会话全程未被注入（互不干扰）')
     assert.ok(injected.includes(receipt.sessionId), '唤醒只发给负责人会话')
+  } finally { cleanup() }
+})
+
+/** Awaits one call that MUST throw, returning the Error so its code/message can be asserted. */
+async function forkRejection(promise, label) {
+  try {
+    await promise
+  } catch (error) {
+    return error
+  }
+  assert.fail(label + '：本应拒绝，但调用却成功了')
+  return undefined
+}
+
+/**
+ * fork 的授权与确认闸门不得被切点改动放松（issue #34, #69）：真实事件序号（read_session 暴露的那种大序号）
+ * 原样穿过 action → 确认文本 → sessions.fork；且确认闸门在 fork 之前就把关 —— 票不在 person/confirm 时
+ * 一次 fork 都不许发生。atSeq 只能是真实非负安全整数，编造的切点直接被拒。
+ *
+ * The fork authorization + confirmation gate stays intact while the cut point becomes verifiable (issue #34, #69):
+ * a REAL event seq flows verbatim through action → confirm text → sessions.fork; the gate still runs BEFORE any fork
+ * side effect (a ticket not at person/confirm never reaches the fork call); and a fabricated atSeq is refused.
+ */
+test('S03 regression: fork keeps its confirmation gate and forwards the exact real atSeq', async () => {
+  const { board, seed, cleanup } = boardFixture()
+  try {
+    // 真实转录页上的事件序号（docs/evidence-task-12.md 记录的活实证量级：四位数全局序号，不是页内下标）。
+    const realSeq = 1601
+    const action = buildForkAction({ sessionId: 'session-l3', cwd: '/w', reason: '上下文被压测指令污染，从干净边界切出续作', atSeq: realSeq })
+    assert.equal(action.type, FORK_ACTION_TYPE)
+    assert.equal(action.atSeq, realSeq, 'buildForkAction 原样保留真实事件序号作为含边界切点')
+    assert.ok(forkConfirmText(action, 'tsk-s03-fork').includes(String(realSeq)), '确认文本向用户指明真实切点序号（对象+预期结果，不靠模型自觉）')
+
+    // 编造的切点必须被拒（不合法 → 不允许悄悄降级成「缺省 fork」）。
+    for (const bogus of [-1, 1.5, '1601', Number.MAX_SAFE_INTEGER + 2]) {
+      assert.throws(
+        () => buildForkAction({ sessionId: 'session-l3', cwd: '/w', reason: 'r', atSeq: bogus }),
+        { code: 'fork-atseq-invalid' },
+        '非法 atSeq ' + JSON.stringify(bogus) + ' 必须被拒',
+      )
+    }
+
+    // 确认闸门在 fork 之前：票还在 working（没到 person/confirm）→ 一次 fork 都不许发生。
+    const working = seed('working')
+    const earlyCalls = []
+    const early = await forkRejection(
+      confirmTicketFork({ tasks: board, sessions: { fork: async r => { earlyCalls.push(r); return { sessionId: 'session-nope' } } }, ticketId: working.id }),
+      'working 票不得执行 fork',
+    )
+    assert.equal(early.code, 'illegal-transition', '票不在 person/confirm 时拒绝（确认闸门未放松）')
+    assert.deepEqual(earlyCalls, [], '被闸门拦下时不得发生任何 fork 副作用')
+
+    // 放行后：action 上的真实 atSeq 必须一字不差地传给 sessions.fork（含边界，不四舍五入、不改写）。
+    const t = seed('working')
+    board.askConfirm({ ticketId: t.id, question: forkConfirmText(action, t.id), action })
+    const forkCalls = []
+    const result = await confirmTicketFork({
+      tasks: board,
+      sessions: { fork: async request => { forkCalls.push(request); return { sessionId: 'session-forked-s03' } } },
+      ticketId: t.id,
+    })
+    assert.deepEqual(forkCalls, [{ sessionId: 'session-l3', atSeq: realSeq }], 'sessions.fork 收到 { sessionId, atSeq } 原样请求（atSeq 含边界）')
+    assert.equal(result.atSeq, realSeq, '回执保留真实切点序号，供审计')
+    assert.equal(result.fromSessionId, 'session-l3', '回执记录源会话（原会话保留可查）')
+    assert.equal(result.sessionId, 'session-forked-s03', '回执记录新会话（任务绑到新会话续作）')
+    const ticket = board.getTicket(t.id)
+    assert.equal(ticket.mechanism, 'fork', '确认后任务机制记为 fork')
+    assert.equal(ticket.workerSession.sessionId, 'session-forked-s03', '任务绑到新会话')
+    assert.equal(ticket.stage, 'working', '确认后回到进行中')
   } finally { cleanup() }
 })

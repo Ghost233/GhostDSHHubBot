@@ -12,11 +12,18 @@
  * crash recovery are unit-testable without a DSH runtime. Rows live in the store's outbox table — a fresh
  * runner over the same store resumes unfinished work (spec: 重启恢复）. Legacy 'recorded' rows (pre-#66
  * reply intents) are not delivery work and are left untouched.
+ *
+ * S07 同聊天合并 (issue #38): intake rows of the same owner AND the same stored Feishu chat are claimed as ONE
+ * cohort — only the consecutive due, pending prefix of that inbox. Before delivery, one transaction freezes
+ * the original rows in the head (mergedRows, in arrival order with the head first) and records the membership
+ * on each trigger. A retry, postponement or restart reuses the frozen members and the original head requestId.
+ * mergedCount includes the head. An accepted cohort settles its rows together. Only a merge adds mergedRows.
  */
 import { randomUUID } from 'node:crypto'
+import { archiveRunNotification } from './runs.js'
 
 /** Backoff caps by row kind (spec: 回复上限 1 分钟、注入上限 5 分钟）. */
-const CAP_MS = { inject: 5 * 60_000, reply: 60_000 }
+const CAP_MS = { inject: 5 * 60_000, inbox: 5 * 60_000, reply: 60_000 }
 const BASE_MS = 2_000
 const MAX_ATTEMPTS = 3
 
@@ -37,38 +44,79 @@ export function insertOutbox(store, row, now = () => Date.now()) {
   return full
 }
 
-/** THE one outbox row updater (双轴审查 P1-2: feishu/github/runner hand-rolled the same UPDATE three times). */
+function writeOutboxTransaction(store, write) {
+  const { db } = store
+  if (db.isTransaction) return write()
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const result = write()
+    db.exec('COMMIT')
+    return result
+  } catch (error) {
+    if (db.isTransaction) db.exec('ROLLBACK')
+    throw error
+  }
+}
+
+function failedOutboxGroups(store, ids) {
+  const groups = new Map()
+  for (const { value } of store.db.prepare('SELECT value FROM outbox').all()) {
+    const row = JSON.parse(String(value))
+    if (row.state !== 'failed') continue
+    const headId = row.settledWith ?? row.id
+    if (!groups.has(headId)) groups.set(headId, [])
+    groups.get(headId).push(row)
+  }
+  return [...groups].filter(([, rows]) => ids === null || rows.some(row => ids.includes(row.id)))
+}
+
 /**
  * 死信重投（面板健康警告条的操作闭环）: failed 行回到原投递通道（originState），
  * attempts 清零、退避清空——下一轮 tick 重新尝试。返回重投的行数。
- * 旧死信（v0.4.1 前，无 originState）默认回 'queued'——主循环能处理绝大多数行。
+ * 旧死信（v0.4.1 前，无 originState）默认回 'queued'。同一批的死信以原队头和冻结成员表整批重投。
  */
-export function retryOutboxRows(store, ids = null) {
-  const rows = store.db.prepare('SELECT id, value FROM outbox').all()
-    .map(r => JSON.parse(String(r.value)))
-    .filter(row => row.state === 'failed' && (ids === null || ids.includes(row.id)))
-  let retried = 0
-  for (const row of rows) {
-    const { originState, ...rest } = row
-    updateOutboxRow(store, { ...rest, state: originState ?? 'queued', attempts: 0, nextRetryAt: null, lastError: null })
-    retried++
-  }
-  return retried
+export function retryOutboxRows(store, ids = null, now = () => new Date().toISOString()) {
+  return writeOutboxTransaction(store, () => {
+    let retried = 0
+    for (const [headId, rows] of failedOutboxGroups(store, ids)) {
+      // A partial cohort can be discarded, but replay requires the original head and every frozen member.
+      const head = rows.find(row => row.id === headId)
+      if (!head || head.retryable === false) continue
+      const frozen = Array.isArray(head.mergedRows) ? head.mergedRows : [head]
+      const memberIds = new Set(frozen.map(member => member?.id))
+      if (frozen.length !== rows.length || rows.some(row => !memberIds.has(row.id))) continue
+      for (const { originState, ...row } of rows) {
+        const ordinary = Number.isSafeInteger(row.notificationWindowMs) && row.notificationWindowMs > 0
+        updateOutboxRow(store, { ...row, state: ordinary ? 'held' : originState ?? 'queued',
+          ...(ordinary && { notificationRetry: true, notificationRetryAt: now() }), attempts: 0, nextRetryAt: null, lastError: null })
+      }
+      retried += rows.length
+    }
+    return retried
+  })
 }
 
 /**
- * 死信丢弃（round 41）：确认不在乎的失败回执从 outbox 删除——重投治「还想送」，丢弃治「别再来」。
- * 返回删除的行数。只碰 failed 行，queued/recorded 等活行绝不被误删。
+ * 死信丢弃（round 41）：删除选中的 failed 行及其整批死信。返回删除的行数。
  */
 export function discardOutboxRows(store, ids = null) {
-  const rows = store.db.prepare('SELECT id, value FROM outbox').all()
-    .map(r => JSON.parse(String(r.value)))
-    .filter(row => row.state === 'failed' && (ids === null || ids.includes(row.id)))
-  const del = store.db.prepare('DELETE FROM outbox WHERE id = ?')
-  for (const row of rows) del.run(row.id)
-  return rows.length
+  return writeOutboxTransaction(store, () => {
+    const del = store.db.prepare('DELETE FROM outbox WHERE id = ?')
+    const discardIntake = store.db.prepare("UPDATE trigger SET value = json_set(value, '$.intakeDiscarded', json('true')) WHERE id = ?")
+    let discarded = 0
+    for (const [, rows] of failedOutboxGroups(store, ids)) {
+      for (const row of rows) {
+        if (row.kind === 'inbox' && row.triggerId) discardIntake.run(row.triggerId)
+        archiveRunNotification(store, row)
+        del.run(row.id)
+      }
+      discarded += rows.length
+    }
+    return discarded
+  })
 }
 
+/** THE one outbox row updater (双轴审查 P1-2: feishu/github/runner hand-rolled the same UPDATE three times). */
 export function updateOutboxRow(store, row) {
   store.db.prepare('UPDATE outbox SET value = ? WHERE id = ?').run(JSON.stringify(row), row.id)
 }
@@ -82,7 +130,7 @@ export function updateOutboxRow(store, row) {
  * @param {{ store: import('./store.js').Store, logger: { warn: Function }, now: () => string,
  *   channel: string, prefix: string, maxAttempts: number,
  *   parseTarget: (to: string) => unknown,  // null = unparseable → the row fails immediately
- *   send: (target: unknown, body: string) => Promise<void>,
+ *   send: (target: unknown, body: string, row: object) => Promise<void | false>, // false leaves the row available for a later pass
  *   prepareBody?: (body: string) => string, canContinue?: () => boolean }} deps
  */
 /**
@@ -120,10 +168,12 @@ async function deliverRecordedRepliesPass({ store, logger, now, channel, prefix,
     }
     const body = prepareBody ? prepareBody(row.body) : row.body
     try {
-      await send(target, body)
+      if (await send(target, body, row) === false) continue
+      if (store.closed) break
       updateOutboxRow(store, { ...row, state: 'sent', sentAt: now() })
       delivered++
     } catch (error) {
+      if (store.closed) break
       const attempts = (row.attempts ?? 0) + 1
       logger.warn('hub-bot %s: reply to %s failed (%s)', channel, row.to, error?.message ?? error)
       if (attempts >= maxAttempts) {
@@ -144,14 +194,27 @@ async function deliverRecordedRepliesPass({ store, logger, now, channel, prefix,
 
 export class OutboxRunner {
   /**
+   * S01 单飞账本： per-ticket key（`row.ticketId ?? ''`）标记「这张票当前有一轮 drain 在途」。
+   * 一行从 enqueue 到落 sent/recorded/failed 之间始终是 'queued'，而 1s 定时器并不 await 上一轮
+   * tick（先存后做 = 行先入库，送达后才改状态）—— 慢投递（真实 gh/feishu/会话 prompt）常常超过一秒，
+   * 没有这把锁，重叠的 tick 会把同一个 queued 行再投一次。进程内、不落盘：崩溃后下一轮 tick 照常重试
+   * 仍是 'queued' 的行，语义不变。按票隔离，票与票之间永不互相阻塞。
+   */
+  #activeDrains = new Set()
+
+
+
+  /**
    * @param {{ store: import('./store.js').Store,
    *           deliver: (row: object) => Promise<void>,
    *           now?: () => number,
+   *           onFailure?: (row: object, reason: string) => boolean,
    *           onSystemProblem?: (problem: { ticketId: string|null, reason: string, rowId: string }) => void }} deps
    */
-  constructor({ store, deliver, now, onSystemProblem }) {
+  constructor({ store, deliver, now, onFailure, onSystemProblem }) {
     this.store = store
     this.deliver = deliver
+    this.onFailure = onFailure
     this.now = now ?? (() => Date.now())
     this.onSystemProblem = onSystemProblem ?? (() => {})
   }
@@ -162,9 +225,9 @@ export class OutboxRunner {
    * scan until releaseHeld() flips it to 'queued' (slot admission). Per-ticket order survives: the held head
    * and any follow-up rows release together, oldest first.
    */
-  enqueue({ ticketId, triggerId, kind, to, body, sessionId, requestId, held }) {
+  enqueue({ id, ticketId, triggerId, kind, to, body, sessionId, requestId, held }) {
     return insertOutbox(this.store, {
-      ticketId: ticketId ?? null, kind, to, body, sessionId: sessionId ?? null, requestId, state: held === true ? 'held' : 'queued',
+      id, ticketId: ticketId ?? null, kind, to, body, sessionId: sessionId ?? null, requestId, state: held === true ? 'held' : 'queued',
       ...(triggerId !== undefined && { triggerId }),
     }, this.now)
   }
@@ -173,7 +236,7 @@ export class OutboxRunner {
   releaseHeld({ ticketId }) {
     const rows = this.store.db.prepare('SELECT value FROM outbox ORDER BY at').all()
       .map(raw => JSON.parse(String(raw.value)))
-      .filter(row => row.ticketId === ticketId && row.state === 'held')
+      .filter(row => row.ticketId === ticketId && row.state === 'held' && row.kind !== 'notification-source' && !row.notificationRetry)
     for (const row of rows) this.#writeRow({ ...row, state: 'queued' })
     return rows.length
   }
@@ -187,28 +250,136 @@ export class OutboxRunner {
     updateOutboxRow(this.store, row) // 双轴审查 P1-2: 三处逐字重复收敛到这一个写者
   }
 
-  /** All queued delivery rows, oldest first, grouped by ticket (null ticket groups under ''). */
-  #pendingByTicket() {
-    const rows = this.store.db.prepare('SELECT value FROM outbox ORDER BY at').all()
+  /** All queued delivery rows, oldest first, grouped by ticket or owner inbox. */
+  #pendingByTicket({ kind, excludeKind }) {
+    const rows = this.store.db.prepare('SELECT value FROM outbox ORDER BY at, rowid').all()
       .map(raw => JSON.parse(String(raw.value)))
-      .filter(row => row.state === 'queued')
+      .filter(row => row.state === 'queued' && (kind === undefined || row.kind === kind)
+        && (excludeKind === undefined || row.kind !== excludeKind))
     const groups = new Map()
     for (const row of rows) {
-      const key = row.ticketId ?? ''
+      const ownerLane = ['inbox', 'stop', 'deferred-decision', 'owner-switch-control'].includes(row.kind)
+      const channelReply = row.kind === 'reply' && typeof row.to === 'string' && /^(feishu|github):/.test(row.to)
+      const key = channelReply ? 'reply:' + row.to : row.ticketId ?? (ownerLane ? row.kind + ':' + row.to : '')
       if (!groups.has(key)) groups.set(key, [])
       groups.get(key).push(row)
     }
     return groups
   }
 
-  /** Delivers every due row, strictly ordered within each ticket. */
-  async tick() {
+  #pendingChat(row) {
+    if (typeof row.triggerId !== 'string' || !row.triggerId) return null
+    const raw = this.store.db.prepare('SELECT value FROM trigger WHERE id = ?').get(row.triggerId)
+    if (!raw) return null
+    const trigger = JSON.parse(String(raw.value))
+    const chatId = trigger.source?.chatId
+    if (!trigger.authorization || trigger.dropped || trigger.injectedAt || typeof chatId !== 'string' || !chatId) return null
+    return JSON.stringify([chatId, trigger.ownerSwitchRef ?? null])
+  }
+
+  /**
+   * S07 同聊天合并 (issue #38): claim the cohort the head row delivers for.
+   *
+   * Membership is the consecutive, due, still-'queued' `kind: 'inbox'` prefix of one owner inbox that was
+   * admitted from the SAME stored chat. Every terminator is a hard stop: a different owner (`to`), a
+   * different chat, a not-yet-due `nextRetryAt`, a non-inbox row (stop lane / inject / reply never merge),
+   * a row already advanced by another path, and — because the snapshot is one ordered read — anything that
+   * arrived after the claim. No debounce: the cohort is what is pending at this instant, nothing waits.
+   *
+   * Save chosen membership before invoking the transport, including an attempt with only its head.
+   * Retries reuse the original request ID and members even if new rows have arrived.
+   */
+  #claimCohort(head, tail, nowMs) {
+    if (head.kind !== 'inbox' || head.cohortClaimedAt) return head
+    const members = [head]
+    const chat = this.#pendingChat(head)
+    if (chat) for (const pending of tail) {
+      const candidate = this.#readRow(pending.id)
+      if (!candidate || candidate.state !== 'queued' || candidate.kind !== 'inbox' || candidate.to !== head.to
+        || (candidate.nextRetryAt !== null && candidate.nextRetryAt > nowMs)
+        || candidate.cohortClaimedAt || candidate.settledWith != null || this.#pendingChat(candidate) !== chat) break
+      members.push(candidate)
+    }
+    const frozen = {
+      ...head, cohortClaimedAt: new Date(this.now()).toISOString(),
+      ...(members.length > 1 && { mergedRows: members, mergedCount: members.length }),
+    }
+    if (!frozen.mergedRows) {
+      this.#writeRow(frozen)
+      return frozen
+    }
+
+    const triggerIds = members.map(row => row.triggerId)
+    const audit = JSON.stringify({ requestId: frozen.requestId, triggerIds, mergedCount: frozen.mergedCount })
+    return writeOutboxTransaction(this.store, () => {
+      this.#writeRow(frozen)
+      const stamp = this.store.db.prepare("UPDATE trigger SET value = json_set(value, '$.intakeCohort', json(?)) WHERE id = ?")
+      for (const id of triggerIds) {
+        if (stamp.run(audit, id).changes !== 1) throw new Error('Missing trigger during cohort claim: ' + id)
+      }
+      return frozen
+    })
+  }
+
+  /**
+   * S07: an accepted cohort settles together. The head is already written by #attempt; every other frozen
+   * member that is still pending is advanced to the same terminal state (a member already moved or removed
+   * by another path is left alone). Members record `settledWith` so the panel/audit can tell that this row
+   * was carried by the head's wake-up instead of being delivered on its own.
+   */
+  #settleCohort(head, terminal) {
+    if (this.store.closed) return
+    writeOutboxTransaction(this.store, () => {
+      this.#writeRow({ ...head, ...terminal, nextRetryAt: null })
+      this.#settleMembers(head, terminal)
+    })
+  }
+
+  #settleMembers(head, terminal) {
+    const merged = Array.isArray(head.mergedRows) ? head.mergedRows : []
+    for (const member of merged) {
+      if (member?.id === undefined || member.id === head.id) continue
+      const current = this.#readRow(member.id)
+      if (current === undefined || current.state !== 'queued') continue
+      this.#writeRow({ ...current, ...terminal, nextRetryAt: null, settledWith: head.id })
+    }
+  }
+
+  /**
+   * Delivers every due row, strictly ordered within each ticket.
+   *
+   * S01 可靠性（单飞 + 保序 + 幂等）：
+   * 1) 单飞 — 一张票同时只允许一轮 drain。行在送达前一直是 'queued'，而 1s 定时器不 await 上一轮 tick，
+   *    慢投递超过一秒就会让重叠的 tick 重入同一个 queued 行（重复送达）。本轮已持有该票的 key 时，
+   *    整票跳过（只跳过这一张票，别的票照常推进），由在途那一轮的 finally 释放。
+   * 2) 保序 — #pendingByTicket() 按落库顺序（ORDER BY at）给出每票的行；队头未到期则队尾等待（break）。
+   * 3) 幂等 — 每次尝试之前重新读库里的当前行：别处（重投/丢弃/另一条路径）已经把它推进终态
+   *    （sent/recorded/failed）或删掉时直接跳过，绝不凭旧快照再投一次；requestId 等字段一律沿用库里的当前值。
+   */
+  async tick({ kind, excludeKind } = {}) {
     const nowMs = this.now()
-    for (const rows of this.#pendingByTicket().values()) {
-      for (const row of rows) {
-        if (row.nextRetryAt !== null && row.nextRetryAt > nowMs) break // the head is not due; the tail waits (保序)
-        const done = await this.#attempt(row)
-        if (!done) break // failed attempts keep the head in place until it is sent or declared failed
+    const groups = this.#pendingByTicket({ kind, excludeKind })
+    // Interrupts must not wait behind a blocked ordinary prompt.
+    const ordered = [...groups].sort(([, a], [, b]) => Number(b[0].kind === 'stop') - Number(a[0].kind === 'stop'))
+    for (const [key, rows] of ordered) {
+      if (this.store.closed) return
+      if (this.#activeDrains.has(key)) continue // 这张票已有一轮 drain 在途 → 本轮不重入
+      this.#activeDrains.add(key)
+      try {
+        for (let index = 0; index < rows.length; index++) {
+          if (this.store.closed) return
+          const current = this.#readRow(rows[index].id)
+          // A stale snapshot may still contain members that were just requeued with their head.
+          if (current === undefined || current.state !== 'queued' || current.settledWith != null) continue
+          if (current.nextRetryAt !== null && current.nextRetryAt > nowMs) break // 当前值未到期，队尾等待
+          // S07: 只把「同 owner、同聊天、连续、到期」的待投递前缀合成一次唤醒；成员表在投递之前先冻结，
+          // 已在途/已冻结的队头直接复用库里那份成员表，绝不重新推导。
+          const head = this.#claimCohort(current, rows.slice(index + 1), nowMs)
+          const done = await this.#attempt(head)
+          if (!done) break // failed attempts keep the head in place until it is sent or declared failed
+        }
+      } finally {
+        this.#activeDrains.delete(key)
       }
     }
   }
@@ -219,9 +390,10 @@ export class OutboxRunner {
    */
   async #attempt(row) {
     try {
-      // The deliverer may ask to be retried later WITHOUT burning an attempt — e.g. a digest waits for the
-      // owner's wake to end (idle session) so one wake coalesces into one outward message (#67).
+      // A deferred digest may stay queued without spending an attempt. A frozen cohort keeps its frozen
+      // membership: postponing is still a retry, and re-deriving after it would let later arrivals in.
       const result = await this.deliver(row)
+      if (this.store.closed) return true
       if (result && typeof result.postponeMs === 'number') {
         this.#writeRow({ ...row, nextRetryAt: this.now() + result.postponeMs })
         return false
@@ -230,20 +402,31 @@ export class OutboxRunner {
       // whose channel does not exist yet) — a terminal 'recorded' row, kept for a future channel to scan,
       // never a fake 'sent'. Only an actual delivery earns 'sent'.
       if (result && result.recorded === true) {
-        this.#writeRow({ ...row, state: 'recorded', recordedAt: new Date(this.now()).toISOString(), nextRetryAt: null })
+        this.#settleCohort(row, {
+          state: 'recorded', recordedAt: new Date(this.now()).toISOString(),
+          ...(typeof result.skipped === 'string' && { skipReason: result.skipped }),
+        })
         return true
       }
-      this.#writeRow({ ...row, state: 'sent', sentAt: new Date(this.now()).toISOString(), nextRetryAt: null })
+      const sentAt = new Date(this.now()).toISOString()
+      this.#settleCohort(row, { state: 'sent', sentAt })
       return true
     } catch (error) {
+      if (this.store.closed) return true
       // A permanent failure (e.g. the ticket's authorization record is missing — 票面权威) must not be
       // retried: it fails out immediately and is reported as a system problem like any 3rd failure.
+      // S07: 失败只推进队头的 attempts 阶梯，成员保持 queued 且成员表原样不动——下一次尝试（或重启后的
+      // 新 runner）重放的就是这一份成员表，不会重新推导。
       const attempts = error?.permanent === true ? MAX_ATTEMPTS : row.attempts + 1
       const lastError = String(error?.message ?? error)
       if (attempts >= MAX_ATTEMPTS) {
-        this.#writeRow({ ...row, attempts, lastError, state: 'failed', failedAt: new Date(this.now()).toISOString(), nextRetryAt: null })
+        const failedAt = new Date(this.now()).toISOString()
         const problem = { ticketId: row.ticketId, reason: 'delivery failed ' + attempts + ' times in a row (' + row.kind + ' → ' + row.to + ')', rowId: row.id }
-        insertOutbox(this.store, { ticketId: row.ticketId, kind: 'system-problem', to: 'chief', body: problem.reason, state: 'recorded' }, this.now)
+        writeOutboxTransaction(this.store, () => {
+          const settled = this.onFailure?.(row, lastError) === true
+          this.#settleCohort(row, { state: 'failed', failedAt, lastError, attempts, ...(settled && { retryable: false }) })
+          insertOutbox(this.store, { ticketId: row.ticketId, kind: 'system-problem', to: 'chief', body: problem.reason, state: 'recorded' }, this.now)
+        })
         this.onSystemProblem(problem)
         return true // bypass: the tail may proceed
       }

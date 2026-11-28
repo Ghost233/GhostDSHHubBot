@@ -38,6 +38,8 @@ registration=pending，qr.url=https://open.feishu.cn/page/launcher?user_code=JWZ
 用户手机飞书打开确认后凭据落 stateDir/feishu-credentials.json（0600）并自动连长连接——需用户真机实测收尾。
 后台轮询在 dev 实例驻留（过期自动报错记日志）。
 
+以上是 v1 的当时行为。v2 的宿主凭据记录和旧 Bot 迁移步骤见 [README](../README.md#飞书入口68)。
+
 ### E7 群聊 Policy
 群里无 @ → {"dropped":"no-mention"}（trigger 记录）；@bot → injected（mention 占位符 @_user_1 已剥离）。
 

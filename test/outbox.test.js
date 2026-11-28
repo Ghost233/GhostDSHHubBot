@@ -376,3 +376,476 @@ test('discardOutboxRows removes only failed rows and returns the count (round 41
     assert.equal(discardOutboxRows(store, ['out-missing', rows[2].id]), 0)
   } finally { cleanup() }
 })
+
+/**
+ * S01 (#32 stage01-reliability) 重叠 tick 不得重复投递同一行 / an overlapping tick must not re-enter the
+ * deliverer for the same row: the 1s OutboxRunner tick is not awaited by its caller, and a real delivery
+ * (gh api / feishu im / a DSH inject) routinely outlasts one tick. While that first delivery is still in
+ * flight the row is still state 'queued' in the store — the row only flips to 'sent' after the deliverer
+ * returns — so the next overlapping tick re-scans it and enters the deliverer a SECOND time for the same
+ * row. One queued row must be delivered exactly once across overlapping ticks. Deferred promise only:
+ * no timers, and the gate is released BEFORE any assertion so a red run fails on the count, never hangs.
+ */
+test('S01 regression: an overlapping tick never re-enters the deliverer for the same queued row', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-outbox-'))
+  const store = new Store(dir)
+  try {
+    const entries = []
+    let releaseDelivery
+    const deliveryGate = new Promise((resolve) => { releaseDelivery = resolve })
+    const deliver = async (row) => {
+      entries.push(row.id)
+      await deliveryGate // 第一次投递一直挂着——模拟真实发送慢于一个 tick 间隔
+    }
+    const runner = new OutboxRunner({ store, deliver, now: () => 1_000_000 })
+    const row = runner.enqueue({ ticketId: 'tsk-s01', kind: 'inject', to: 'session-x', body: 'once only', requestId: 'req-s01' })
+    const firstTick = runner.tick() // 不 await：第一轮投递还在飞
+    await Promise.resolve() // 一个微任务冲刷，确保第一轮已进入投递器
+    assert.equal(entries.length, 1, '第一轮 tick 已经进入投递器（前置条件）')
+    const secondTick = runner.tick() // 重叠 tick：此时该行在 store 里仍是 state 'queued'
+    releaseDelivery() // 先放行再断言：红灯只会挂在计数上，绝不会卡死
+    await Promise.all([firstTick, secondTick])
+    assert.equal(entries.length, 1, '同一 queued 行在重叠 tick 下只投递一次（不得重复送达）')
+    const stored = JSON.parse(String(store.db.prepare('SELECT value FROM outbox WHERE id = ?').get(row.id).value))
+    assert.equal(stored.state, 'sent', '投递成功后该行落为 sent')
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+/* ----------------------------------------------------------------------------------------------------------
+ * S07 同聊天合并 (issue #38) — 认领时只合并「同一 owner、同一聊天、连续、到期、仍待投递」的 inbox 前缀。
+ * 不同聊天、stop 车道、独立后台工作、未到期的行、以及认领之后才到达的行一律不并入；成员表在调用传输层
+ * 之前用一次 outbox 写冻结在队头上，之后的重试 / 推迟 / 重启都逐字重放那一份，绝不重新推导。
+ * 这里的聊天身份来自「原始来源事实」（trigger.value.source.chatId）——就是 router 准入时写下的那条授权，
+ * 不另抄一份到 outbox 行上（抄一份就会和它描述的那条授权各自漂移）。
+ * ------------------------------------------------------------------------------------------------------- */
+
+/** The ORIGINAL source fact: the runner reads chat identity from here, never from a duplicated row field. */
+function seedFeishuTrigger(store, { triggerId, chatId, messageId, at }) {
+  const trigger = {
+    id: triggerId,
+    kind: 'feishu',
+    at,
+    source: { chatId, messageId, addressing: 'direct' },
+    message: 'm-' + messageId,
+    authorization: { actor: 'ou_fixture', at },
+    injectedAt: null,
+  }
+  store.db.prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)').run(triggerId, JSON.stringify(trigger), at)
+  return trigger
+}
+
+/** One Feishu intake row using the router's own id/requestId convention (acceptFeishuTrigger). */
+function enqueueFeishuIntake(runner, store, { chatId, messageId, at }) {
+  const triggerId = 'trg-' + messageId
+  seedFeishuTrigger(store, { triggerId, chatId, messageId, at })
+  return runner.enqueue({
+    id: 'out-inbox-' + triggerId, ticketId: null, triggerId, kind: 'inbox', to: 'owner:chief',
+    body: 'msg ' + messageId, requestId: 'hub-bot-feishu-' + messageId,
+  })
+}
+
+function readOutbox(store) {
+  return store.db.prepare('SELECT value FROM outbox ORDER BY at, rowid').all().map(raw => JSON.parse(String(raw.value)))
+}
+
+function readTriggers(store) {
+  return store.db.prepare('SELECT value FROM trigger ORDER BY rowid').all().map(raw => JSON.parse(String(raw.value)))
+}
+
+test('S07: the consecutive same-chat intake prefix is delivered as ONE cohort (head + mergedRows)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-outbox-'))
+  const store = new Store(dir)
+  const clock = 1_000_000
+  const at = new Date(clock).toISOString()
+  try {
+    const calls = []
+    const runner = new OutboxRunner({ store, deliver: async (row) => { calls.push(row) }, now: () => clock })
+    for (const messageId of ['om_1', 'om_2', 'om_3']) enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId, at })
+    await runner.tick()
+    assert.equal(calls.length, 1, '一次唤醒：同一聊天同时准入的三条只进入投递器一次')
+    const head = calls[0]
+    assert.equal(head.id, 'out-inbox-trg-om_1', '队头就是最早那条')
+    assert.equal(head.requestId, 'hub-bot-feishu-om_1', '整批复用队头的 requestId（一次唤醒一个幂等键）')
+    assert.ok(Array.isArray(head.mergedRows), '成员表随队头一起交给投递器')
+    assert.equal(head.mergedRows.length, 3)
+    assert.equal(head.mergedCount, 3, 'the inbox count includes the head and both members')
+    assert.deepEqual(head.mergedRows.map(r => r.id), ['out-inbox-trg-om_1', 'out-inbox-trg-om_2', 'out-inbox-trg-om_3'],
+      'index 0 = 队头，其余按到达顺序')
+    assert.deepEqual(head.mergedRows.map(r => r.requestId), ['hub-bot-feishu-om_1', 'hub-bot-feishu-om_2', 'hub-bot-feishu-om_3'],
+      '每条保留自己的 requestId')
+    for (const member of head.mergedRows) {
+      assert.equal(member.kind, 'inbox')
+      assert.equal(member.to, 'owner:chief')
+      assert.equal(member.state, 'queued', '交给投递器时每条仍是待投递的原始行')
+      assert.ok(member.triggerId && member.body, '每条保留自己的来源事实与正文')
+    }
+    const rows = readOutbox(store)
+    assert.equal(rows.length, 3, '没有凭空多出记录')
+    for (const row of rows) {
+      assert.equal(row.state, 'sent', row.id + ' 随队头一起结清')
+      assert.equal(row.settledWith ?? row.id, 'out-inbox-trg-om_1', '成员记录被哪一次唤醒带走')
+    }
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('S07: a different chat is never merged — it stops the prefix and wakes the owner on its own', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-outbox-'))
+  const store = new Store(dir)
+  const clock = 1_000_000
+  const at = new Date(clock).toISOString()
+  try {
+    const calls = []
+    const runner = new OutboxRunner({ store, deliver: async (row) => { calls.push(row) }, now: () => clock })
+    enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_1', at })
+    enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_2', at })
+    enqueueFeishuIntake(runner, store, { chatId: 'chat-b', messageId: 'om_3', at })
+    await runner.tick()
+    assert.equal(calls.length, 2, '两个聊天 → 两次唤醒')
+    assert.deepEqual(calls[0].mergedRows.map(r => r.requestId), ['hub-bot-feishu-om_1', 'hub-bot-feishu-om_2'],
+      '同聊天前缀合并')
+    assert.equal(calls[1].id, 'out-inbox-trg-om_3')
+    assert.equal(calls[1].requestId, 'hub-bot-feishu-om_3', '另一个聊天保留自己的幂等键')
+    assert.equal(calls[1].mergedRows, undefined, '单独一行不写成员表（普通的一参数契约）')
+    assert.equal(readTriggers(store).find(row => row.id === calls[1].triggerId).intakeCohort, undefined)
+    assert.deepEqual(readOutbox(store).map(r => r.state), ['sent', 'sent', 'sent'])
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('S07: a row admitted after the claim never joins the in-flight cohort', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-outbox-'))
+  const store = new Store(dir)
+  const clock = 1_000_000
+  const at = new Date(clock).toISOString()
+  try {
+    const calls = []
+    let late = null
+    const runner = new OutboxRunner({
+      store, now: () => clock,
+      deliver: async (row) => {
+        calls.push(row)
+        // 投递在途时同一聊天又来了一条——它绝不能挤进这次唤醒
+        if (late === null) late = enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_late', at })
+      },
+    })
+    enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_1', at })
+    enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_2', at })
+    await runner.tick()
+    assert.equal(calls.length, 1)
+    assert.deepEqual(calls[0].mergedRows.map(r => r.requestId), ['hub-bot-feishu-om_1', 'hub-bot-feishu-om_2'],
+      '成员表在投递之前就已冻结，后到的行不在其中')
+    assert.equal(readOutbox(store).find(r => r.id === late.id).state, 'queued', '后到的行原样待投：不丢、不并')
+    await runner.tick()
+    assert.equal(calls.length, 2, '后到的行下一次 tick 自己唤醒一次')
+    assert.equal(calls[1].id, late.id)
+    assert.equal(calls[1].mergedRows, undefined)
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('S07: an overlapping tick never re-delivers a claimed cohort', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-outbox-'))
+  const store = new Store(dir)
+  const clock = 1_000_000
+  const at = new Date(clock).toISOString()
+  try {
+    const entries = []
+    let releaseDelivery
+    const gate = new Promise((resolve) => { releaseDelivery = resolve })
+    const runner = new OutboxRunner({ store, deliver: async (row) => { entries.push(row); await gate }, now: () => clock })
+    enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_1', at })
+    enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_2', at })
+    const firstTick = runner.tick() // 不 await：整批还在飞
+    await Promise.resolve()
+    assert.equal(entries.length, 1, '第一轮已进入投递器（前置条件）')
+    const secondTick = runner.tick() // 重叠 tick：成员行在库里仍是 'queued'
+    releaseDelivery() // 先放行再断言：红灯只挂在计数上，绝不卡死
+    await Promise.all([firstTick, secondTick])
+    assert.equal(entries.length, 1, '同一批成员在重叠 tick 下只投递一次')
+    assert.equal(entries[0].mergedRows.length, 2)
+    assert.deepEqual(readOutbox(store).map(r => r.state), ['sent', 'sent'], '整批结清')
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('S07: a restart after a failed delivery replays the frozen cohort instead of re-deriving it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-outbox-'))
+  const store = new Store(dir)
+  let clock = 1_000_000
+  const at = new Date(clock).toISOString()
+  try {
+    const attempts = []
+    const failing = new OutboxRunner({
+      store, now: () => clock,
+      deliver: async (row) => { attempts.push(row); throw new Error('channel down (fake)') },
+    })
+    enqueueFeishuIntake(failing, store, { chatId: 'chat-a', messageId: 'om_1', at })
+    enqueueFeishuIntake(failing, store, { chatId: 'chat-a', messageId: 'om_2', at })
+    await failing.tick()
+    assert.equal(attempts.length, 1)
+    assert.equal(attempts[0].mergedRows.length, 2, '第一次尝试就已经冻结了成员表')
+    let rows = readOutbox(store)
+    const head = rows.find(r => r.id === 'out-inbox-trg-om_1')
+    assert.equal(head.state, 'queued')
+    assert.equal(head.attempts, 1, '失败只推进队头的 attempts 阶梯')
+    assert.equal(head.nextRetryAt, clock + 2000)
+    assert.deepEqual(head.mergedRows.map(r => r.requestId), ['hub-bot-feishu-om_1', 'hub-bot-feishu-om_2'],
+      '成员表随失败一起落库')
+    const member = rows.find(r => r.id === 'out-inbox-trg-om_2')
+    assert.equal(member.state, 'queued', '成员保持待投，不各自单飞')
+    assert.equal(member.attempts, 0, '成员不背队头的失败计数')
+
+    // 进程换代，期间同一聊天又来了第三条：重试只认库里冻结的那一份
+    clock += 2000
+    enqueueFeishuIntake(failing, store, { chatId: 'chat-a', messageId: 'om_3', at: new Date(clock).toISOString() })
+    const retried = []
+    const fresh = new OutboxRunner({ store, now: () => clock, deliver: async (row) => { retried.push(row) } })
+    await fresh.tick()
+    assert.equal(retried.length, 2, '重放冻结的整批，再单独唤醒后到的那条')
+    assert.deepEqual(retried[0].mergedRows.map(r => r.requestId), ['hub-bot-feishu-om_1', 'hub-bot-feishu-om_2'],
+      '成员表逐字复用——失败后绝不重新推导（否则后到的消息会悄悄挤进同一次唤醒）')
+    assert.equal(retried[1].requestId, 'hub-bot-feishu-om_3')
+    assert.equal(retried[1].mergedRows, undefined)
+    assert.deepEqual(readOutbox(store).map(r => r.state), ['sent', 'sent', 'sent'])
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('S07: the stop lane never joins a cohort and keeps its own ordering', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-outbox-'))
+  const store = new Store(dir)
+  const clock = 1_000_000
+  const at = new Date(clock).toISOString()
+  try {
+    const calls = []
+    const runner = new OutboxRunner({ store, deliver: async (row) => { calls.push(row) }, now: () => clock })
+    enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_1', at })
+    enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_2', at })
+    seedFeishuTrigger(store, { triggerId: 'trg-stop', chatId: 'chat-a', messageId: 'om_stop', at })
+    runner.enqueue({
+      id: 'out-inbox-trg-stop', ticketId: null, triggerId: 'trg-stop', kind: 'stop', to: 'owner:chief',
+      body: '停', sessionId: 'sess-1', requestId: 'hub-bot-feishu-om_stop',
+    })
+    await runner.tick({ kind: 'stop' })
+    assert.equal(calls.length, 1, 'stop 先走：打断不排在普通唤醒后面')
+    assert.equal(calls[0].kind, 'stop')
+    assert.equal(calls[0].mergedRows, undefined, 'stop 行永不合并')
+    await runner.tick()
+    assert.equal(calls.length, 2)
+    assert.deepEqual(calls[1].mergedRows.map(r => r.requestId), ['hub-bot-feishu-om_1', 'hub-bot-feishu-om_2'],
+      'stop 落地后，后面的同聊天 inbox 前缀照常合并')
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('an already claimed single message cannot absorb a later same-chat retry', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'hub-bot-outbox-'))
+  const store = new Store(directory)
+  let clock = 1_000_000
+  const calls = []
+  const runner = new OutboxRunner({ store, now: () => clock, deliver: async row => {
+    calls.push(row)
+    if (calls.length === 1) throw new Error('fixture temporary outage')
+  } })
+  try {
+    const head = enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_first', at: new Date(clock).toISOString() })
+    await runner.tick()
+    clock += 2000
+    const later = enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_later', at: new Date(clock).toISOString() })
+    await runner.tick()
+    assert.deepEqual(calls.map(row => row.requestId), [head.requestId, head.requestId, later.requestId])
+    assert.ok(calls.every(row => row.mergedRows === undefined))
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }) }
+})
+
+test('a stored admitted message does not become the head of a new cohort', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'hub-bot-outbox-'))
+  const store = new Store(directory)
+  const calls = []
+  const at = new Date(1_000_000).toISOString()
+  const runner = new OutboxRunner({ store, now: () => Date.parse(at), deliver: async row => { calls.push(row) } })
+  try {
+    const head = enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_admitted', at })
+    const later = enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_pending', at })
+    const saved = JSON.parse(store.db.prepare('SELECT value FROM trigger WHERE id = ?').get(head.triggerId).value)
+    store.db.prepare('UPDATE trigger SET value = ? WHERE id = ?').run(JSON.stringify({ ...saved, injectedAt: at }), head.triggerId)
+    await runner.tick()
+    assert.deepEqual(calls.map(row => row.requestId), [head.requestId, later.requestId])
+    assert.ok(calls.every(row => row.mergedRows === undefined))
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }) }
+})
+
+test('retrying one failed member replays its full cohort with the original request ID', async () => {
+  const attempts = []
+  const { store, runner, setClock, getClock, cleanup } = fixture({
+    plan: row => { attempts.push(row); return false },
+  })
+  try {
+    const cohort = ['om_head', 'om_member', 'om_last'].map(messageId =>
+      enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId, at: new Date(getClock()).toISOString() }))
+    await runner.tick()
+    setClock(getClock() + 2_000)
+    await runner.tick()
+    setClock(getClock() + 4_000)
+    await runner.tick()
+
+    const later = enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_later', at: new Date(getClock()).toISOString() })
+    const retried = retryOutboxRows(store, [cohort[1].id])
+    const delivered = []
+    const fresh = new OutboxRunner({ store, now: getClock, deliver: async row => { delivered.push(row) } })
+    await fresh.tick()
+
+    assert.deepEqual(delivered.map(row => row.requestId), [cohort[0].requestId, later.requestId])
+    assert.deepEqual(delivered[0].mergedRows, attempts[0].mergedRows)
+    assert.equal(delivered[0].attempts, 0)
+    assert.equal(retried, cohort.length)
+  } finally { cleanup() }
+})
+
+test('a cohort retried during failure reporting cannot deliver a member on its own', async () => {
+  const { store, getClock, cleanup } = fixture()
+  const calls = []
+  try {
+    const runner = new OutboxRunner({
+      store, now: getClock,
+      onSystemProblem: () => retryOutboxRows(store, [member.id]),
+      deliver: async row => {
+        calls.push(row)
+        if (calls.length === 1) throw Object.assign(new Error('fake outage'), { permanent: true })
+      },
+    })
+    const at = new Date(getClock()).toISOString()
+    const head = enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_head', at })
+    const member = enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_member', at })
+    await runner.tick()
+    await runner.tick()
+
+    assert.deepEqual(calls.map(row => row.requestId), [head.requestId, head.requestId])
+    assert.deepEqual(calls[1].mergedRows, calls[0].mergedRows)
+  } finally { cleanup() }
+})
+
+test('discarding one failed member removes its whole cohort', async () => {
+  const { store, getClock, cleanup } = fixture()
+  const calls = []
+  const runner = new OutboxRunner({
+    store, now: getClock,
+    deliver: async row => {
+      calls.push(row.requestId)
+      if (row.requestId === 'hub-bot-feishu-om_head') throw Object.assign(new Error('fake outage'), { permanent: true })
+    },
+  })
+  try {
+    const at = new Date(getClock()).toISOString()
+    const head = enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_head', at })
+    const member = enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_member', at })
+    await runner.tick()
+
+    const unrelated = insertOutbox(store, { kind: 'reply', state: 'failed', to: 'dsh:session:chief' })
+    const later = enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_later', at })
+    assert.equal(discardOutboxRows(store, [member.id]), 2)
+    assert.equal(discardOutboxRows(store, [head.id, member.id]), 0)
+    assert.equal(discardOutboxRows(store, [unrelated.id]), 1)
+    await runner.tick()
+    assert.deepEqual(calls, [head.requestId, later.requestId])
+  } finally { cleanup() }
+})
+
+test('a merged inbox claim keeps its original trigger audit through reopen, retry and discard', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-outbox-'))
+  let store = new Store(dir)
+  const now = () => 1_000_000
+  const at = new Date(now()).toISOString()
+  const calls = []
+  const makeRunner = () => new OutboxRunner({
+    store, now,
+    deliver: async row => {
+      calls.push({ requestId: row.requestId, triggers: readTriggers(store) })
+      throw Object.assign(new Error('fake outage'), { permanent: true })
+    },
+  })
+  try {
+    const first = makeRunner()
+    const cohort = ['om_1', 'om_2', 'om_3'].map(messageId =>
+      enqueueFeishuIntake(first, store, { chatId: 'chat-a', messageId, at }))
+    const audit = { requestId: cohort[0].requestId, triggerIds: cohort.map(row => row.triggerId), mergedCount: 3 }
+    const expected = readTriggers(store).map(trigger => ({ ...trigger, intakeCohort: audit }))
+
+    await first.tick()
+    assert.deepEqual(calls, [{ requestId: audit.requestId, triggers: expected }])
+    const failed = readOutbox(store).filter(row => row.state === 'failed')
+    assert.equal(failed.find(row => row.id === cohort[0].id).mergedCount, audit.mergedCount)
+    store.close()
+    store = new Store(dir)
+    assert.deepEqual(readTriggers(store), expected)
+
+    assert.equal(retryOutboxRows(store, [cohort[1].id]), 3)
+    const reopened = makeRunner()
+    await reopened.tick()
+    assert.deepEqual(calls[1], calls[0])
+    assert.equal(discardOutboxRows(store, [cohort[2].id]), 3)
+    assert.ok(readOutbox(store).every(row => row.kind !== 'inbox'))
+    assert.deepEqual(readTriggers(store), expected.map(trigger => ({ ...trigger, intakeDiscarded: true })))
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('a failed audit write rolls back the whole inbox claim before delivery', async () => {
+  const { store, runner, calls, getClock, cleanup } = fixture()
+  try {
+    const at = new Date(getClock()).toISOString()
+    const head = enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_head', at })
+    const member = enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_member', at })
+    const original = readTriggers(store)
+    store.db.exec([
+      'CREATE TEMP TRIGGER block_member_audit BEFORE UPDATE ON trigger',
+      "WHEN OLD.id = 'trg-om_member' BEGIN",
+      "  SELECT RAISE(ABORT, 'fake audit write failure');",
+      'END',
+    ].join('\n'))
+
+    await assert.rejects(runner.tick(), /fake audit write failure/)
+    assert.deepEqual(readOutbox(store), [head, member])
+    assert.deepEqual(readTriggers(store), original)
+    assert.equal(calls.length, 0)
+
+    store.db.exec('DROP TRIGGER block_member_audit')
+    await runner.tick()
+    assert.deepEqual(calls.map(row => row.id), [head.id])
+  } finally { cleanup() }
+})
+
+test('a failed member whose original head is missing can still be discarded', () => {
+  const { store, cleanup } = fixture()
+  try {
+    const orphan = insertOutbox(store, {
+      kind: 'inbox', state: 'failed', to: 'owner:chief', requestId: 'member-request', settledWith: 'deleted-head',
+    })
+    assert.equal(retryOutboxRows(store, [orphan.id]), 0)
+    assert.equal(discardOutboxRows(store, [orphan.id]), 1)
+  } finally { cleanup() }
+})
+
+test('an outbox pass can exclude deferred decisions while targeted and default passes still deliver them', async () => {
+  const { runner, calls, cleanup } = fixture()
+  try {
+    const decision = runner.enqueue({ kind: 'deferred-decision', to: 'owner:chief', requestId: 'decision' })
+    const reply = runner.enqueue({ kind: 'reply', to: 'dsh:session:chief', requestId: 'reply' })
+    await runner.tick({ excludeKind: 'deferred-decision' })
+    assert.deepEqual(calls.map(row => row.id), [reply.id])
+
+    const laterReply = runner.enqueue({ kind: 'reply', to: 'dsh:session:chief', requestId: 'later-reply' })
+    await runner.tick({ kind: 'deferred-decision' })
+    assert.deepEqual(calls.map(row => row.id), [reply.id, decision.id])
+
+    const laterDecision = runner.enqueue({ kind: 'deferred-decision', to: 'owner:chief', requestId: 'later-decision' })
+    await runner.tick()
+    assert.deepEqual(calls.map(row => row.id), [reply.id, decision.id, laterReply.id, laterDecision.id])
+  } finally { cleanup() }
+})
+
+test('a deferred decision in backoff only blocks decisions for the same destination', async () => {
+  const { runner, calls, cleanup } = fixture({ plan: row => row.requestId !== 'first-chief-decision' })
+  try {
+    runner.enqueue({ kind: 'deferred-decision', to: 'owner:chief', requestId: 'first-chief-decision' })
+    runner.enqueue({ kind: 'deferred-decision', to: 'owner:chief', requestId: 'second-chief-decision' })
+    runner.enqueue({ kind: 'deferred-decision', to: 'owner:secondary', requestId: 'other-decision' })
+    runner.enqueue({ kind: 'reply', to: 'dsh:session:chief', requestId: 'reply' })
+    await runner.tick()
+    assert.deepEqual(calls.map(row => row.requestId), ['first-chief-decision', 'other-decision', 'reply'])
+  } finally { cleanup() }
+})

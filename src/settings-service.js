@@ -147,6 +147,81 @@ export class HubBotSettingsService extends TypertRemoteService {
     return detail
   }
 
+  async ticketDetail(ticketId) {
+    if (typeof ticketId !== 'string' || !ticketId.trim()) throw new RemoteError('ticket/invalid', 'A ticket ID is required.', {})
+    const detail = await this.deps.ticketDetail(ticketId)
+    if (!detail) throw new RemoteError('ticket/not-found', 'Unknown ticket.', {})
+    return detail
+  }
+
+  async notificationDetail(request) {
+    const id = request?.id
+    if (typeof id !== 'string' || !id.trim()) throw new RemoteError('notification/invalid', 'A notification ID is required.', {})
+    const detail = await this.deps.notificationDetail(id)
+    if (!detail) throw new RemoteError('notification/not-found', 'Unknown notification.', {})
+    return detail
+  }
+
+  async ownerWorkspace(request) {
+    try {
+      return await this.deps.ownerWorkspace(request)
+    } catch (error) {
+      if (error?.status === 400) throw new RemoteError('owner-workspace/invalid', error.message, {})
+      if (error?.status === 404) throw new RemoteError('owner-workspace/not-found', error.message, {})
+      throw error
+    }
+  }
+
+  async ownerSwitchAction(request) {
+    try {
+      return await this.deps.ownerSwitchAction(request ?? {})
+    } catch (error) {
+      if (error?.status === 400 || ['OwnerSwitchError', 'HandoffSummaryError', 'RouterError'].includes(error?.name)) {
+        throw new RemoteError('owner-switch/' + (error.code ?? 'invalid'), error.message, {})
+      }
+      throw error
+    }
+  }
+
+  async handoffSummaryAction(request) {
+    try {
+      return await this.deps.handoffSummaryAction(request)
+    } catch (error) {
+      if (error?.status === 400 || error?.name === 'HandoffSummaryError') {
+        throw new RemoteError('handoff-summary/' + (error.code ?? 'invalid'), error.message, {})
+      }
+      throw error
+    }
+  }
+
+  async listRuns(request) {
+    try {
+      return await this.deps.listRuns(request ?? {})
+    } catch (error) {
+      if (error?.status === 400 || error?.statusCode === 400) throw new RemoteError('runs/invalid', error.message, {})
+      throw error
+    }
+  }
+
+  async runDetail(request) {
+    const id = request?.id
+    if (typeof id !== 'string' || !id.trim()) throw new RemoteError('runs/invalid', 'A run ID is required.', {})
+    const run = await this.deps.runDetail(id)
+    if (!run) throw new RemoteError('runs/not-found', 'This background run is no longer available.', {})
+    return run
+  }
+
+  async timerAction(request) {
+    try {
+      return await this.deps.timerAction(request ?? {})
+    } catch (error) {
+      if ([400, 404].includes(error?.status ?? error?.statusCode)) {
+        throw new RemoteError('timer/invalid', error.message, {})
+      }
+      throw error
+    }
+  }
+
   /** Start the feishu scan-to-bind device flow (idempotent: a pending registration is not restarted). */
   async startFeishuRegister() {
     try {
@@ -182,5 +257,13 @@ markRemote(HubBotSettingsService, 'discardOutbox', {})
 markRemote(HubBotSettingsService, 'selfTest', {})
 markRemote(HubBotSettingsService, 'overview', {})
 markRemote(HubBotSettingsService, 'messageDetail', {})
+markRemote(HubBotSettingsService, 'ticketDetail', {})
+markRemote(HubBotSettingsService, 'notificationDetail', {})
+markRemote(HubBotSettingsService, 'ownerSwitchAction', {})
+markRemote(HubBotSettingsService, 'ownerWorkspace', {})
+markRemote(HubBotSettingsService, 'handoffSummaryAction', {})
+markRemote(HubBotSettingsService, 'listRuns', {})
+markRemote(HubBotSettingsService, 'runDetail', {})
+markRemote(HubBotSettingsService, 'timerAction', {})
 markRemote(HubBotSettingsService, 'resolveTicket', {})
 markRemote(HubBotSettingsService, 'startFeishuRegister', {})

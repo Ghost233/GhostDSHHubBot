@@ -33,7 +33,7 @@ import { resolveConfig } from './config.js'
 const PKG_VERSION = createRequire(import.meta.url)('../package.json').version
 import {
   SETTINGS_FILE, applySettingsOverlay, applySettingsPatch, loadSettingsOverlay, mergeSettingsOverlay,
-  saveSettingsOverlay, buildOverview, buildOutboxHealth, buildSettingsView, feishuSelfTestMarker, readMessageDetail,
+  saveSettingsOverlay, buildOverview, buildOutboxHealth, buildSettingsView, feishuSelfTestMarker, readMessageDetail, readTicketDetail, readOwnerWorkspace,
 } from './panel.js'
 import { discardOutboxRows, retryOutboxRows } from './outbox.js'
 import { Store, SCHEMA_VERSION } from './store.js'
@@ -43,6 +43,13 @@ import { GitHubSource } from './github.js'
 import { Recycler } from './recycle.js'
 import { WorkspacePlacer } from './workspaces.js'
 import { HubBotSettingsService } from './settings-service.js'
+import { TimerService } from './timers.js'
+import { buildOwnerFacts, formatOwnerFacts, listOwnerFactIndex, readOwnerFactDetail } from './owner-facts.js'
+import { DeferredRegistry } from './deferred.js'
+import { SILENCE_REASONS } from './runs.js'
+import { OwnerSwitch } from './owner-switch.js'
+import { HandoffSummaryRegistry } from './handoff-summary.js'
+import { NotificationThrottle } from './notifications.js'
 
 export const name = 'hub-bot'
 export const inject = ['sessionController', 'sessionPersistence', 'webServer']
@@ -63,10 +70,12 @@ export const Config = z.object({
   }).description('GUI 工作区归位 (#52)：负责人会话出生即落进工作区。'),
   feishu: z.object({
     enabled: z.boolean().description('飞书入口开关。'),
-    appId: z.string().description('飞书应用 App ID（一般用面板绑定流程自动写入，此为人工降级通道）。'),
-    appSecret: z.string().description('飞书应用 App Secret（同上，人工降级通道）。'),
-    botOpenId: z.string().description('机器人自身 open_id（回环防护用，通常自动解析）。'),
-  }).description('飞书渠道（设备流绑定见面板）。'),
+    // Accept the retired keys at the schema boundary so resolveConfig can report how to migrate.
+    appId: z.string().hidden(),
+    appSecret: z.string().hidden(),
+    botOpenId: z.string().description('机器人自身 open_id（群聊定向使用）。'),
+    credentialRef: z.string().description('DSH 凭据记录引用，默认 hub-bot/feishu。保存后重新加载插件。'),
+  }).description('飞书渠道（设备流绑定见面板；配置只留引用，不落明文凭据）。'),
   github: z.object({
     enabled: z.boolean().description('GitHub 监听开关（新 Issue/@mention → 自动建票）。'),
     intervalMs: z.number().description('轮询间隔毫秒，最小 30000（30s）。'),
@@ -83,6 +92,17 @@ export const Config = z.object({
   concurrency: z.object({
     slotsPerOwner: z.number().description('同 owner 并发 working 任务上限（默认 3）。'),
   }).description('执行槽 (#72)。'),
+  deferred: z.object({
+    ttlMs: z.number().description('确认和问答的默认期限（毫秒，缺省 24 小时）。'),
+    ttlByAction: z.object({
+      fork: z.number().description('Fork 确认的期限。'),
+      'dangerous-inject': z.number().description('高风险注入确认的期限。'),
+      'ask-user': z.number().description('用户问题的期限。'),
+    }),
+  }),
+  notifications: z.object({
+    windowMs: z.number().description('同一接收位置的普通结果通知间隔（毫秒，默认 60000）。'),
+  }).description('普通后台结果汇总。'),
   reporting: z.object({
     auto: z.boolean().description('定时汇总自动汇报开关（默认关）。'),
     intervalMs: z.number().description('汇总间隔毫秒（默认 60000）。'),
@@ -155,6 +175,10 @@ function optionalString(body, key) {
 /** One AbortSignal that fires after ms. */
 const deadline = ms => AbortSignal.timeout(ms)
 
+// A previous plugin mount may still be waiting for the Host to admit a prompt.
+const PROMPT_ADMISSIONS = Symbol.for('dsh-hub-bot:prompt-admissions')
+const promptAdmissions = globalThis[PROMPT_ADMISSIONS] ??= new Map()
+
 /** Constant-time token comparison; both sides are hashed first so length never leaks. */
 function tokenMatches(presented, expected) {
   const hash = value => createHash('sha256').update(String(value)).digest()
@@ -185,20 +209,107 @@ export function apply(ctx, rawConfig) {
   // access then throws "cannot get required service in inactive context" on every call. The captured service
   // object itself stays alive and usable regardless of the context state marker.
   const sessionController = ctx.sessionController
+  const sessionPersistence = ctx.sessionPersistence
+  const promptKey = (sessionId, requestId) => JSON.stringify([store.stateDir, sessionId, requestId])
+  async function hasManagedTurn(sessionId, cursor, requestIds, signal) {
+    if (typeof sessionPersistence.open !== 'function' || !Number.isSafeInteger(cursor) || cursor < 0) return false
+    await sessionPersistence.flush()
+    signal.throwIfAborted()
+    const reader = await sessionPersistence.open(sessionId, 'read', { signal })
+    try {
+      const firstOwn = reader.inheritedEventCount
+      if (reader.id !== sessionId || !Number.isSafeInteger(firstOwn) || firstOwn < 0 || firstOwn > cursor) return false
+      let managed = false
+      for (let last = cursor; last >= firstOwn;) {
+        signal.throwIfAborted()
+        const offset = Math.max(firstOwn, last - 511)
+        const length = last - offset + 1
+        const { events } = await reader.read(offset, length, { signal })
+        if (events.length !== length || events[0]?.seq !== offset || events.at(-1)?.seq !== last) return false
+        for (let index = events.length - 1; index >= 0; index--) {
+          const event = events[index]
+          if (event.type === 'turn/end') return false
+          if (event.type === 'turn/start') return managed
+          if (event.type !== 'user/message') continue
+          const { source } = event.data.message ?? event.data
+          if (source?.kind !== 'user' && source?.kind !== 'retry') continue
+          if (!requestIds.has(source.rpcId)) return false
+          managed = true
+        }
+        last = offset - 1
+      }
+      return false
+    } finally { await reader.close() }
+  }
 
   // The Sessions port of src/router.js over the real sessionController. prompt uses queue mode: an owner Session
   // is event-driven — an injected message wakes it exactly like a person typing (spec「核心原则」2).
   const sessions = {
     create: async request => {
       const value = await sessionController.create(request, deadline(30_000))
-      return { sessionId: value.sessionId ?? value.session?.id }
+      return { sessionId: value.sessionId ?? value.session?.id, agentPreset: value.agentPreset }
     },
-    prompt: async ({ sessionId, requestId, text }) => {
-      const value = await sessionController.prompt({
-        requestId, sessionId, mode: 'queue', content: [{ type: 'text', text }],
-      }, deadline(30_000))
-      await ctx.sessionPersistence.flush()
-      return value
+    isArchived: sessionId => (safeGetService(ctx, 'workspaceRegistry')?.archivedSessionIds ?? []).includes(sessionId),
+    workerInfo: async sessionId => {
+      const listed = await sessionController.list({}, deadline(10_000))
+      const item = (listed.items ?? []).find(entry => entry.sessionId === sessionId)
+      if (!item) return undefined
+      const stored = await sessionPersistence.stat(sessionId, { signal: deadline(10_000) })
+      return { cwd: item.cwd, agentPreset: stored?.header?.agentPreset ?? item.projections?.values?.agentPreset }
+    },
+    async hasPromptReceipt({ sessionId, requestId }) {
+      const key = promptKey(sessionId, requestId)
+      if (promptAdmissions.has(key) || typeof sessionPersistence.open !== 'function') return undefined
+      const signal = deadline(7000)
+      let reader
+      try {
+        // A prior Host admission may remain in its buffer after a plugin reload.
+        await sessionPersistence.flush()
+        signal.throwIfAborted()
+        if (promptAdmissions.has(key)) return undefined
+        const snapshot = await sessionPersistence.stat?.(sessionId, { signal })
+        reader = await sessionPersistence.open(sessionId, 'read', { signal })
+        const firstOwn = reader.inheritedEventCount
+        if (reader.id !== sessionId || !Number.isSafeInteger(firstOwn) || firstOwn < 0) return undefined
+        const budget = 8192
+        const size = 256
+        const start = Math.max(firstOwn, Number.isSafeInteger(snapshot?.eventCount) ? snapshot.eventCount - budget : firstOwn)
+        for (let offset = start; offset < start + budget; offset += size) {
+          const { events } = await reader.read(offset, size, { signal })
+          for (const event of events) {
+            const messages = event.type === 'agent/inbox/spliced' ? event.data.inserted
+              : event.type === 'user/message' ? [event.data.message ?? event.data] : []
+            if (messages.some(message => {
+              const { source } = message
+              return (source?.kind === 'user' || source?.kind === 'retry') && source.rpcId === requestId
+            })) return true
+          }
+          if (events.length < size) {
+            const complete = start === firstOwn && !(snapshot?.eventCount > offset + events.length)
+            return complete && !promptAdmissions.has(key) ? false : undefined
+          }
+        }
+        return undefined
+      } catch {
+        return undefined
+      } finally {
+        await reader?.close().catch(() => {})
+      }
+    },
+    prompt: async ({ sessionId, requestId, text, content }) => {
+      const key = promptKey(sessionId, requestId)
+      promptAdmissions.set(key, (promptAdmissions.get(key) ?? 0) + 1)
+      try {
+        const value = await sessionController.prompt({
+          requestId, sessionId, mode: 'queue', content: content ?? [{ type: 'text', text }],
+        }, deadline(30_000))
+        await sessionPersistence.flush()
+        return value
+      } finally {
+        const remaining = promptAdmissions.get(key) - 1
+        if (remaining > 0) promptAdmissions.set(key, remaining)
+        else promptAdmissions.delete(key)
+      }
     },
     // Wake coalescing (#67): digests flush once the owner Session goes idle, so one wake = one outward message.
     isRunning: async sessionId => {
@@ -217,21 +328,368 @@ export function apply(ctx, rawConfig) {
       await ctx.sessionPersistence.flush()
       return { sessionId: value.sessionId ?? value.session?.id }
     },
+    // S06 显式停止（停 / 停止）: the router stops exactly ONE session through this port — the installed DSH
+    // SessionCancelRequest shape is { sessionId } (no invented fields). Authorization stays with the caller:
+    // the router only reaches here after the existing owner/actor check, so this never widens scope.
+    cancel: request => sessionController.cancel({ sessionId: request.sessionId }, deadline(30_000)),
+    async stopBackgroundWork({ sessionId, requestIds, isCurrent }) {
+      if (!requestIds.length || typeof sessionController.state !== 'function') return { status: 'skipped' }
+      const signal = deadline(10000)
+      const exactRequests = new Set(requestIds)
+      const address = { sessionId }
+      let accepted = false
+      try {
+        const before = await sessionController.state(address, signal)
+        for (const pending of before.queue ?? []) {
+          if (!exactRequests.has(pending.rpcId) || !isCurrent() || typeof sessionController.updateQueue !== 'function') continue
+          try {
+            const removed = await sessionController.updateQueue({ sessionId, itemId: pending.id, action: { kind: 'remove' } }, signal)
+            accepted ||= removed?.accepted === true
+          } catch (error) {
+            if (error?.code !== 'session/queue-item-not-found') throw error
+          }
+        }
+        if (isCurrent()) {
+          const running = await sessionController.state(address, signal)
+          if (running.running && await hasManagedTurn(sessionId, running.cursor, exactRequests, signal)) {
+            const latest = await sessionController.state(address, signal)
+            if (isCurrent() && latest.running && latest.cursor === running.cursor) {
+              const stopped = await sessionController.cancel(address, signal)
+              if (stopped?.accepted !== true) throw new Error('The Host declined the stop request.')
+              accepted = true
+            }
+          }
+        }
+      } catch (error) {
+        if (error?.code !== 'session/not-found') throw error
+      }
+      return { status: accepted ? 'cancelled' : 'skipped' }
+    },
   }
   // GUI 工作区 (#52): ctx.get 动态探测（不放 inject 声明——旧版 DSH 无该服务时插件仍须可加载）。
   // 会话只能「出生即归位」（create({ workspaceId })）——已创建会话无任何归位 API（cwd 严格校验）。
   const placer = new WorkspacePlacer({ workspaceController: safeGetService(ctx, 'workspaceController'), homeRepo: config.homeRepo, workspaces: config.workspaces, logger: ctx.logger, registryList: () => safeGetService(ctx, 'workspaceRegistry')?.list?.() ?? [], archivedList: () => { try { return safeGetService(ctx, 'workspaceRegistry')?.archivedSessionIds ?? [] } catch { return [] } } })
   const hub = new Hub({ store, config, sessions, onSystemProblem: p => ctx.logger.warn('hub-bot system problem: %s (ticket %s, row %s)', p.reason, p.ticketId, p.rowId), placer })
   const chief = hub.registry.ensureChief({ cwd: config.homeRepo, workspace: basename(config.homeRepo) })
+  const handoffSummaries = new HandoffSummaryRegistry({
+    store, registry: hub.registry, now: hub.router.now,
+    async readTranscript({ sessionId, maxBytes }) {
+      const page = await sessionController.page({ address: { kind: 'session', sessionId }, maxMessages: 16 }, deadline(10000))
+      const excerpts = []
+      let throughSeq = null
+      for (const record of page.records ?? []) {
+        const event = record.event ?? record
+        if (Number.isSafeInteger(event.seq) && event.seq >= 0) throughSeq = Math.max(throughSeq ?? 0, event.seq)
+        if (!['user/message', 'assistant/message'].includes(event.type)) continue
+        const message = event.data?.message ?? event.data
+        const fromUser = event.type === 'user/message'
+        const source = message?.source
+        if (fromUser && source?.kind !== 'user') continue
+        const parts = Array.isArray(message?.content) ? message.content : []
+        let discussion
+        if (fromUser && typeof source.rpcId === 'string' && source.rpcId.startsWith('hub-bot-')) {
+          if (!source.rpcId.startsWith('hub-bot-feishu-')) continue
+          const head = hub.router.getTrigger(source.rpcId.slice('hub-bot-'.length))
+          if (head?.kind !== 'feishu' || !head.authorization || head.dropped || head.injectedSessionId !== sessionId) continue
+          const cohort = head.intakeCohort
+          const matched = cohort?.requestId === source.rpcId && Array.isArray(cohort.triggerIds)
+          const members = matched ? cohort.triggerIds.slice(-8).map(id => hub.router.getTrigger(id)) : [head]
+          discussion = members.filter(member => member?.kind === 'feishu' && member.authorization && !member.dropped
+            && member.injectedSessionId === sessionId && member.source?.chatId === head.source?.chatId
+            && typeof member.message === 'string').map(member => member.message.slice(0, 960))
+        } else {
+          discussion = [parts.filter(part => part?.type === 'text' && typeof part.text === 'string')
+            .slice(0, 3).map(part => part.text.slice(0, 320)).join(' ')]
+        }
+        const role = fromUser ? '用户' : '助手'
+        const seq = Number.isSafeInteger(event.seq) && event.seq >= 0 ? '#' + event.seq + ' ' : ''
+        for (const original of discussion) {
+          const text = original.replace(/\s+/gu, ' ').trim()
+          if (!text) continue
+          const excerpt = Array.from(text).slice(0, 200).join('')
+          excerpts.push(seq + role + '：' + excerpt + (excerpt === text ? '' : '…'))
+        }
+      }
+      const selected = excerpts.slice(-8)
+      while (selected.length && Buffer.byteLength(selected.join('\n')) > maxBytes) selected.shift()
+      return { text: selected.join('\n'), source: { sessionId, throughSeq, hasMore: page.hasMore === true } }
+    },
+    async summarize({ transcript, maxBytes }) {
+      const lines = transcript.split('\n')
+      const heading = '旧会话近期讨论摘记'
+      while (lines.length && Buffer.byteLength([heading, ...lines].join('\n')) > maxBytes) lines.shift()
+      return lines.length && lines.some(Boolean) ? [heading, ...lines].join('\n') : ''
+    },
+  })
+  const handoffSummaryAction = async request => {
+    if (!request || typeof request !== 'object' || Array.isArray(request)) throw new HttpError(400, 'A handoff summary request is required.')
+    const { action, ownerId, expectedSessionId, draftId, revision, text } = request
+    if (!['list', 'get', 'generate', 'edit', 'confirm', 'discard'].includes(action)) throw new HttpError(400, 'Unknown handoff summary operation.')
+    const result = await handoffSummaries[action]({ ownerId, expectedSessionId, draftId, revision, text })
+    return result ?? null
+  }
+  const ownerSwitch = new OwnerSwitch({
+    store, registry: hub.registry, now: hub.router.now, handoffSummaries,
+    withAdmission: (ownerId, work) => hub.router.withOwnerAdmission(ownerId, work),
+    buildFacts: ({ ownerId }) => formatOwnerFacts(buildOwnerFacts({ store, ownerId, isArchived: id => sessions.isArchived(id) })),
+    sessions: {
+      async status({ sessionId }) {
+        try {
+          const state = await sessionController.state({ sessionId }, deadline(5000))
+          const queued = state.queue?.some(entry => entry.placement === 'queued' || entry.placement === 'steering')
+          return state.running || queued || state.pendingInput?.length ? 'busy' : 'idle'
+        } catch (error) {
+          if (error?.code === 'session/not-found' || error?.name === 'ApiSessionNotFound') return 'missing'
+          throw error
+        }
+      },
+      async create({ owner, sessionId }) {
+        const ws = await (owner.role === 'chief' ? placer.chiefWorkspace() : placer.ownerWorkspace(owner))
+        const agentPreset = owner.role === 'chief' ? 'hub-bot-router' : 'hub-bot-owner'
+        const existing = await ctx.sessionPersistence.stat?.(sessionId, { signal: deadline(5000) })
+        if (existing) {
+          if (existing.header?.agentPreset !== agentPreset || existing.header?.cwd !== (ws?.path ?? owner.cwd)) {
+            throw new Error('Proposed owner session does not match its stored preset and workspace.')
+          }
+          return { sessionId, agentPreset }
+        }
+        return sessions.create({ ...(ws ? { workspaceId: ws.workspaceId } : { cwd: owner.cwd }), sessionId, agentPreset })
+      },
+      prompt: sessions.prompt,
+      cancel: sessions.cancel,
+      isArchived: sessions.isArchived,
+      async archive({ sessionId }) {
+        const controller = safeGetService(ctx, 'workspaceController')
+        if (!controller?.archiveSession) throw new Error('此 DSH 实例暂时无法归档会话。')
+        const result = await controller.archiveSession({ sessionId, stopActivity: false })
+        if (!result?.archivedSessionIds?.includes(sessionId)) throw new Error('宿主未确认旧会话已归档。')
+      },
+    },
+    recordChange: operation => hub.router.publishOwnerSwitchProgress(operation),
+  })
+  hub.router.ownerSwitch = ownerSwitch
+  hub.router.handoffSummaries = handoffSummaries
+  const ownerSwitchAction = request => {
+    if (request != null && (typeof request !== 'object' || Array.isArray(request))) {
+      throw new HttpError(400, 'An owner switch request must be an object.')
+    }
+    const { action, ownerId, expectedSessionId, operationId, mode, summary } = request ?? {}
+    return hub.router.ownerSwitchAction({ action, ownerId, expectedSessionId, operationId, mode, summary })
+  }
+  const notificationThrottle = new NotificationThrottle({ store, runs: hub.router.runs,
+    now: () => Date.parse(hub.router.now()), windowMs: config.notifications?.windowMs })
+  hub.router.notifications = notificationThrottle
+  hub.router.installDeferred(new DeferredRegistry({
+    store, tasks: hub.tasks, now: hub.router.now, ...config.deferred,
+    owners: {
+      currentBinding: ownerId => hub.registry.get(ownerId),
+      isOwnerSession: sessionId => hub.registry.isOwnerSession(sessionId),
+    },
+  }))
   // Owner preset subtrees resolve the Hub through the Host root context.
   const unprovide = ctx[Context.root].reflect.provide('hubBot', hub)
   setHub(hub)
+  const timers = new TimerService({ store, getOwner: id => hub.registry.get(id), getTicket: id => hub.router.getTicket(id),
+    routeBackground: request => hub.router.routeBackground(request) })
+  hub.router.timerDeliveryState = (id, ref) => timers.deliveryState(id, ref)
+  const timerAction = ({ id, action } = {}) => {
+    if (!['pause', 'resume', 'cancel'].includes(action) || typeof id !== 'string' || !id) {
+      throw new HttpError(400, 'A timer ID and pause, resume, or cancel are required.')
+    }
+    try {
+      return timers[action](id)
+    } catch (error) {
+      if (error?.name === 'TimerError') throw new HttpError(error.code === 'timer-not-found' ? 404 : 400, error.message)
+      throw error
+    }
+  }
+  const listRuns = (filters = {}) => {
+    let { limit = 30, offset = 0 } = filters
+    if (typeof limit === 'string' && /^[0-9]+$/.test(limit)) limit = Number(limit)
+    if (typeof offset === 'string' && /^[0-9]+$/.test(offset)) offset = Number(offset)
+    try {
+      if (!Number.isSafeInteger(limit) || limit < 1) throw new TypeError('Run list limit must be a positive integer.')
+      limit = Math.min(limit, 100)
+      const rows = hub.router.runs.list({ ...filters, limit: limit + 1, offset })
+      return { runs: rows.slice(0, limit), nextOffset: rows.length > limit ? offset + limit : null }
+    } catch (error) {
+      if (error instanceof TypeError) throw new HttpError(400, error.message)
+      throw error
+    }
+  }
+
+  const ownerWorkspace = request => {
+    const ownerId = requireString(request, 'ownerId')
+    if (!ownerId.trim()) throw new HttpError(400, 'An owner ID is required.')
+    if (!hub.registry.get(ownerId)) throw new HttpError(404, 'Unknown owner.')
+    const [currentOperation, ...priorOperations] = ownerSwitch.list({ ownerId })
+    const workspace = readOwnerWorkspace({ store, registry: hub.registry, ownerId, timers: timers.list({ ownerId }),
+      runs: listRuns({ ownerId }), switchOperation: currentOperation ?? null })
+    if (!workspace) throw new HttpError(404, 'Unknown owner.')
+    const archiveFailures = priorOperations.filter(operation => operation.status === 'archive-failed')
+    return { ...workspace, archiveFailures }
+  }
+
+  const overview = async () => ({
+    ...buildOverview({ store, registry: hub.registry, health: await buildHealth(), compact: true }),
+    timers: timers.list(),
+    ownerSwitches: [...ownerSwitch.list().reduce((latest, operation) => {
+      if (!latest.has(operation.ownerId)) latest.set(operation.ownerId, operation)
+      return latest
+    }, new Map()).values()],
+  })
+  ctx.inject(['tools'], scope => {
+    scope.tools.register({
+      name: 'report_background',
+      description: '记录后台任务的结果、失败或静默原因。progress-only 仅记录进展，任务保持进行中。',
+      parameters: {
+        type: 'object', required: ['ticketId'], additionalProperties: false,
+        properties: {
+          ticketId: { type: 'string' }, summary: { type: 'string' }, failure: { type: 'string' }, evidence: { type: 'string' },
+          silenceReason: { type: 'string', enum: Object.keys(SILENCE_REASONS) },
+        },
+      },
+      output: {
+        schema: { type: 'object', required: ['ticketId', 'stage'], additionalProperties: false,
+          properties: { ticketId: { type: 'string' }, stage: { type: 'string' } } },
+        render: (_args, value) => [{ type: 'text', text: '后台任务 ' + value.ticketId + ' 的结果已记录。' }],
+      },
+      execute: (args, exec) => hub.router.reportBackground({ ...args, sessionId: exec.agent?.id }),
+    }, { when: ({ agent }) => hub.router.isBackgroundWorker(agent.id) })
+    scope.tools.register({
+      name: 'ask_user', description: '就当前绑定的任务向用户提问。随后等待这条请求的明确答复。',
+      parameters: { type: 'object', properties: { ticketId: { type: 'string' }, question: { type: 'string' } },
+        required: ['ticketId', 'question'], additionalProperties: false },
+      output: { schema: { type: 'object', properties: { ticketId: { type: 'string' }, stage: { type: 'string' } },
+        required: ['ticketId', 'stage'], additionalProperties: false },
+        render: (_args, value) => [{ type: 'text', text: '任务 ' + value.ticketId + ' 正等待用户回复。' }] },
+      execute: async (args, exec) => hub.router.askWorker({ ...args, sessionId: exec.agent?.id }),
+    }, { when: ({ agent }) => hub.router.isManagedWorker(agent.id) })
+    const getBoundOwner = sessionId => store.closed ? undefined : hub.registry.findByCurrentSession(sessionId)
+    const getManager = sessionId => {
+      const owner = getBoundOwner(sessionId)
+      return owner && !owner.transient ? owner : undefined
+    }
+    const managerFor = (exec, ownerId) => {
+      const manager = getManager(exec.agent?.id)
+      if (!manager || (ownerId && manager.role !== 'chief' && ownerId !== manager.id)) {
+        throw new Error('This session cannot manage timers for that owner.')
+      }
+      return manager
+    }
+    const managerTool = { when: ({ agent }) => Boolean(getManager(agent.id)) }
+    const textProperty = { type: 'string' }
+    const timerResult = {
+      schema: { type: 'object', properties: { timer: { type: 'object' }, changed: { type: 'boolean' } },
+        required: ['timer'], additionalProperties: false },
+      render: (_args, value) => [{ type: 'text', text: value.timer.id + ' · ' + value.timer.status + ' · ' + value.timer.fireAt }],
+    }
+    scope.tools.register({
+      name: 'read_owner_fact', description: '查看当前负责人的冷启动事实。按 section 分页读索引，再用 kind 和 id 查看单条工单或汇报记录。',
+      parameters: {
+        type: 'object', additionalProperties: false, properties: {
+          section: { type: 'string', enum: ['tickets', 'activeTasks', 'workers', 'pending', 'reports', 'reportRecords'] },
+          offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 50 },
+          kind: { type: 'string', enum: ['ticket', 'outbox'] }, id: textProperty,
+        },
+      },
+      output: {
+        schema: { type: 'object', required: ['text'], additionalProperties: false, properties: { text: textProperty } },
+        render: (_args, value) => [{ type: 'text', text: value.text }],
+      },
+      async execute({ section, offset, limit, kind, id }, exec) {
+        const owner = getBoundOwner(exec.agent?.id)
+        if (!owner) throw new Error('Only the current owner session can read these facts.')
+        const input = { store, ownerId: owner.id, isArchived: sid => sessions.isArchived(sid) }
+        if (kind !== undefined || id !== undefined) {
+          if (!['ticket', 'outbox'].includes(kind) || typeof id !== 'string' || !id.trim() || section !== undefined || offset !== undefined || limit !== undefined) {
+            throw new Error('Provide kind and id to read one record.')
+          }
+          const detail = readOwnerFactDetail({ ...input, kind, id })
+          if (!detail) throw new Error('No matching record for this owner.')
+          return { text: JSON.stringify(detail) }
+        }
+        if (section !== undefined || offset !== undefined || limit !== undefined) {
+          const page = listOwnerFactIndex({ ...input, section, offset, limit })
+          if (!page) throw new Error('Invalid owner fact section or page.')
+          return { text: JSON.stringify(page) }
+        }
+        return { text: formatOwnerFacts(buildOwnerFacts(input)) }
+      },
+    }, { when: ({ agent }) => Boolean(getBoundOwner(agent.id)) })
+    scope.tools.register({
+      name: 'timer_create',
+      description: '安排后台跟进。一次性使用带时区的 fireAt，每日或每周使用上海时间 schedule。飞书交代的提醒可带原消息 triggerRef，以便后续问答回原处。',
+      parameters: {
+        type: 'object', required: ['message'], additionalProperties: false,
+        oneOf: [{ required: ['fireAt'] }, { required: ['schedule'] }],
+        properties: {
+          ownerId: textProperty, fireAt: textProperty, message: textProperty, triggerRef: textProperty,
+          notifyAtFire: { type: 'boolean', description: '用户明确要求到点发提醒时设为 true。有原飞书来源时立即发到原聊天。' },
+          schedule: {
+            type: 'object', required: ['frequency', 'time'], additionalProperties: false,
+            properties: {
+              frequency: { type: 'string', enum: ['daily', 'weekly'] },
+              time: { type: 'string', description: '上海时间，24 小时制 HH:mm' },
+              weekday: { type: 'integer', minimum: 1, maximum: 7, description: '每周使用，周一为 1，缺省为创建时的上海星期' },
+            },
+          },
+        },
+      },
+      output: timerResult,
+      async execute({ ownerId, fireAt, schedule, message, triggerRef, notifyAtFire }, exec) {
+        const manager = managerFor(exec, ownerId)
+        let origin, authorization
+        if (triggerRef) {
+          const trigger = hub.router.getTrigger(triggerRef)
+          authorization = trigger?.authorization
+          const sender = authorization?.actor
+          const isFeishu = trigger?.kind === 'feishu' && !trigger.dropped && trigger.source?.chatId && sender
+            && trigger.source.openId === sender && trigger.authorization.source === 'feishu'
+          const withinOwner = manager.role === 'chief' || hub.router.queryTasks({ owner: manager.id }).some(ticket => ticket.triggerId === triggerRef)
+          if (!isFeishu || !withinOwner) throw new Error('The Feishu source for this reminder cannot be verified.')
+          origin = { kind: 'feishu', triggerId: trigger.id, chatId: trigger.source.chatId, actor: sender }
+        }
+        return { timer: timers.create({ ownerId: ownerId ?? manager.id, createdBy: exec.agent.id, fireAt, schedule, message, origin, authorization, notifyAtFire }) }
+      },
+    }, managerTool)
+    scope.tools.register({
+      name: 'timer_list', description: '查看提醒的到期时间、状态和关联任务。',
+      parameters: { type: 'object', properties: { ownerId: textProperty }, additionalProperties: false },
+      output: { schema: { type: 'object', properties: { timers: { type: 'array' } }, required: ['timers'], additionalProperties: false },
+        render: (_args, value) => [{ type: 'text', text: JSON.stringify(value.timers) }] },
+      async execute({ ownerId }, exec) {
+        const manager = managerFor(exec, ownerId)
+        return { timers: timers.list({ ownerId: ownerId ?? (manager.role === 'chief' ? undefined : manager.id) }) }
+      },
+    }, managerTool)
+    scope.tools.register({
+      name: 'timer_manage', description: '暂停、恢复或取消提醒。取消不会停止已经开始的执行会话。',
+      parameters: { type: 'object', properties: { id: textProperty, action: { type: 'string', enum: ['pause', 'resume', 'cancel'] } },
+        required: ['id', 'action'], additionalProperties: false },
+      output: timerResult,
+      async execute(args, exec) {
+        const timer = timers.get(args.id)
+        if (!timer) throw new Error('Unknown timer.')
+        managerFor(exec, timer.ownerId)
+        return timerAction(args)
+      },
+    }, managerTool)
+  })
   // 飞书入口 (#68): OFF unless config.feishu.enabled. With credentials present the WSClient long connection
   // starts at boot; the same source scans recorded feishu reply intents on the 1s tick (阶段 2 留的通道).
-  const feishu = new FeishuSource({ store, registry: hub.registry, sessions, config: config.feishu, chiefConfig: config.chief, logger: ctx.logger, placer })
+  const feishu = new FeishuSource({
+    store, config: config.feishu, logger: ctx.logger,
+    credentials: safeGetService(ctx, 'credentials'),
+    // S06 单一入口: with the router port present the source is a pure adapter — it hands the ORIGINAL event to
+    // router.acceptFeishuTrigger() and never prompts a session itself (same port pattern as GitHubSource below).
+    router: hub.router,
+  })
   const updateFeishuConnection = () => {
     if (!config.feishu.enabled) { feishu.disconnect(); return }
-    if (feishu.credentialState === 'ok') void feishu.connect().catch(error => ctx.logger.warn('hub-bot feishu connect failed: %s', error?.message ?? error))
+    void feishu.credentialsReady.then(() => {
+      if (config.feishu.enabled && !store.closed && feishu.credentialState === 'ok') return feishu.connect()
+    }).catch(error => ctx.logger.warn('hub-bot feishu connect failed: %s', error?.message ?? error))
   }
   updateFeishuConnection()
   // GitHub 自动处理闭环 (#71): OFF unless config.github.enabled. loginAllowlist 空时经 gh api user 解析为本人；
@@ -257,9 +715,18 @@ export function apply(ctx, rawConfig) {
     }
   })().catch(error => ctx.logger.warn('hub-bot workspace warmup failed (non-fatal): %s', error?.message ?? error))
   void hub.router.tick().catch(error => ctx.logger.warn('hub-bot delivery resume failed: %s', error?.message ?? error))
+  const tickOwnerSwitches = () => {
+    void ownerSwitch.tick().catch(error => ctx.logger.warn('hub-bot owner switch tick failed: %s', error?.message ?? error))
+  }
+  tickOwnerSwitches()
   const deliveryTimer = setInterval(() => {
+    void timers.tick().catch(error => ctx.logger.warn('hub-bot timer tick failed: %s', error?.message ?? error))
     void hub.router.tick().catch(error => ctx.logger.warn('hub-bot delivery tick failed: %s', error?.message ?? error))
     void hub.router.autoReportTick().catch(error => ctx.logger.warn('hub-bot auto-report tick failed: %s', error?.message ?? error))
+    tickOwnerSwitches()
+    try { notificationThrottle.flush() } catch (error) {
+      ctx.logger.warn('hub-bot notification flush failed: %s', error?.message ?? error)
+    }
     if (config.feishu.enabled && feishu.credentialState === 'ok') {
       void feishu.deliverReplies().catch(error => ctx.logger.warn('hub-bot feishu reply tick failed: %s', error?.message ?? error))
     }
@@ -274,7 +741,7 @@ export function apply(ctx, rawConfig) {
   let githubPollTask = null
   const pollGithub = () => {
     if (!config.github.enabled || githubPollTask) return
-    githubPollTask = github.resolveSelfLogin().then(() => github.pollAll())
+    githubPollTask = github.pollAll()
       .catch(error => ctx.logger.warn('hub-bot github poll tick failed: %s', error?.message ?? error))
       .finally(() => { githubPollTask = null })
   }
@@ -414,7 +881,9 @@ export function apply(ctx, rawConfig) {
     if (!config.feishu.enabled) throw new HttpError(400, '请先启用飞书，再扫码绑定。')
     if (feishu.registering) return { started: false, registration: 'pending', qr: feishu.lastQr }
     void feishu.register().catch(error => ctx.logger.warn('hub-bot feishu register failed: %s', error?.message ?? error))
-    return { started: true }
+    const status = feishu.status()
+    if (status.registration === 'failed') throw new HttpError(400, status.registrationError)
+    return { started: true, registration: 'pending' }
   }
 
   const serviceDeps = {}
@@ -426,6 +895,14 @@ export function apply(ctx, rawConfig) {
     modelCatalog: forwardDep('modelCatalog'),
     overview: forwardDep('overview'),
     messageDetail: forwardDep('messageDetail'),
+    ticketDetail: forwardDep('ticketDetail'),
+    notificationDetail: forwardDep('notificationDetail'),
+    ownerSwitchAction: forwardDep('ownerSwitchAction'),
+    ownerWorkspace: forwardDep('ownerWorkspace'),
+    handoffSummaryAction: forwardDep('handoffSummaryAction'),
+    listRuns: forwardDep('listRuns'),
+    runDetail: forwardDep('runDetail'),
+    timerAction,
     resolveTicket: forwardDep('resolveTicket'),
     startFeishuRegister: forwardDep('startFeishuRegister'),
     listWorkspaces: forwardDep('listWorkspaces'),
@@ -464,8 +941,15 @@ export function apply(ctx, rawConfig) {
         return out
       } catch { return {} }
     },
-    overview: async () => buildOverview({ store, registry: hub.registry, health: await buildHealth() }),
+    overview,
     messageDetail: triggerId => readMessageDetail(store, triggerId),
+    ticketDetail: ticketId => readTicketDetail({ store, registry: hub.registry, ticketId }),
+    notificationDetail: id => notificationThrottle.details(id),
+    ownerSwitchAction,
+    ownerWorkspace,
+    handoffSummaryAction,
+    listRuns,
+    runDetail: id => hub.router.runs.get(id),
     resolveTicket: request => resolveTicket(request),
     startFeishuRegister,
   })
@@ -607,7 +1091,19 @@ export function apply(ctx, rawConfig) {
   const resolveTicket = async body => {
     const ticketId = requireString(body, 'ticketId')
     const resolution = requireString(body, 'resolution')
-    if (!['confirm', 'reject', 'answer', 'accept', 'retry', 'cancel'].includes(resolution)) throw new HttpError(400, 'resolution must be "confirm", "reject", "answer", "accept", "retry" or "cancel"')
+    if (!['confirm', 'reject', 'answer', 'accept', 'retry', 'cancel'].includes(resolution)) throw new HttpError(400, 'Invalid ticket resolution.')
+    const requestId = optionalString(body, 'requestId')
+    if (requestId) {
+      const decision = ({ confirm: 'approve', reject: 'reject', answer: 'answer', cancel: 'cancel' })[resolution]
+      if (!decision) throw new HttpError(400, 'This operation is not a deferred decision.')
+      try {
+        return await hub.router.resolveDeferred({ requestId, ticketId, decision,
+          channel: 'panel', text: optionalString(body, 'message') })
+      } catch (error) {
+        if (['TaskError', 'RouterError', 'DeferredError'].includes(error?.name)) throw new HttpError(400, error.message)
+        throw error
+      }
+    }
     // 取消（round 43）: idle/queued 票还没开始执行，允许直接关闭（done）。已开始的一律走 reject/失败路径。
     if (resolution === 'cancel') {
       const ticket0 = hub.router.getTicket(ticketId)
@@ -649,9 +1145,9 @@ export function apply(ctx, rawConfig) {
 
   // 死信重投（健康警告条的操作闭环 turn 110）: {id} 单条 / {all:true} 全部。
   const retryOutbox = body => {
-    if (body?.all === true) return { retried: retryOutboxRows(store, null) }
+    if (body?.all === true) return { retried: retryOutboxRows(store, null, hub.router.now) }
     const id = requireString(body, 'id')
-    const retried = retryOutboxRows(store, [id])
+    const retried = retryOutboxRows(store, [id], hub.router.now)
     if (retried === 0) throw new HttpError(404, 'no failed outbox row "' + id + '"')
     return { retried }
   }
@@ -726,6 +1222,7 @@ export function apply(ctx, rawConfig) {
           json(res, 200, await waitIdle(await readBody(req)))
         } else if (route === 'deliver' && method === 'POST') {
           await hub.router.tick()
+          notificationThrottle.flush()
           const autoReport = await hub.router.autoReportTick({ force: true })
           json(res, 200, { delivered: true, autoReport })
         } else if (route === 'transcript' && method === 'GET') {
@@ -734,8 +1231,7 @@ export function apply(ctx, rawConfig) {
           // 面板健康视图: credentialState 'invalid'/'missing' = 提示重新扫码.
           json(res, 200, feishu.status())
         } else if (route === 'feishu/register' && method === 'POST') {
-          // 扫码建应用: starts the device flow in the background; poll feishu/status for the QR url, then
-          // for credentialState 'ok' once the user confirmed on the phone.
+          // Acknowledges the scan request. Poll feishu/status for the QR and the binding outcome.
           const reply = startFeishuRegister()
           json(res, reply.started ? 202 : 200, reply)
         } else if (route === 'feishu/simulate' && method === 'POST') {
@@ -752,9 +1248,10 @@ export function apply(ctx, rawConfig) {
           // Forces one polling cycle NOW (dev proof without waiting 5min); body {repo?} narrows to one repo.
           const body = await readBody(req)
           if (body.repo) {
-            const cfg = (config.github.repos ?? []).find(r => r.repo === body.repo)
-            if (!cfg) { json(res, 404, { error: 'unknown repo ' + body.repo }); return }
-            json(res, 200, await github.pollRepo(cfg))
+            const repo = requireString(body, 'repo')
+            const result = await github.pollWatchedRepo(repo)
+            if (result === null) throw new HttpError(404, 'Unknown watched repository ' + repo)
+            json(res, 200, result)
           } else {
             json(res, 200, await github.pollAll())
           }
@@ -765,14 +1262,49 @@ export function apply(ctx, rawConfig) {
           const cfg = { repo: body.repo, workspace: body.workspace ?? basename(config.homeRepo), cwd: config.homeRepo, enabled: true }
           if (body.kind === 'comment') json(res, 200, await github.handleCommentEvent(body.item ?? body.comment, cfg))
           else json(res, 200, await github.handleIssueEvent(body.item, cfg))
+        } else if (route === 'runs' && method === 'GET') {
+          json(res, 200, listRuns(Object.fromEntries(url.searchParams)))
+        } else if (route === 'runs/detail' && method === 'GET') {
+          const id = requireString({ id: url.searchParams.get('id') }, 'id')
+          const run = hub.router.runs.get(id)
+          if (!run) throw new HttpError(404, 'This background run is no longer available.')
+          json(res, 200, run)
         } else if (route === 'overview' && method === 'GET') {
           // 三问视图数据 (#73): 票面 + 注册表 + 健康快照, 一次取齐
-          json(res, 200, buildOverview({ store, registry: hub.registry, health: await buildHealth() }))
+          json(res, 200, await overview())
+        } else if (route === 'owners/workspace' && method === 'POST') {
+          json(res, 200, ownerWorkspace(await readBody(req)))
+        } else if (route === 'owners/handoff-summary' && method === 'POST') {
+          try { json(res, 200, await handoffSummaryAction(await readBody(req))) } catch (error) {
+            if (error?.name !== 'HandoffSummaryError') throw error
+            throw new HttpError(400, error.message)
+          }
+        } else if (route === 'owners/switch' && method === 'POST') {
+          try { json(res, 200, ownerSwitchAction(await readBody(req))) } catch (error) {
+            if (!['OwnerSwitchError', 'HandoffSummaryError', 'RouterError'].includes(error?.name)) throw error
+            throw new HttpError(error.code === 'owner-switch-not-found' ? 404 : 400, error.message)
+          }
+        } else if (route === 'tickets/detail' && method === 'GET') {
+          const ticketId = requireString(Object.fromEntries(url.searchParams), 'ticketId')
+          const detail = readTicketDetail({ store, registry: hub.registry, ticketId })
+          if (!detail) throw new HttpError(404, 'Unknown ticket.')
+          json(res, 200, detail)
+        } else if (route === 'notifications/detail' && method === 'GET') {
+          const id = requireString(Object.fromEntries(url.searchParams), 'id')
+          const detail = notificationThrottle.details(id)
+          if (!detail) throw new HttpError(404, 'Unknown notification.')
+          json(res, 200, detail)
+        } else if (route === 'timers/manage' && method === 'POST') {
+          json(res, 200, timerAction(await readBody(req)))
         } else if (route === 'settings' && method === 'GET') {
           json(res, 200, await settingsView())
         } else if (route === 'models/catalog' && method === 'GET') {
           // 面板「总管模型」：目录 + 当前配置（配置即时生效后的下一次注入使用）。
           json(res, 200, { catalog: await sessions.modelCatalog(), chief: config.chief?.model ?? null })
+        } else if (route === 'triggers/detail' && method === 'GET') {
+          const detail = readMessageDetail(store, requireString(Object.fromEntries(url.searchParams), 'triggerId'))
+          if (!detail) throw new HttpError(404, 'Unknown trigger.')
+          json(res, 200, detail)
         } else if (route === 'triggers' && method === 'GET') {
           // 面板「最近触发」：trigger 表直读，最新在前。
           const limitRaw = url.searchParams.get('limit')
