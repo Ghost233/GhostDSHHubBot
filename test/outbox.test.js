@@ -423,9 +423,12 @@ test('S01 regression: an overlapping tick never re-enters the deliverer for the 
 function seedFeishuTrigger(store, { triggerId, chatId, messageId, at }) {
   const trigger = {
     id: triggerId,
+    kind: 'feishu',
+    at,
     source: { chatId, messageId, addressing: 'direct' },
     message: 'm-' + messageId,
     authorization: { actor: 'ou_fixture', at },
+    injectedAt: null,
   }
   store.db.prepare('INSERT INTO trigger (id, value, at) VALUES (?, ?, ?)').run(triggerId, JSON.stringify(trigger), at)
   return trigger
@@ -445,6 +448,10 @@ function readOutbox(store) {
   return store.db.prepare('SELECT value FROM outbox ORDER BY at, rowid').all().map(raw => JSON.parse(String(raw.value)))
 }
 
+function readTriggers(store) {
+  return store.db.prepare('SELECT value FROM trigger ORDER BY rowid').all().map(raw => JSON.parse(String(raw.value)))
+}
+
 test('S07: the consecutive same-chat intake prefix is delivered as ONE cohort (head + mergedRows)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'hub-bot-outbox-'))
   const store = new Store(dir)
@@ -461,7 +468,7 @@ test('S07: the consecutive same-chat intake prefix is delivered as ONE cohort (h
     assert.equal(head.requestId, 'hub-bot-feishu-om_1', '整批复用队头的 requestId（一次唤醒一个幂等键）')
     assert.ok(Array.isArray(head.mergedRows), '成员表随队头一起交给投递器')
     assert.equal(head.mergedRows.length, 3)
-    assert.equal(head.mergedCount, 2, 'mergedCount 是并入的条数，不含队头本身')
+    assert.equal(head.mergedCount, 3, 'the inbox count includes the head and both members')
     assert.deepEqual(head.mergedRows.map(r => r.id), ['out-inbox-trg-om_1', 'out-inbox-trg-om_2', 'out-inbox-trg-om_3'],
       'index 0 = 队头，其余按到达顺序')
     assert.deepEqual(head.mergedRows.map(r => r.requestId), ['hub-bot-feishu-om_1', 'hub-bot-feishu-om_2', 'hub-bot-feishu-om_3'],
@@ -499,6 +506,7 @@ test('S07: a different chat is never merged — it stops the prefix and wakes th
     assert.equal(calls[1].id, 'out-inbox-trg-om_3')
     assert.equal(calls[1].requestId, 'hub-bot-feishu-om_3', '另一个聊天保留自己的幂等键')
     assert.equal(calls[1].mergedRows, undefined, '单独一行不写成员表（普通的一参数契约）')
+    assert.equal(readTriggers(store).find(row => row.id === calls[1].triggerId).intakeCohort, undefined)
     assert.deepEqual(readOutbox(store).map(r => r.state), ['sent', 'sent', 'sent'])
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
 })
@@ -735,6 +743,69 @@ test('discarding one failed member removes its whole cohort', async () => {
     assert.equal(discardOutboxRows(store, [unrelated.id]), 1)
     await runner.tick()
     assert.deepEqual(calls, [head.requestId, later.requestId])
+  } finally { cleanup() }
+})
+
+test('a merged inbox claim keeps its original trigger audit through reopen, retry and discard', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-bot-outbox-'))
+  let store = new Store(dir)
+  const now = () => 1_000_000
+  const at = new Date(now()).toISOString()
+  const calls = []
+  const makeRunner = () => new OutboxRunner({
+    store, now,
+    deliver: async row => {
+      calls.push({ requestId: row.requestId, triggers: readTriggers(store) })
+      throw Object.assign(new Error('fake outage'), { permanent: true })
+    },
+  })
+  try {
+    const first = makeRunner()
+    const cohort = ['om_1', 'om_2', 'om_3'].map(messageId =>
+      enqueueFeishuIntake(first, store, { chatId: 'chat-a', messageId, at }))
+    const audit = { requestId: cohort[0].requestId, triggerIds: cohort.map(row => row.triggerId), mergedCount: 3 }
+    const expected = readTriggers(store).map(trigger => ({ ...trigger, intakeCohort: audit }))
+
+    await first.tick()
+    assert.deepEqual(calls, [{ requestId: audit.requestId, triggers: expected }])
+    const failed = readOutbox(store).filter(row => row.state === 'failed')
+    assert.equal(failed.find(row => row.id === cohort[0].id).mergedCount, audit.mergedCount)
+    store.close()
+    store = new Store(dir)
+    assert.deepEqual(readTriggers(store), expected)
+
+    assert.equal(retryOutboxRows(store, [cohort[1].id]), 3)
+    const reopened = makeRunner()
+    await reopened.tick()
+    assert.deepEqual(calls[1], calls[0])
+    assert.equal(discardOutboxRows(store, [cohort[2].id]), 3)
+    assert.ok(readOutbox(store).every(row => row.kind !== 'inbox'))
+    assert.deepEqual(readTriggers(store), expected.map(trigger => ({ ...trigger, intakeDiscarded: true })))
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('a failed audit write rolls back the whole inbox claim before delivery', async () => {
+  const { store, runner, calls, getClock, cleanup } = fixture()
+  try {
+    const at = new Date(getClock()).toISOString()
+    const head = enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_head', at })
+    const member = enqueueFeishuIntake(runner, store, { chatId: 'chat-a', messageId: 'om_member', at })
+    const original = readTriggers(store)
+    store.db.exec([
+      'CREATE TEMP TRIGGER block_member_audit BEFORE UPDATE ON trigger',
+      "WHEN OLD.id = 'trg-om_member' BEGIN",
+      "  SELECT RAISE(ABORT, 'fake audit write failure');",
+      'END',
+    ].join('\n'))
+
+    await assert.rejects(runner.tick(), /fake audit write failure/)
+    assert.deepEqual(readOutbox(store), [head, member])
+    assert.deepEqual(readTriggers(store), original)
+    assert.equal(calls.length, 0)
+
+    store.db.exec('DROP TRIGGER block_member_audit')
+    await runner.tick()
+    assert.deepEqual(calls.map(row => row.id), [head.id])
   } finally { cleanup() }
 })
 

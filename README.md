@@ -108,7 +108,7 @@ patch 结构测试复用仓内先例 `scripts/test-runtime.mjs` 的解析链：`
 ## fork 路径与确认流程（#69）
 
 - **fork 是重操作，永远先确认**：L2 用 `fork_session` 工具只发起**确认**——意图以结构化 action 落票面 `pendingConfirm`（先存后做），票转「等您确认」，确认文本由代码生成（src/fork.js：对象+预期结果+原因，原样呈用户）；确认请求随汇报链 digest 到 L1。确认前 L2 停手，不重复发起、不注入。
-- **确认后由代码执行，不靠模型自觉**：L1 `route_to_owner(ticketId, resolution:"confirm")` → Router 调 sessionController `fork()`（缺省取最近完成回合前缀；`atSeq` 可指定含边界切点，丢掉污染的尾巴）→ 票回进行中、`mechanism:'fork'`、绑新会话（新 Assignment）→ 唤醒 L2 注入续作。fork 失败票保持「等您确认」，可重试/拒绝/取消。
+- **确认后由代码执行**：已登记的请求由面板或飞书按 `requestId` 提交。fork 调用宿主 `fork()`，按原 `atSeq` 切分事件，成功后把票绑到新会话并唤醒负责人。原先没有请求编号的票继续支持 `route_to_owner` 的确认入口。已记录批准但执行结果不明时，界面保留该状态并拒绝重复执行。
 - **否定与取消**：`resolution:"reject"` 票转被卡住、**保持原会话**，等用户下一句释放；`resolution:"cancel"` 是终态（票转完成）。两种决议与确认一样记 `confirmOutcome` 于票面供审计。
 - **24h 确认超时自动取消**（spec「错误场景」）：1 秒 tick 顺带清扫超时的「等您确认」票——自动取消（by system）并经 L1 统一出口回复「已取消」（先存后做、恰好一次）。
 - **互不干扰**：fork 只读源会话事件切前缀，原会话保留可查、全程不再注入；两个会话用户都可打开。默认注入（inject_session）不改变会话拓扑。
@@ -117,12 +117,19 @@ patch 结构测试复用仓内先例 `scripts/test-runtime.mjs` 的解析链：`
 ## GitHub 自动处理闭环（#71）
 
 - **轮询**：监听清单跟随 owner 注册表（repo 负责人的 cwd 解析 `git remote get-url origin` → GitHub 仓库，无需配置；无 origin/非 GitHub 记 resolveErrors 跳过）；REST 轮询复用本机 `gh auth`（认证限额 5000 次/小时，`config.github.intervalMs` 默认 5min，下限 30s）。**首轮只记水位线**（stateDir/github-watermarks.json），历史存量不触发；之后只处理编号更大的新 Issue/PR，重启不重放。
-- **自动处理闭环**：本人新 Issue = 显式请求豁免（无确认）——插件先记 ack 回复意图（先存后做，deliverReplies 实投并强制 dsh-badge）→ 路由进 L2 仓库负责人（triggerRef `github:<repo>:issue:<n>` 幂等）→ 注入文本携带完整链路指令（worktree 修复 → 提 PR → 汇报链通知审核；**永不直推主分支，合并永远由人**）。新 PR 路由初审指令（摘要+风险点）。
+- **自动处理闭环**：接受 Issue、PR 或工作评论后，保存原始来源和授权，按已注册的仓库负责人建票，每个事件交给独立执行会话。该会话受负责人执行槽约束，使用部署的执行 preset。Issue 的受理评论先落库再发送。改动走 worktree 和 PR，由用户审核并合并。完成活动用 `report_background` 把结果记到账，并通知该负责人的当前实例。
 - **Policy**：`loginAllowlist` 默认空 = 启动时经 `gh api user` 解析为本人；非白名单作者与 `bot:ignore` 标签只记录不处理（github-dropped 行）。
-- **喊停与关闭**：白名单评论「停」→ 任务终止（让位于人，人的消息仍可释放）+ chief 通知；普通评论归入已有任务（follow-up 不产生新 Trigger）；`mentionHandle` 提及 → 新 Trigger（mention 寻址）；轮询发现源头关闭/合并 → 自动终止 + 通知。
+- **喊停与关闭**：白名单评论「停」终止该条目关联的任务，并请求停止这些任务绑定的独立执行会话。源条目关闭或合并时结束关联任务并通知总负责人。插件按仓库和评论 ID 识别自己发出的回执，人工评论继续按来源策略受理。
 - **回复回投**：`reply_source to='github:<repo>:<n>'` 的 recorded 行经 deliverReplies 用 `gh api` 实投为评论——body 缺 badge 由代码补上——实投成功才标 sent；连续 5 次失败标 failed 并报 system-problem。
 - **dsh-badge**：bot 在 GitHub 的一切产出结尾带 powered-by-dsh 徽标（ack/回复由代码强制；PR 描述等 L2/L3 自然产出由注入文本与 persona 约束）。
 - dev 实证探针：`GET github/status`（跟随清单/水位线/解析失败留痕）、`POST github/poll {repo?}`（立即一轮）、`POST github/simulate {kind, repo, item}`（mock 事件走真实归一化/Policy/路由）。
+
+## 一次性跟进和结构化答复
+
+- 对负责人说清跟进内容和时间，由当前 L1/L2 调用 `timer_create`。`fireAt` 使用带时区的绝对时间。飞书交代的提醒可关联原消息，执行时沿用这条消息的授权。
+- 在飞书对话中请负责人查看、暂停、恢复或取消提醒，也可在面板直接管理。停机错过的提醒补火一次并标记迟到。取消停止后续点火，已接管的执行会话继续运行。
+- 绑定任务的执行会话可通过 `ask_user` 提问。面板按请求编号接受回复或确认，飞书从原聊天和原发送者接收 `/hub-answer <requestId> answer <回复>`，确认用 `approve` 或 `reject`。问题默认有效 24 小时，宿主可配置 `deferred.ttlMs` 及 `deferred.ttlByAction`。
+- 负责人提问由其当前实例接续，执行会话提问由原会话接续。危险动作使用确认时保存的目标，目标失效时须重新发起确认。面板显示答复待投递、已接管或失败。
 
 ## 三类负责人与 scratch 回收（#70）
 

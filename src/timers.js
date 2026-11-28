@@ -56,11 +56,7 @@ const BACKOFF_CAP_MS = 5 * 60_000
  */
 const NEVER_DUE = '9999-12-31T23:59:59.999Z'
 
-/**
- * Lateness grace. The host ticks every second, so a normal fire lands within ~1s of its due instant and is
- * NOT late. Lateness is claimed only when the due instant was genuinely missed — a stopped host, a paused
- * process, a suspended machine — which is exactly the case the spec wants marked 迟到.
- */
+/** Grace for ordinary tick delays while the timer is armed. */
 export const LATE_GRACE_MS = 60_000
 
 /** An absolute timestamp MUST carry an explicit timezone: `Z` or `±HH:MM`. A bare local time is ambiguous. */
@@ -102,6 +98,20 @@ function feishuOrigin(origin) {
   return { kind, triggerId, chatId, actor }
 }
 
+/** The caller verifies the source event before supplying its original authorization. */
+function feishuAuthorization(authorization, origin) {
+  if (authorization === undefined) return undefined
+  const saved = { ...authorization }
+  const { at } = saved
+  // Date.parse can normalize an impossible calendar day, such as February 30.
+  const validTimestamp = typeof at === 'string' && ABSOLUTE_TIMESTAMP.test(at) && Number.isFinite(Date.parse(at))
+    && new Date(at.slice(0, 10) + 'T00:00:00Z').getUTCDate() === Number(at.slice(8, 10))
+  if (!origin || saved.actor !== origin.actor || saved.source !== origin.kind || !validTimestamp) {
+    throw new TimerError('timer-authorization-invalid', 'Timer authorization must match its Feishu origin and have a valid absolute timestamp.')
+  }
+  return saved
+}
+
 /**
  * Persistent one-shot follow-up timers.
  *
@@ -120,6 +130,7 @@ export class TimerService {
   #getTicket
   #routeBackground
   #now
+  #startedAtMs
   #lateGraceMs
   #authorizeCreate
   /** Single-flight guard: concurrent ticks share one pass, so one occurrence can never be double-admitted. */
@@ -147,6 +158,7 @@ export class TimerService {
     this.#getTicket = getTicket
     this.#routeBackground = routeBackground
     this.#now = now
+    this.#startedAtMs = this.#nowMs()
     this.#lateGraceMs = lateGraceMs
     this.#authorizeCreate = authorizeCreate
   }
@@ -154,14 +166,15 @@ export class TimerService {
   /**
    * Creates one pending one-shot follow-up.
    *
-   * `createdBy` (谁下的令) and `ownerId` (替谁跟进) are separate identities and both are stored: the creator
-   * is what the ticket face carries as authorization actor, the owner is what the task belongs to.
+   * `createdBy` identifies who set the reminder. `ownerId` identifies who owns the follow-up.
+   * A verified Feishu event supplies the original ticket authorization. Direct reminders use the creator.
    *
    * @param {{ ownerId: string, createdBy: string, fireAt: string, message: string,
-   *   origin?: { kind: 'feishu', triggerId: string, chatId: string, actor: string } }} request
+   *   origin?: { kind: 'feishu', triggerId: string, chatId: string, actor: string },
+   *   authorization?: { actor: string, source: 'feishu', at: string, messageId?: string, addressing?: string } }} request
    * @returns {object} the stored timer document.
    */
-  create({ ownerId, createdBy, fireAt, message, origin } = {}) {
+  create({ ownerId, createdBy, fireAt, message, origin, authorization } = {}) {
     if (typeof ownerId !== 'string' || !ownerId.trim()) {
       throw new TimerError('owner-required', 'timer_create: ownerId must be a non-empty string — a follow-up always belongs to one owner')
     }
@@ -181,9 +194,6 @@ export class TimerService {
     if (!owner) {
       throw new TimerError('unknown-owner', 'timer_create: unknown owner "' + ownerId + '" — a follow-up must belong to a registered owner')
     }
-    if (owner.role === 'chief') {
-      throw new TimerError('cannot-timer-chief', 'timer_create: the chief is the router, not a follow-up target')
-    }
     if (owner.recycled) {
       throw new TimerError('owner-recycled', 'timer_create: owner ' + ownerId + ' 已回收 — its directory is gone, schedule a follow-up for a live owner instead')
     }
@@ -196,6 +206,7 @@ export class TimerService {
       throw new TimerError('timer-create-unauthorized', 'timer_create: ' + createdBy + ' is not allowed to schedule follow-ups (only the human-facing L1/L2 tools may create timers)')
     }
     const sourceOrigin = feishuOrigin(origin)
+    const sourceAuthorization = feishuAuthorization(authorization, sourceOrigin)
     const at = toIso(nowMs)
     const timer = {
       id: 'tmr-' + randomUUID(),
@@ -204,6 +215,7 @@ export class TimerService {
       createdBy: createdBy.trim(),
       message: message.trim(),
       ...(sourceOrigin && { origin: sourceOrigin }),
+      ...(sourceAuthorization && { authorization: sourceAuthorization }),
       // Canonical UTC instant for comparison/delivery + the exact string the human gave, kept for display.
       fireAt: toIso(fireAtMs),
       fireAtInput: fireAt,
@@ -391,8 +403,10 @@ export class TimerService {
     if (recovered?.state === 'sent') return this.#settle(timer, recovered, nowIso)
     // Retries carry the due instant and lateness recorded by the first attempt.
     const fireAt = previous?.fireAt ?? timer.fireAt
-    const lateMs = previous?.lateMs ?? Math.max(0, nowMs - Date.parse(fireAt))
-    const late = previous?.late ?? (lateMs > this.#lateGraceMs)
+    const fireAtMs = Date.parse(fireAt)
+    const lateMs = previous?.lateMs ?? Math.max(0, nowMs - fireAtMs)
+    const missedWhileInactive = fireAtMs < this.#startedAtMs || fireAtMs < Date.parse(timer.resumedAt)
+    const late = previous?.late ?? (missedWhileInactive || lateMs > this.#lateGraceMs)
     const source = {
       kind: 'timer', timerId: timer.id, occurrenceId, fireAt, late,
       ...(timer.origin && { origin: timer.origin }),
@@ -418,8 +432,7 @@ export class TimerService {
         ownerId: timer.ownerId,
         message: timer.message,
         triggerRef,
-        // 票面权威: the creator and the moment of creation ARE the authorization for this follow-up.
-        authorization: { actor: timer.createdBy, source: 'timer', at: timer.createdAt },
+        authorization: timer.authorization ?? { actor: timer.createdBy, source: 'timer', at: timer.createdAt },
         source,
       })
       if (!receipt?.ticketId) throw new TimerError('missing-timer-ticket', 'The router did not accept this timer occurrence.')

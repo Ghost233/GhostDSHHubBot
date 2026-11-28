@@ -291,14 +291,14 @@ export function apply(ctx, rawConfig) {
       execute: (args, exec) => hub.router.reportBackground({ ...args, sessionId: exec.agent?.id }),
     }, { when: ({ agent }) => hub.router.isBackgroundWorker(agent.id) })
     scope.tools.register({
-      name: 'ask_background', description: '请用户回答当前后台任务的问题。随后等待这条请求的明确答复。',
+      name: 'ask_user', description: '就当前绑定的任务向用户提问。随后等待这条请求的明确答复。',
       parameters: { type: 'object', properties: { ticketId: { type: 'string' }, question: { type: 'string' } },
         required: ['ticketId', 'question'], additionalProperties: false },
       output: { schema: { type: 'object', properties: { ticketId: { type: 'string' }, stage: { type: 'string' } },
         required: ['ticketId', 'stage'], additionalProperties: false },
         render: (_args, value) => [{ type: 'text', text: '任务 ' + value.ticketId + ' 正等待用户回复。' }] },
-      execute: async (args, exec) => hub.router.askBackground({ ...args, sessionId: exec.agent?.id }),
-    }, { when: ({ agent }) => hub.router.isBackgroundWorker(agent.id) })
+      execute: async (args, exec) => hub.router.askWorker({ ...args, sessionId: exec.agent?.id }),
+    }, { when: ({ agent }) => hub.router.isManagedWorker(agent.id) })
     const getManager = sessionId => {
       if (store.closed) return undefined
       const owner = hub.registry.findByCurrentSession(sessionId)
@@ -326,17 +326,18 @@ export function apply(ctx, rawConfig) {
       output: timerResult,
       async execute({ ownerId, fireAt, message, triggerRef }, exec) {
         const manager = managerFor(exec, ownerId)
-        let origin
+        let origin, authorization
         if (triggerRef) {
           const trigger = hub.router.getTrigger(triggerRef)
-          const sender = trigger?.authorization?.actor
+          authorization = trigger?.authorization
+          const sender = authorization?.actor
           const isFeishu = trigger?.kind === 'feishu' && !trigger.dropped && trigger.source?.chatId && sender
             && trigger.source.openId === sender && trigger.authorization.source === 'feishu'
           const withinOwner = manager.role === 'chief' || hub.router.queryTasks({ owner: manager.id }).some(ticket => ticket.triggerId === triggerRef)
           if (!isFeishu || !withinOwner) throw new Error('The Feishu source for this reminder cannot be verified.')
           origin = { kind: 'feishu', triggerId: trigger.id, chatId: trigger.source.chatId, actor: sender }
         }
-        return { timer: timers.create({ ownerId: ownerId ?? manager.id, createdBy: exec.agent.id, fireAt, message, origin }) }
+        return { timer: timers.create({ ownerId: ownerId ?? manager.id, createdBy: exec.agent.id, fireAt, message, origin, authorization }) }
       },
     }, managerTool)
     scope.tools.register({
@@ -419,7 +420,7 @@ export function apply(ctx, rawConfig) {
   let githubPollTask = null
   const pollGithub = () => {
     if (!config.github.enabled || githubPollTask) return
-    githubPollTask = github.resolveSelfLogin().then(() => github.pollAll())
+    githubPollTask = github.pollAll()
       .catch(error => ctx.logger.warn('hub-bot github poll tick failed: %s', error?.message ?? error))
       .finally(() => { githubPollTask = null })
   }
@@ -935,6 +936,10 @@ export function apply(ctx, rawConfig) {
         } else if (route === 'models/catalog' && method === 'GET') {
           // 面板「总管模型」：目录 + 当前配置（配置即时生效后的下一次注入使用）。
           json(res, 200, { catalog: await sessions.modelCatalog(), chief: config.chief?.model ?? null })
+        } else if (route === 'triggers/detail' && method === 'GET') {
+          const detail = readMessageDetail(store, requireString(Object.fromEntries(url.searchParams), 'triggerId'))
+          if (!detail) throw new HttpError(404, 'Unknown trigger.')
+          json(res, 200, detail)
         } else if (route === 'triggers' && method === 'GET') {
           // 面板「最近触发」：trigger 表直读，最新在前。
           const limitRaw = url.searchParams.get('limit')

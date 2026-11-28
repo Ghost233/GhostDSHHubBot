@@ -14,15 +14,19 @@ import { resolveConfig } from '../src/config.js'
 const REPO = 'Ghost233/DSH-Workflow'
 const REPO_CFG = { repo: REPO, workspace: 'DSH-Workflow', cwd: '/Volumes/home/DSH-Workflow', enabled: true }
 
-/** Scripted GitHub responses are keyed by endpoint. POST requests are recorded locally. */
+/** Scripted GitHub responses are keyed by endpoint, with a POST prefix for sends. */
 function fakeGh(script) {
   const posts = []
   const reads = []
   const gh = async (args) => {
-    if (args.includes('POST')) { posts.push(args); return '{"id": 9001}' }
-    reads.push(args)
-    const endpoint = args[1].split('?')[0]
-    const response = script[endpoint] ?? (args.includes('--slurp') ? [[]] : { state: 'open' })
+    const posting = args.includes('POST')
+    const endpoint = args[posting ? args.indexOf('POST') + 1 : 1].split('?')[0]
+    if (posting) posts.push(args)
+    else reads.push(args)
+    const key = posting ? 'POST ' + endpoint : endpoint
+    const query = new URLSearchParams(args[1].split('?')[1])
+    const defaultRead = args.includes('--slurp') || query.has('page') ? [] : { state: 'open' }
+    const response = script[key] ?? (posting ? { id: 9001 } : defaultRead)
     const value = typeof response === 'function' ? await response(args) : response
     if (value instanceof Error) throw value
     return typeof value === 'string' ? value : JSON.stringify(value)
@@ -47,19 +51,20 @@ function comment({ id = 5001, body = '继续', login = 'Ghost233', issueNumber =
 
 /** registry+router+source with fake sessions and a scripted fake gh. 监听清单跟随注册表（repo owners 的
  *  origin——fake git 按 cwd 返回 remote URL）；repo owner 已在下方注册，config 不再有 repos 列表。 */
-function fixture({ allowlist = ['Ghost233'], script = {}, repos = [REPO_CFG] } = {}) {
+function fixture({ allowlist = ['Ghost233'], script = {}, repos = [REPO_CFG], routerConfig } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'hub-bot-gh-'))
   const store = new Store(dir)
   const registry = new OwnerRegistry(store, { scratchRoot: join(dir, 'scratch') })
   registry.ensureChief({ cwd: '/Volumes/home', workspace: 'Ghost233HomeRepo' })
   for (const r of repos) registry.create({ kind: 'repo', workspace: r.workspace, cwd: r.cwd })
   let nowMs = Date.parse('2026-11-15T00:00:00.000Z')
-  const calls = { create: [], prompt: [] }
+  const calls = { create: [], prompt: [], cancel: [] }
   const sessions = {
     create: async request => { calls.create.push(request); return { sessionId: 'session-' + calls.create.length } },
     prompt: async request => { calls.prompt.push(request); return { accepted: true } },
+    cancel: async request => { calls.cancel.push(request.sessionId) },
   }
-  const router = new Router({ store, registry, sessions, now: () => new Date(nowMs).toISOString() })
+  const router = new Router({ store, registry, sessions, config: routerConfig, now: () => new Date(nowMs).toISOString() })
   const { gh, posts, reads } = fakeGh(script)
   const config = { enabled: true, intervalMs: 300000, loginAllowlist: allowlist, mentionHandle: '@hub-bot' }
   const warnings = []
@@ -69,9 +74,19 @@ function fixture({ allowlist = ['Ghost233'], script = {}, repos = [REPO_CFG] } =
     if (!match) throw new Error('git remote get-url: no origin')
     return 'https://github.com/' + match.repo + '.git\n'
   }
-  const source = new GitHubSource({ store, registry, router, sessions, config, logger: { info() {}, warn: (...a) => warnings.push(a.join(' ')) }, gh, git, now: () => new Date(nowMs).toISOString() })
+  const makeSource = (store, registry, router) => new GitHubSource({
+    store, registry, router, sessions, config, logger: { info() {}, warn: (...a) => warnings.push(a.join(' ')) }, gh, git,
+    now: () => new Date(nowMs).toISOString(),
+  })
+  const source = makeSource(store, registry, router)
+  const reopen = () => {
+    const nextStore = new Store(dir)
+    const nextRegistry = new OwnerRegistry(nextStore, { scratchRoot: join(dir, 'scratch') })
+    const nextRouter = new Router({ store: nextStore, registry: nextRegistry, sessions, config: routerConfig, now: source.now })
+    return { store: nextStore, source: makeSource(nextStore, nextRegistry, nextRouter) }
+  }
   return {
-    source, registry, router, store, calls, posts, reads, script, gh, warnings,
+    source, registry, router, store, sessions, calls, posts, reads, script, gh, warnings, reopen,
     setNow: (iso) => { nowMs = Date.parse(iso) },
     triggers: () => store.db.prepare('SELECT value FROM trigger').all().map(r => JSON.parse(String(r.value))),
     tickets: () => store.db.prepare('SELECT value FROM ticket').all().map(r => JSON.parse(String(r.value))),
@@ -89,15 +104,18 @@ test('config: the github section validates and defaults disabled with 5min polli
   assert.deepEqual(resolveConfig({ stateDir: '/tmp/x', homeRepo: '/tmp/y' }).github, { enabled: false, intervalMs: 300000, loginAllowlist: [] })
 })
 
-test('the first poll of a repo records ONLY the watermark — 存量不触发', async () => {
-  const f = fixture({ script: { ['repos/' + REPO + '/issues']: [issue({ number: 40 }), issue({ number: 41 })] } })
+test('bootstrap reads only the newest issue or PR and records its number', async () => {
+  const issues = 'repos/' + REPO + '/issues'
+  const f = fixture({ script: { [issues]: args => args.includes('--slurp')
+    ? [[issue({ number: 41, pr: true })], [issue({ number: 40 })]] : [issue({ number: 41, pr: true })] } })
   try {
-    const result = await f.source.pollAll()
-    assert.equal(result.triggered, 0, 'existing backlog never triggers')
+    const result = await f.source.pollWatchedRepo(REPO)
+    assert.equal(result.triggered, 0)
     assert.equal(f.calls.prompt.length, 0)
     const wm = JSON.parse(readFileSync(watermarkPath(f.store.stateDir), 'utf8'))
     assert.equal(wm.repos[REPO].maxNumber, 41)
     assert.equal(wm.repos[REPO].initialized, true)
+    assert.deepEqual(f.reads, [['api', issues + '?state=all&sort=created&direction=desc&per_page=1&page=1']])
   } finally { f.cleanup() }
 })
 
@@ -181,28 +199,43 @@ test('a new PR routes with the initial-review instruction (摘要+风险点)', a
   } finally { f.cleanup() }
 })
 
-test('an allowlisted stop terminates all live work for the item and notifies the chief once per task', async () => {
-  const f = fixture()
+test('a GitHub stop cancels its bound workers and leaves management sessions and unrelated work alone', async () => {
+  const f = fixture({ routerConfig: { concurrency: { slotsPerOwner: 10 } } })
   try {
     const ownerId = 'repo-DSH-Workflow'
+    f.registry.bindSession(ownerId, 'old-repo-owner')
     f.registry.bindSession(ownerId, 'repo-owner')
     const routed = await f.source.handleIssueEvent(issue(), REPO_CFG)
     const follow = await f.source.handleCommentEvent(comment({ id: 5003 }), REPO_CFG)
     const unrelated = await f.router.routeToOwner({ ownerId, message: 'unrelated management work' })
     const otherIssue = await f.source.handleIssueEvent(issue({ number: 43 }), REPO_CFG)
+    const legacyComment = comment({ id: 5004 })
+    const legacy = await f.router.routeToOwner({ ownerId, message: 'legacy work',
+      triggerRef: 'github:' + REPO + ':comment:5004',
+      authorization: { actor: 'Ghost233', source: 'github', at: f.source.now(), messageId: legacyComment.html_url } })
+    f.router.tasks.bindWorkerSession(legacy.ticketId, { sessionId: 'legacy-worker', cwd: REPO_CFG.cwd })
+    const stale = await f.source.handleCommentEvent(comment({ id: 5005 }), REPO_CFG)
+    f.router.tasks.bindWorkerSession(stale.ticketId, { sessionId: 'old-repo-owner', cwd: REPO_CFG.cwd })
+    const workerOf = id => f.router.getTicket(id).workerSession.sessionId
+    const conflicting = await f.source.handleCommentEvent(comment({ id: 5006 }), REPO_CFG)
+    f.router.tasks.bindWorkerSession(conflicting.ticketId, { sessionId: workerOf(otherIssue.ticketId), cwd: REPO_CFG.cwd })
+    const shared = await f.source.handleCommentEvent(comment({ id: 5007 }), REPO_CFG)
+    f.router.tasks.bindWorkerSession(shared.ticketId, { sessionId: workerOf(routed.ticketId), cwd: REPO_CFG.cwd })
     const stop = comment({ body: '停' })
     const result = await f.source.handleCommentEvent(stop, REPO_CFG)
+    const stopped = [routed, follow, legacy, stale, conflicting, shared].map(work => work.ticketId)
     assert.equal(result.terminated, routed.ticketId)
-    assert.deepEqual(new Set(result.terminatedTicketIds), new Set([routed.ticketId, follow.ticketId]))
-    for (const id of result.terminatedTicketIds) {
+    assert.deepEqual(new Set(result.terminatedTicketIds), new Set(stopped))
+    for (const id of stopped) {
       const ticket = f.router.getTicket(id)
       assert.equal(ticket.stage, 'failed')
       assert.ok(ticket.failed.reason.includes('停'))
     }
     assert.equal(f.router.getTicket(unrelated.ticketId).stage, 'working')
-    assert.equal(f.router.getTicket(otherIssue.ticketId).stage, 'queued')
+    assert.equal(f.router.getTicket(otherIssue.ticketId).stage, 'working')
     assert.equal(f.registry.get(ownerId).sessionId, 'repo-owner')
     assert.equal((await f.source.handleCommentEvent({ ...stop, body: '@hub-bot 重试' }, REPO_CFG)).deduped, true)
+    assert.deepEqual(f.calls.cancel, [workerOf(routed.ticketId), workerOf(follow.ticketId)])
     const notices = f.outbox().filter(r => r.kind === 'reply' && r.body.includes('已终止'))
     assert.deepEqual(notices.map(r => r.ticketId), result.terminatedTicketIds)
     assert.ok(notices.every(r => r.to === 'dsh:session:chief' && r.state === 'queued'))
@@ -342,6 +375,109 @@ test('deliverReplies posts recorded github replies as real comments with the bad
   } finally { f.cleanup() }
 })
 
+test('a posted acknowledgement does not become work after reopen, even when a manual comment has the same login and body', async () => {
+  const issues = 'repos/' + REPO + '/issues'
+  const f = fixture({ allowlist: [], script: { user: { login: 'Ghost233' }, [issues]: [issue({ number: 41 })] } })
+  let store
+  try {
+    assert.deepEqual(await f.source.resolveSelfLogin(), ['Ghost233'])
+    await f.source.pollAll()
+    f.script[issues] = [issue(), issue({ number: 41 })]
+    assert.equal((await f.source.pollAll()).triggered, 1)
+    let posted
+    f.script['POST ' + issues + '/42/comments'] = args => {
+      posted = comment({ id: 9001, body: args[args.indexOf('-f') + 1].slice('body='.length) })
+      return posted
+    }
+    assert.equal((await f.source.deliverReplies()).delivered, 1)
+    assert.ok(posted.body.includes(DSH_BADGE))
+    const manual = comment({ id: 9002, body: posted.body })
+    f.script[issues + '/comments'] = [[posted, manual]]
+    const reopened = f.reopen()
+    store = reopened.store
+    const result = await reopened.source.pollWatchedRepo(REPO)
+    assert.deepEqual({ triggered: result.triggered, ids: f.tickets().map(row => row.triggerId) }, {
+      triggered: 1, ids: ['github:' + REPO + ':issue:42', 'github:' + REPO + ':comment:9002'],
+    })
+    assert.equal(f.posts.length, 1)
+  } finally { store?.close(); f.cleanup() }
+})
+
+test('polling waits for an in-flight reply receipt before admitting same-item comments', async () => {
+  const issues = 'repos/' + REPO + '/issues'
+  const f = fixture()
+  const visible = Promise.withResolvers()
+  const release = Promise.withResolvers()
+  const entered = Promise.withResolvers()
+  let delivery, poll
+  try {
+    await f.source.pollAll()
+    await f.source.handleIssueEvent(issue(), REPO_CFG)
+    const self = comment({ id: 9001, body: 'posted by the plugin' })
+    const human = comment({ id: 9002, body: 'manual comment' })
+    f.script['POST ' + issues + '/42/comments'] = async () => {
+      visible.resolve()
+      await release.promise
+      return self
+    }
+    f.script[issues + '/comments'] = [[self, human]]
+    delivery = f.source.deliverReplies()
+    await visible.promise
+    const receive = f.source.handleCommentEvent.bind(f.source)
+    f.source.handleCommentEvent = (...args) => {
+      entered.resolve()
+      return receive(...args)
+    }
+    poll = f.source.pollWatchedRepo(REPO)
+    await entered.promise
+    assert.equal(f.tickets().length, 1)
+    release.resolve()
+    assert.equal((await delivery).delivered, 1)
+    assert.equal((await poll).triggered, 1)
+    assert.deepEqual(f.tickets().map(t => t.triggerId), [
+      'github:' + REPO + ':issue:42', 'github:' + REPO + ':comment:9002',
+    ])
+  } finally {
+    release.resolve()
+    await Promise.allSettled([delivery, poll])
+    f.cleanup()
+  }
+})
+
+test('a restart reuses the receipt for the same outbox row when a POST completes during shutdown', async () => {
+  const issues = 'repos/' + REPO + '/issues'
+  const f = fixture()
+  const posted = comment({ id: 9001, body: 'recorded acknowledgement' })
+  const started = Promise.withResolvers()
+  const reply = Promise.withResolvers()
+  let delivery, reopened
+  try {
+    await f.source.pollAll()
+    const routed = await f.source.handleIssueEvent(issue(), REPO_CFG)
+    const outboxId = f.outbox().find(row => row.ticketId === routed.ticketId && row.state === 'recorded').id
+    f.script['POST ' + issues + '/42/comments'] = () => { started.resolve(); return reply.promise }
+    delivery = f.source.deliverReplies()
+    await started.promise
+    f.store.close()
+    reply.resolve(posted)
+    await assert.rejects(delivery, /database.*(?:closed|not open)/i)
+    reopened = f.reopen()
+    const readRow = () => JSON.parse(reopened.store.db.prepare('SELECT value FROM outbox WHERE id = ?').get(outboxId).value)
+    assert.equal(readRow().state, 'recorded')
+    assert.equal((await reopened.source.deliverReplies()).delivered, 1)
+    assert.equal(readRow().state, 'sent')
+    assert.equal(f.posts.length, 1)
+    f.script[issues + '/comments'] = [[posted]]
+    assert.equal((await reopened.source.pollWatchedRepo(REPO)).triggered, 0)
+    assert.equal(f.calls.prompt.length, 1)
+  } finally {
+    reply.resolve(posted)
+    await Promise.allSettled([delivery])
+    reopened?.store.close()
+    f.cleanup()
+  }
+})
+
 test('deliverReplies failures: recorded stays recorded with the shared attempts counter; five failures fail the row + system problem', async () => {
   const f = fixture()
   f.source.gh = async () => { throw new Error('HTTP 403') }
@@ -405,27 +541,61 @@ test('a failed comment fetch preserves the checkpoint and the next instance catc
   } finally { f.cleanup() }
 })
 
-test('paginated issues and comments are processed once across overlapping pages', async () => {
+test('issue pagination crosses number gaps, deduplicates overlap and stops at the saved floor', async () => {
   const issues = 'repos/' + REPO + '/issues'
-  const f = fixture({ script: { [issues]: [[issue({ number: 41 })], [issue({ number: 40 })]] } })
+  const f = fixture({ script: { [issues]: [issue({ number: 41 })] } })
   try {
     await f.source.pollAll()
-    const pull = issue({ number: 43, pr: true })
+    const highPage = Array.from({ length: 100 }, (_, index) => issue({ number: 250 - index * 2, login: 'stranger' }))
+    const pull = issue({ number: 47, pr: true })
     const opened = issue()
-    f.script[issues] = [[pull, opened], [opened, issue({ number: 41 })]]
+    f.script[issues] = args => {
+      const query = new URLSearchParams(args[1].split('?')[1])
+      assert.equal(query.get('state'), 'all')
+      assert.equal(query.get('sort'), 'created')
+      assert.equal(query.get('direction'), 'desc')
+      assert.deepEqual(args.slice(2), [])
+      if (query.get('page') === '1') return highPage
+      if (query.get('page') === '2') return [highPage.at(-1), pull, opened, issue({ number: 40 })]
+      throw new Error('old history must not be fetched')
+    }
     const first = comment({ id: 5001, body: '@hub-bot 确认行为' })
-    const second = comment({ id: 5002, body: '补充说明', issueNumber: 43 })
+    const second = comment({ id: 5002, body: '补充说明', issueNumber: 47 })
     f.script[issues + '/comments'] = [[second], [first, second]]
-    assert.deepEqual(await f.source.pollAll(), { triggered: 4, dropped: 0, terminated: 0 })
-    assert.deepEqual(f.triggers().map(t => t.id), [
-      'github:' + REPO + ':issue:42', 'github:' + REPO + ':pr:43',
+    assert.deepEqual(await f.source.pollWatchedRepo(REPO), { triggered: 4, dropped: 100, terminated: 0 })
+    assert.deepEqual(new Set(f.tickets().map(t => t.triggerId)), new Set([
+      'github:' + REPO + ':issue:42', 'github:' + REPO + ':pr:47',
       'github:' + REPO + ':comment:5001', 'github:' + REPO + ':comment:5002',
-    ])
-    const listReads = f.reads.filter(args => args[1].startsWith(issues + '?') || args[1].startsWith(issues + '/comments?'))
-    assert.equal(listReads.length, 3)
-    for (const args of listReads) assert.deepEqual(args.slice(2), ['--paginate', '--slurp'])
+    ]))
+    const issueReads = f.reads.filter(args => args[1].startsWith(issues + '?'))
+    assert.deepEqual(issueReads.map(args => new URLSearchParams(args[1].split('?')[1]).get('page')), ['1', '1', '2'])
+    const commentReads = f.reads.filter(args => args[1].startsWith(issues + '/comments?'))
+    assert.deepEqual(commentReads.map(args => args.slice(2)), [['--paginate', '--slurp']])
     assert.equal((await f.source.status()).repos[REPO].maxCommentId, 5002)
+    assert.equal((await f.source.status()).repos[REPO].maxNumber, 250)
   } finally { f.cleanup() }
+})
+
+test('a failed later issue page leaves the saved floor available after reopening', async () => {
+  const issues = 'repos/' + REPO + '/issues'
+  const f = fixture({ script: { [issues]: [issue({ number: 41 })] } })
+  let reopened
+  try {
+    await f.source.pollWatchedRepo(REPO)
+    const checkpoint = () => readFileSync(watermarkPath(f.store.stateDir), 'utf8')
+    const before = checkpoint()
+    const first = Array.from({ length: 100 }, (_, index) => issue({ number: 142 - index, login: 'stranger' }))
+    f.script[issues] = args => args[1].endsWith('&page=1') ? first : new Error('synthetic second page timeout')
+    await assert.rejects(f.source.pollWatchedRepo(REPO), /synthetic second page timeout/)
+    assert.equal(checkpoint(), before)
+    assert.equal(f.triggers().length, 0)
+    assert.equal((await f.source.status()).repos[REPO].lastError, 'synthetic second page timeout')
+    f.script[issues] = args => args[1].endsWith('&page=1') ? first : [issue(), issue({ number: 41 })]
+    reopened = f.reopen()
+    assert.deepEqual(await reopened.source.pollWatchedRepo(REPO), { triggered: 1, dropped: 100, terminated: 0 })
+    assert.equal(f.tickets()[0].triggerId, 'github:' + REPO + ':issue:42')
+    assert.equal((await reopened.source.status()).repos[REPO].maxNumber, 142)
+  } finally { reopened?.store.close(); f.cleanup() }
 })
 
 test('a comment processing failure preserves both checkpoint fields and a reopen deduplicates committed work', async () => {
@@ -540,6 +710,49 @@ test('status() follows the registry: watched repos come from repo owners\' origi
     assert.ok(repaired.followed.some(w => w.ownerId === 'repo-plain'))
     assert.equal(repaired.resolveErrors['owner:repo-plain'], undefined)
   } finally { f.cleanup() }
+})
+
+test('manual and scheduled polling wait for one default login check and retry after failure', async () => {
+  const issues = 'repos/' + REPO + '/issues'
+  const f = fixture({ script: { [issues]: [issue({ number: 41 })] } })
+  const started = Promise.withResolvers()
+  const release = Promise.withResolvers()
+  let manual, scheduled
+  try {
+    await f.source.pollWatchedRepo(REPO)
+    f.source.config.loginAllowlist = []
+    f.setNow('2026-11-15T02:00:00.000Z')
+    f.script[issues] = [issue(), issue({ number: 41 })]
+    const checkpoint = () => readFileSync(watermarkPath(f.store.stateDir), 'utf8')
+    const before = checkpoint()
+    f.reads.length = 0
+    f.script.user = async () => {
+      started.resolve()
+      await release.promise
+      throw new Error('synthetic auth timeout')
+    }
+    manual = f.source.pollWatchedRepo(REPO)
+    scheduled = f.source.pollAll()
+    await started.promise
+    assert.deepEqual(f.reads, [['api', 'user']])
+    assert.equal(checkpoint(), before)
+    release.resolve()
+    await assert.rejects(manual, /synthetic auth timeout/)
+    assert.deepEqual(await scheduled, { triggered: 0, dropped: 0, terminated: 0 })
+    assert.deepEqual(f.reads, [['api', 'user']])
+    assert.equal(checkpoint(), before)
+    assert.equal((await f.source.status()).repos[REPO].lastError, 'synthetic auth timeout')
+    f.script.user = { login: 'Ghost233' }
+    const recovered = await f.source.pollWatchedRepo(REPO)
+    assert.equal(recovered.triggered, 1)
+    assert.equal(f.reads.filter(args => args[1] === 'user').length, 2)
+    assert.equal((await f.source.status()).repos[REPO].lastError, undefined)
+    assert.deepEqual(f.source.config.loginAllowlist, ['Ghost233'])
+  } finally {
+    release.resolve()
+    await Promise.allSettled([manual, scheduled])
+    f.cleanup()
+  }
 })
 
 test('a pending default GitHub login lookup respects an allowlist the user saves', async () => {

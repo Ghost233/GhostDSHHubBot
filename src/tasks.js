@@ -360,15 +360,15 @@ export class TaskBoard {
   noteDeferred(ticketId, patch = {}) {
     const ticket = this.#mustGet(ticketId)
     const deferred = ticket.deferred
+    if (!deferred) throw new TaskError('no-deferred', 'ticket ' + ticketId + ' has no deferred request')
+    if (DEFERRED_TERMINAL_STATUSES.includes(deferred.status)) {
+      throw new TaskError('deferred-closed', 'ticket ' + ticketId + ': deferred request is already ' + deferred.status)
+    }
     if ('status' in patch && patch.status !== deferred.status && !(deferred.status === 'pending' && patch.status === 'accepted')) {
       throw new TaskError('deferred-status-invalid', 'deferred: invalid status change from ' + deferred.status + ' to ' + patch.status)
     }
     if (deferred.status === 'accepted' && ['decidedAt', 'outcome', 'waitRevision'].some(key => key in patch && !sameFact(deferred[key], patch[key]))) {
       throw new TaskError('deferred-immutable', 'deferred: the accepted decision cannot change')
-    }
-    if (!deferred) throw new TaskError('no-deferred', 'ticket ' + ticketId + ' has no deferred request')
-    if (DEFERRED_TERMINAL_STATUSES.includes(deferred.status)) {
-      throw new TaskError('deferred-closed', 'ticket ' + ticketId + ': deferred request is already ' + deferred.status)
     }
     const drift = DEFERRED_IMMUTABLE_FIELDS.filter(field => field in patch && !sameFact(deferred[field], patch[field]))
     if (drift.length > 0) {
@@ -405,6 +405,32 @@ export class TaskBoard {
     if (executedAt !== undefined) closed.executedAt = executedAt
     this.#updateTicket({ ...ticket, deferred: closed, updatedAt: this.now() })
     return { deferred: closed, duplicate: false }
+  }
+
+  /** Mirrors a delivery receipt on the closed answer still shown on the ticket. */
+  recordDeferredAnswerDelivery(ticketId, { requestId, delivery }) {
+    const ticket = this.getTicket(ticketId)
+    const deferred = ticket?.deferred
+    if (!deferred || deferred.requestId !== requestId) return
+    if (deferred.status !== 'fulfilled' || deferred.outcome?.decision !== 'answer') {
+      throw new TaskError('deferred-status-invalid', 'deferred: delivery receipt requires a fulfilled answer')
+    }
+    const previous = deferred.outcome.delivery
+    if (previous && previous.state !== 'queued') {
+      if (sameFact(previous, delivery)) return
+      throw new TaskError('deferred-status-invalid', 'deferred: answer delivery is already ' + previous.state)
+    }
+    const transitions = ticket.transitions ?? []
+    const resumed = transitions.at(-1)
+    const originalRun = deferred.waitRevision === undefined
+      ? resumed?.at === deferred.decidedAt && !transitions.slice(0, -1).some(event =>
+        event.from === 'person/answer' && Date.parse(event.at) >= Date.parse(deferred.openedAt))
+      : transitions.length === deferred.waitRevision + 1
+    const block = delivery.state === 'failed' && ticket.stage === 'working' && originalRun
+      && resumed?.from === 'person/answer' && resumed.to === 'working' && resumed.by === 'route'
+    const nextTicket = block ? this.escalate({ ticketId, reason: delivery.reason, by: 'system' }) : ticket
+    const next = { ...deferred, outcome: { ...deferred.outcome, delivery } }
+    this.#updateTicket({ ...nextTicket, deferred: next, updatedAt: this.now() })
   }
 
   /** Adds execution evidence to a completed approval on the current face or in its history. */

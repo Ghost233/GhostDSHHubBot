@@ -355,6 +355,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       intakeInjected: '已注入',
       intakePending: '待注入',
       intakeFailed: '投递失败',
+      intakeDiscarded: '已丢弃投递',
       timersSection: '提醒',
       timersEmpty: '暂无提醒。',
       timerPause: '暂停',
@@ -366,6 +367,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       timerCancelled: '已取消', timerFailed: '失败',
       timerWorker: '打开执行会话', timerDeliverySent: '已接管', timerDeliveryQueued: '待投递', timerDeliveryFailed: '投递失败',
       intakeCohort: '合并来信',
+      deferredExpires: '答复截止', deferredTarget: '目标会话',
+      answerQueued: '答复待接管', answerSent: '答复已接管', answerFailed: '答复投递失败', answerDiscarded: '已丢弃答复投递',
       intakeInterrupt: '停止请求',
       intakeInterruptRequested: '已请求停止',
       intakeTriggers: '触发',
@@ -505,7 +508,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       dismissTicketFeedback: '关闭提示',
       droppedCardHint: '最近未受理',
       retriedNotice: '已重投 {count} 条，回到投递队列',
-      confirmDone: '已确认，继续执行',
+      confirmDone: '已记录确认',
       rejectDone: '已拒绝，任务转被卡住',
       acceptDone: '已验收通过',
       batchConfirmed: '已批量确认 {count} 条',
@@ -733,6 +736,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       intakeInjected: 'injected',
       intakePending: 'awaiting injection',
       intakeFailed: 'delivery failed',
+      intakeDiscarded: 'delivery discarded',
       timersSection: 'Follow-ups',
       timersEmpty: 'No follow-ups scheduled.',
       timerPause: 'Pause',
@@ -744,6 +748,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       timerCancelled: 'Cancelled', timerFailed: 'Failed',
       timerWorker: 'Open worker session', timerDeliverySent: 'Admitted', timerDeliveryQueued: 'Pending delivery', timerDeliveryFailed: 'Delivery failed',
       intakeCohort: 'Combined incoming messages',
+      deferredExpires: 'Reply deadline', deferredTarget: 'Destination session',
+      answerQueued: 'Reply pending delivery', answerSent: 'Reply delivered', answerFailed: 'Reply delivery failed', answerDiscarded: 'Reply delivery discarded',
       intakeInterrupt: 'Stop request',
       intakeInterruptRequested: 'Stop requested',
       intakeTriggers: 'triggers',
@@ -883,7 +889,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       dismissTicketFeedback: 'Dismiss',
       droppedCardHint: 'Last dropped',
       retriedNotice: 'Requeued {count} row(s) to the delivery queue',
-      confirmDone: 'Confirmed, resuming',
+      confirmDone: 'Approval recorded',
       rejectDone: 'Rejected, ticket blocked',
       acceptDone: 'Accepted',
       batchConfirmed: 'Confirmed {count} ticket(s)',
@@ -1729,7 +1735,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     reply.lastError && reply.state !== 'sent' ? h('div', null, reply.lastError) : null)) : null) : null,
               detail?.result?.intake ? h('p', { key: 'intake', style: settingsHintStyle },
                 t('intakeDisposition') + ' · ' + t(({
-                  dropped: 'intakeDropped', injected: 'intakeInjected', pending: 'intakePending', failed: 'intakeFailed',
+                  dropped: 'intakeDropped', discarded: 'intakeDiscarded', injected: 'intakeInjected', pending: 'intakePending', failed: 'intakeFailed',
                   interrupt: 'intakeInterrupt', 'interrupt-requested': 'intakeInterruptRequested',
                 })[detail.result.intake.disposition] || 'intakePending'),
                 detail.result.intake.lastError ? h('span', null, ' · ' + detail.result.intake.lastError) : null) : null,
@@ -2283,6 +2289,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             }
             function disposition(entry) {
               // 处置口径由 src/panel.js 统一判定（disposition），客户端只翻译，不自己再猜一遍。
+              if (entry.disposition === 'discarded') return t('intakeDiscarded');
               if (entry.disposition === 'dropped') return t('intakeDropped') + (entry.dropped ? ': ' + String(entry.dropped).slice(0, 24) : '');
               if (entry.disposition === 'injected') return t('intakeInjected');
             if (entry.disposition === 'interrupt') return t('intakeInterrupt');
@@ -2618,6 +2625,19 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               }
             }
             if (tk.question && tk.stage === 'person/answer') rows.push(h('div', { key: 'q', style: { marginTop: '6px', fontSize: '13px', color: TONES.amber.fg } }, t('questionLabel') + tk.question.text));
+            if (tk.deferred?.status === 'pending') {
+              var deadline = new Date(tk.deferred.expiresAt).toLocaleString();
+              var targetId = tk.deferred.target?.sessionId;
+              rows.push(h('p', { key: 'deferred-deadline', style: settingsHintStyle }, t('deferredExpires') + ' · ' + deadline,
+                targetId ? ' · ' + t('deferredTarget') + ' ' + targetId : null));
+            }
+            var answerDelivery = tk.deferred?.delivery;
+            var answerStatusKey = ({ queued: 'answerQueued', sent: 'answerSent', failed: 'answerFailed', discarded: 'answerDiscarded' })[answerDelivery?.state];
+            var decisionNote = answerDelivery?.reason || tk.deferred?.reason;
+            if (answerStatusKey || decisionNote) {
+              rows.push(h('p', { key: 'deferred-result', style: settingsHintStyle },
+                [answerStatusKey && t(answerStatusKey), decisionNote].filter(Boolean).join(' · ')));
+            }
             var report = tk.report ? h(TicketReport, { key: 'report', report: tk.report,
               copied: copiedId === 'rp:' + tk.id, copy: text => copyText(text, 'rp:' + tk.id),
             }) : null;

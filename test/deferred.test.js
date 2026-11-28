@@ -82,6 +82,14 @@ function openConfirm(env, { requestId, question = '确认 fork：新建会话并
   return { ticket, doc }
 }
 
+function askForAnswer(env, ticket = env.seed()) {
+  const doc = env.registry.request({
+    ...facts(ticket, { type: 'answer', action: { type: 'ask-user' }, target: null, receiver: { kind: 'owner', ownerId: 'owner-A' } }),
+    question: '请提供编号',
+  })
+  return { ticket, input: { requestId: doc.requestId, decision: 'answer', text: 'A-123', actor: REQUESTER } }
+}
+
 test('module contract: the exported vocabulary and fail-closed constructor', () => {
   assert.deepEqual(DEFERRED_STATUSES, ['pending', 'answered', 'cancelled', 'expired'])
   assert.deepEqual(DEFERRED_DECISIONS, ['approve', 'reject', 'answer', 'cancel'])
@@ -487,6 +495,27 @@ test('an initial route may target its registered owner before a session exists',
   } finally { env.cleanup() }
 })
 
+test('owner route and follow-up confirmations preserve the fixed owner session', async () => {
+  const targets = []
+  const owners = { get: () => ({ id: 'owner-A', status: 'created', sessionId: 'sess-owner-1' }) }
+  const env = fixture({ owners, handlers: { 'dangerous-inject': ({ request }) => targets.push(request.target) } })
+  try {
+    const decide = doc => env.registry.resolve({ requestId: doc.requestId, decision: 'approve', actor: REQUESTER })
+    const target = { ownerId: 'owner-A', sessionId: 'sess-owner-1' }
+    for (const entry of ['route', 'follow-up']) {
+      const { doc, ticket } = openConfirm(env, { action: { type: 'dangerous-inject', entry }, target })
+      assert.deepEqual((await decide(doc)).target, target)
+      assert.deepEqual(env.board.getDeferred(ticket.id).target, target)
+    }
+    const action = { type: 'dangerous-inject', entry: 'route' }
+    for (const invalid of [{ ...target, ownerId: 'owner-B' }, { ...target, sessionId: ' ' }, { ...target, sessionId: null }]) {
+      const { doc } = openConfirm(env, { action, target: invalid })
+      await assert.rejects(decide(doc), { code: 'target-ineligible' })
+    }
+    assert.deepEqual(targets, [target, target])
+  } finally { env.cleanup() }
+})
+
 test('a worker answer needs its exact ticket binding and does not need an owner session', async () => {
   const owners = { currentBinding: () => ({ id: 'owner-A', status: 'pending', sessionId: null }) }
   const env = fixture({ owners })
@@ -509,6 +538,117 @@ test('a worker answer needs its exact ticket binding and does not need an owner 
     assert.equal(env.board.getTicket(replaced.ticket.id).stage, 'blocked')
     assert.equal(env.registry.get(replaced.doc.requestId).status, 'cancelled')
     assert.equal(env.registry.get(replaced.doc.requestId).receiver.sessionId, 'sess-worker-1')
+
+    const unavailable = openAnswer()
+    const input = { requestId: unavailable.doc.requestId, decision: 'answer', text: 'B-456', actor: REQUESTER, workerUnavailable: true }
+    await assert.rejects(env.registry.resolve({ ...input, actor: { actor: 'other' } }), { code: 'actor-mismatch' })
+    await assert.rejects(env.registry.resolve({ ...input, decision: 'approve' }), { code: 'decision-invalid' })
+    assert.equal(env.registry.get(unavailable.doc.requestId).status, 'pending')
+    await assert.rejects(env.registry.resolve(input), { code: 'receiver-stale' })
+    assert.equal(env.registry.get(unavailable.doc.requestId).status, 'cancelled')
+    const face = env.board.getTicket(unavailable.ticket.id)
+    assert.equal(face.stage, 'blocked')
+    assert.equal(face.deferred.outcome.refused, 'receiver-stale')
+    assert.equal(face.transitions.at(-1).by, 'system')
+
+    const expired = openAnswer()
+    env.clock.at = expired.doc.expiresAt
+    await assert.rejects(env.registry.resolve({ ...input, requestId: expired.doc.requestId }), { code: 'request-expired' })
+    assert.equal(env.registry.get(expired.doc.requestId).outcome.kind, 'timeout')
+  } finally { env.cleanup() }
+})
+
+test('answer acceptance queues delivery and sent evidence survives a duplicate or late failure', async () => {
+  const env = fixture()
+  try {
+    const closed = []
+    let canEnqueue = false
+    env.registry.setCloseHandler(request => {
+      assert.equal(env.store.db.isTransaction, true)
+      if (!canEnqueue) throw new Error('fixture outbox write failed')
+      closed.push(request)
+    })
+    const { ticket, input } = askForAnswer(env)
+    await assert.rejects(env.registry.resolve(input), /fixture outbox write failed/)
+    assert.equal(env.registry.get(input.requestId).status, 'pending')
+    assert.equal(env.board.getTicket(ticket.id).stage, 'person/answer')
+    canEnqueue = true
+    const accepted = await env.registry.resolve(input)
+    assert.deepEqual(accepted.outcome.delivery, { state: 'queued' })
+    assert.deepEqual(closed, [accepted.request])
+    assert.deepEqual(env.board.getDeferred(ticket.id).outcome, accepted.outcome)
+
+    env.clock.at = '2026-11-15T00:00:45.000Z'
+    const sent = env.registry.recordAnswerDelivery(input.requestId, { state: 'sent' })
+    assert.equal(sent.duplicate, false)
+    assert.equal(sent.request.decidedAt, accepted.request.decidedAt)
+    assert.equal(sent.request.outcome.text, input.text)
+    assert.deepEqual(sent.request.outcome.delivery, { state: 'sent', at: env.clock.at })
+    assert.deepEqual(env.board.getDeferred(ticket.id).outcome, sent.request.outcome)
+
+    env.clock.at = '2026-11-15T00:01:00.000Z'
+    const prior = { request: sent.request, duplicate: true }
+    assert.deepEqual(env.registry.recordAnswerDelivery(input.requestId, { state: 'sent' }), prior)
+    assert.deepEqual(env.registry.recordAnswerDelivery(input.requestId, { state: 'failed', reason: 'worker later retired' }), prior)
+    assert.equal(env.board.getTicket(ticket.id).stage, 'working')
+    assert.equal(closed.length, 1)
+  } finally { env.cleanup() }
+})
+
+test('answer delivery failure blocks only the working run resumed by that answer', async () => {
+  const env = fixture()
+  try {
+    const current = askForAnswer(env)
+    const advanced = askForAnswer(env)
+    const replaced = askForAnswer(env)
+    for (const opened of [current, advanced, replaced]) await env.registry.resolve(opened.input)
+    env.board.escalate({ ticketId: advanced.ticket.id, reason: 'Later blocker' })
+    env.board.resume(advanced.ticket.id)
+    const replacement = askForAnswer(env, replaced.ticket)
+
+    env.clock.at = '2026-11-15T00:02:00.000Z'
+    const reason = 'Original worker was archived.'
+    const delivery = { state: 'failed', reason, at: env.clock.at }
+    for (const { input } of [current, advanced, replaced]) {
+      const result = env.registry.recordAnswerDelivery(input.requestId, { state: 'failed', reason })
+      assert.equal(result.duplicate, false)
+      assert.equal(result.request.status, 'answered')
+      assert.deepEqual(result.request.outcome.delivery, delivery)
+    }
+    const blocked = env.board.getTicket(current.ticket.id)
+    assert.equal(blocked.stage, 'blocked')
+    assert.equal(blocked.escalated.reason, reason)
+    assert.equal(blocked.transitions.at(-1).by, 'system')
+    assert.deepEqual(blocked.deferred.outcome.delivery, delivery)
+    assert.equal(env.board.getTicket(advanced.ticket.id).stage, 'working')
+    assert.deepEqual(env.board.getDeferred(advanced.ticket.id).outcome.delivery, delivery)
+    assert.equal(env.board.getTicket(replaced.ticket.id).stage, 'person/answer')
+    assert.equal(env.board.getDeferred(replaced.ticket.id).requestId, replacement.input.requestId)
+  } finally { env.cleanup() }
+})
+
+test('answer delivery evidence and its system block roll back together on a storage failure', async () => {
+  const env = fixture()
+  try {
+    const { ticket, input } = askForAnswer(env)
+    const accepted = await env.registry.resolve(input)
+    const persist = env.store.set.bind(env.store)
+    env.store.set = () => { throw new Error('fixture receipt write failed') }
+    const failure = { state: 'failed' }
+    assert.throws(() => env.registry.recordAnswerDelivery(input.requestId, failure), /receipt write failed/)
+    assert.equal(env.board.getTicket(ticket.id).stage, 'working')
+    assert.deepEqual(env.board.getDeferred(ticket.id).outcome, accepted.outcome)
+    assert.deepEqual(env.registry.get(input.requestId), accepted.request)
+
+    env.store.set = persist
+    const recorded = env.registry.recordAnswerDelivery(input.requestId, failure)
+    assert.equal(recorded.duplicate, false)
+    const blocked = env.board.getTicket(ticket.id)
+    assert.equal(blocked.stage, 'blocked')
+    assert.equal(blocked.escalated.reason, recorded.request.outcome.delivery.reason)
+    assert.deepEqual(blocked.deferred.outcome, recorded.request.outcome)
+    assert.deepEqual(env.registry.recordAnswerDelivery(input.requestId, failure), { request: recorded.request, duplicate: true })
+    assert.deepEqual(env.board.getTicket(ticket.id), blocked)
   } finally { env.cleanup() }
 })
 

@@ -123,7 +123,6 @@ test('create refuses a relative, ambiguous or past fireAt and unknown targets', 
   bad({ createdBy: '' }, 'created-by-required')
   bad({ message: '   ' }, 'message-required')
   bad({ ownerId: 'repo-Nobody' }, 'unknown-owner')
-  bad({ ownerId: 'chief' }, 'cannot-timer-chief')
   bad({ ownerId: 'repo-Gone' }, 'owner-recycled')
   bad({ ownerId: 'owner-scratch' }, 'background-owner-transient')
   // A non-UTC offset is accepted and normalized to the same instant.
@@ -145,6 +144,22 @@ test('only an authorized caller may create a timer (L1/L2 tools, never L3/c-clas
   t.after(() => allowed.cleanup())
   schedule(allowed.timers)
   assert.deepEqual(seen, [{ ownerId: 'repo-DSH', createdBy: 'user:l1' }])
+})
+
+test('an authorized L1 caller can schedule a one-shot that belongs to chief', async t => {
+  const f = fixture({ authorizeCreate: ({ ownerId, createdBy }) => ownerId === 'chief' && createdBy === 'session-chief' })
+  t.after(() => f.cleanup())
+  const timer = schedule(f.timers, { ownerId: 'chief', createdBy: 'session-chief' })
+  assert.equal(timer.ownerId, 'chief')
+  assert.equal(timer.createdBy, 'session-chief')
+  assert.throws(() => schedule(f.timers, { ownerId: 'chief', createdBy: 'agent:c-class' }),
+    error => error instanceof TimerError && error.code === 'timer-create-unauthorized')
+
+  f.setNow(T0 + 60_000)
+  await f.timers.tick()
+  assert.equal(f.calls[0].ownerId, 'chief')
+  assert.equal(f.calls[0].authorization.actor, 'session-chief')
+  assert.equal(f.timers.get(timer.id).status, 'fired')
 })
 
 test('a due timer is delivered once through the Router background port with a stable trigger identity', async t => {
@@ -289,21 +304,25 @@ test('lateness is measured against the real due instant, not hardcoded', async t
   assert.equal(stored.status, 'fired')
 })
 
-test('a pending one-shot survives downtime and fires once, late, after reopen', async t => {
+test('a pending one-shot missed during short downtime fires once and is late after reopen', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'hub-bot-timers-'))
   const before = fixture({ dir })
   const timer = schedule(before.timers)
+  before.setNow(T0 + 59_200)
   before.closeOnly()
 
-  // Host was down across the fireAt; a new process opens the same database and runs its normal tick.
-  const after = fixture({ dir, startAt: T0 + 60_000 + 30 * 60_000 })
+  // The host was down for 1.8 seconds and the reminder was due during that gap.
+  const after = fixture({ dir, startAt: T0 + 61_000 })
   t.after(() => after.cleanup())
   assert.equal(after.timers.list().length, 1, 'the pending timer must be restored from disk, not lost with the process')
   assert.deepEqual(await after.timers.tick(), { due: 1, fired: 1, retried: 0, failed: 0, skipped: 0 })
   assert.equal(after.calls.length, 1)
   assert.equal(after.calls[0].triggerRef, 'timer:' + timer.id + ':1')
   assert.equal(after.calls[0].source.late, true)
-  assert.equal(after.timers.get(timer.id).status, 'fired')
+  const fired = after.timers.get(timer.id)
+  assert.equal(fired.status, 'fired')
+  assert.equal(fired.late, true)
+  assert.equal(fired.lateMs, 1_000)
 
   // A second reopen must not replay the occurrence that already fired.
   after.closeOnly()
@@ -314,7 +333,7 @@ test('a pending one-shot survives downtime and fires once, late, after reopen', 
   assert.equal(third.timers.get(timer.id).status, 'fired')
 })
 
-test('resuming an overdue follow-up catches up its original occurrence once', async t => {
+test('resuming a briefly overdue follow-up catches up its original occurrence once and marks it late', async t => {
   const f = fixture()
   t.after(() => f.cleanup())
   const timer = schedule(f.timers, { fireAt: at(T0 + 600_000) })
@@ -326,7 +345,7 @@ test('resuming an overdue follow-up catches up its original occurrence once', as
   assert.equal(paused.timer.remainingMs, 360_000)
   assert.equal(f.timers.pause(timer.id).changed, false)
 
-  f.setNow(T0 + 20 * 60_000)
+  f.setNow(T0 + 601_000)
   await f.timers.tick()
   assert.equal(f.calls.length, 0)
 
@@ -340,6 +359,7 @@ test('resuming an overdue follow-up catches up its original occurrence once', as
   assert.equal(f.calls.length, 1)
   assert.equal(f.calls[0].triggerRef, 'timer:' + timer.id + ':1')
   assert.equal(f.calls[0].source.late, true)
+  assert.equal(f.timers.get(timer.id).lateMs, 1_000)
 })
 
 test('cancel stops every later wake and keeps the row for the human to see', async t => {
@@ -576,6 +596,53 @@ test('a timer forwards only the saved identity of its optional Feishu origin', a
   await f.timers.tick()
   assert.deepEqual(f.calls[0].source.origin, source)
   assert.equal(f.calls[0].authorization.actor, 'user:l1')
+})
+
+test('a Feishu reminder dispatches its original authorization after reopen and retry', async t => {
+  const before = fixture()
+  const origin = { kind: 'feishu', triggerId: 'trg-original', chatId: 'oc-original', actor: 'ou-sender' }
+  const authorization = {
+    actor: 'ou-sender', source: 'feishu', at: '2026-11-15T07:55:00+08:00',
+    messageId: 'om-original', addressing: 'mention',
+  }
+  const timer = schedule(before.timers, { origin, authorization })
+  before.closeOnly()
+
+  const after = fixture({ dir: before.stateDir, startAt: T0 + 60_000, route: async (request, attempt) => {
+    if (attempt === 1) throw new Error('temporary Router failure')
+    return { ticketId: 'tsk-feishu-reminder', admitted: true }
+  } })
+  t.after(() => after.cleanup())
+  const pending = after.timers.get(timer.id)
+  assert.equal(pending.createdBy, 'user:l1')
+  assert.equal(pending.createdAt, at(T0))
+  assert.deepEqual(pending.authorization, authorization)
+
+  await after.timers.tick()
+  after.advance(2_000)
+  await after.timers.tick()
+  assert.equal(after.calls.length, 2)
+  for (const request of after.calls) {
+    assert.deepEqual(request.source.origin, origin)
+    assert.deepEqual(request.authorization, authorization)
+  }
+})
+
+test('stored Feishu authorization must match the origin and carry an absolute timestamp', t => {
+  const f = fixture()
+  t.after(() => f.cleanup())
+  const origin = { kind: 'feishu', triggerId: 'trg-original', chatId: 'oc-original', actor: 'ou-sender' }
+  const authorization = { actor: 'ou-sender', source: 'feishu', at: at(T0 - 60_000) }
+  const bad = (input, message) => assert.throws(() => schedule(f.timers, input),
+    error => error instanceof TimerError && error.code === 'timer-authorization-invalid', message)
+
+  bad({ authorization }, 'requires the verified origin')
+  bad({ origin, authorization: { ...authorization, actor: 'ou-other' } }, 'requires the exact actor')
+  bad({ origin, authorization: { ...authorization, source: 'timer' } }, 'requires the Feishu source')
+  bad({ origin, authorization: { ...authorization, at: '2026-11-14T23:59:00' } }, 'requires an explicit time zone')
+  bad({ origin, authorization: { ...authorization, at: '2026-13-14T23:59:00Z' } }, 'requires a valid instant')
+  bad({ origin, authorization: { ...authorization, at: '2026-02-30T23:59:00Z' } }, 'rejects an impossible calendar date')
+  assert.deepEqual(f.timers.list(), [])
 })
 
 test('ticket evidence protects the original sent receipt from later cancellation or failure', async t => {

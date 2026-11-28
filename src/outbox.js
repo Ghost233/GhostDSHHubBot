@@ -14,13 +14,10 @@
  * reply intents) are not delivery work and are left untouched.
  *
  * S07 同聊天合并 (issue #38): intake rows of the same owner AND the same stored Feishu chat are claimed as ONE
- * cohort — only the consecutive due, pending prefix of that inbox. The membership is frozen into the head row
- * (mergedRows, the head included at index 0, every entry being its persisted original row so it keeps its own
- * id/triggerId/requestId/ticketId/body/kind/state) in ONE outbox write BEFORE the transport is invoked, so a
- * retry, a postponement or a restart re-delivers exactly that cohort instead of deriving a new one (no
- * debounce, no drift). The head's requestId is reused for the whole cohort and mergedCount = mergedRows.length
- * - 1. An accepted cohort settles its rows together; ordinary non-cohort rows keep the plain one-argument
- * delivery contract (`mergedRows` absent, not an empty array).
+ * cohort — only the consecutive due, pending prefix of that inbox. Before delivery, one transaction freezes
+ * the original rows in the head (mergedRows, in arrival order with the head first) and records the membership
+ * on each trigger. A retry, postponement or restart reuses the frozen members and the original head requestId.
+ * mergedCount includes the head. An accepted cohort settles its rows together. Only a merge adds mergedRows.
  */
 import { randomUUID } from 'node:crypto'
 
@@ -102,9 +99,13 @@ export function retryOutboxRows(store, ids = null) {
 export function discardOutboxRows(store, ids = null) {
   return writeOutboxTransaction(store, () => {
     const del = store.db.prepare('DELETE FROM outbox WHERE id = ?')
+    const discardIntake = store.db.prepare("UPDATE trigger SET value = json_set(value, '$.intakeDiscarded', json('true')) WHERE id = ?")
     let discarded = 0
     for (const [, rows] of failedOutboxGroups(store, ids)) {
-      for (const row of rows) del.run(row.id)
+      for (const row of rows) {
+        if (row.kind === 'inbox' && row.triggerId) discardIntake.run(row.triggerId)
+        del.run(row.id)
+      }
       discarded += rows.length
     }
     return discarded
@@ -125,7 +126,7 @@ export function updateOutboxRow(store, row) {
  * @param {{ store: import('./store.js').Store, logger: { warn: Function }, now: () => string,
  *   channel: string, prefix: string, maxAttempts: number,
  *   parseTarget: (to: string) => unknown,  // null = unparseable → the row fails immediately
- *   send: (target: unknown, body: string) => Promise<void>,
+ *   send: (target: unknown, body: string, row: object) => Promise<void>,
  *   prepareBody?: (body: string) => string, canContinue?: () => boolean }} deps
  */
 /**
@@ -163,7 +164,7 @@ async function deliverRecordedRepliesPass({ store, logger, now, channel, prefix,
     }
     const body = prepareBody ? prepareBody(row.body) : row.body
     try {
-      await send(target, body)
+      await send(target, body, row)
       updateOutboxRow(store, { ...row, state: 'sent', sentAt: now() })
       delivered++
     } catch (error) {
@@ -291,10 +292,23 @@ export class OutboxRunner {
     }
     const frozen = {
       ...head, cohortClaimedAt: new Date(this.now()).toISOString(),
-      ...(members.length > 1 && { mergedRows: members, mergedCount: members.length - 1 }),
+      ...(members.length > 1 && { mergedRows: members, mergedCount: members.length }),
     }
-    this.#writeRow(frozen)
-    return frozen
+    if (!frozen.mergedRows) {
+      this.#writeRow(frozen)
+      return frozen
+    }
+
+    const triggerIds = members.map(row => row.triggerId)
+    const audit = JSON.stringify({ requestId: frozen.requestId, triggerIds, mergedCount: frozen.mergedCount })
+    return writeOutboxTransaction(this.store, () => {
+      this.#writeRow(frozen)
+      const stamp = this.store.db.prepare("UPDATE trigger SET value = json_set(value, '$.intakeCohort', json(?)) WHERE id = ?")
+      for (const id of triggerIds) {
+        if (stamp.run(audit, id).changes !== 1) throw new Error('Missing trigger during cohort claim: ' + id)
+      }
+      return frozen
+    })
   }
 
   /**

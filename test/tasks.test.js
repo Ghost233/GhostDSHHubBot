@@ -305,6 +305,7 @@ test('a closed deferred request cannot reopen or replace the current ticket face
   const { board, seed, cleanup } = fixture()
   try {
     const ticket = seed()
+    assert.throws(() => board.noteDeferred(ticket.id, { status: 'accepted' }), { code: 'no-deferred' })
     const original = { requestId: 'dfr-original', type: 'confirm', target: { sessionId: 'session-original' } }
     board.attachDeferred(ticket.id, original)
     const closed = board.closeDeferred(ticket.id, { status: 'expired', outcome: { kind: 'timeout' } }).deferred
