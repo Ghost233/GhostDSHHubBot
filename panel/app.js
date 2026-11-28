@@ -160,7 +160,9 @@ async function resolveTicket(ticket, resolution, message) {
     const result = await api('tickets/resolve', { method: 'POST',
       body: { ticketId: ticket.id, resolution, message, ...(['confirm', 'reject', 'answer'].includes(resolution) && { requestId: ticket.deferred?.requestId }) } })
     const labels = { confirm: '已确认', reject: '已拒绝', answer: '答复已保存', retry: '已登记重试' }
-    showNotice(result.stage === 'person/confirm' ? '请求仍在等待确认。' : labels[resolution])
+    const messageText = result.outcome === 'queued' ? '决定已保存，等待处理。'
+      : result.stage === 'person/confirm' ? '请求仍在等待确认。' : labels[resolution]
+    showNotice(messageText)
     await refresh()
   } catch (error) {
     showError(error)
@@ -287,6 +289,81 @@ const OWNER_SWITCH_STATES = {
   'archive-failed': '旧会话归档失败', completed: '更换完成', failed: '更换失败', cancelled: '已取消更换',
 }
 
+function openHandoffSummary(owner) {
+  if (document.querySelector('dialog[data-handoff-editor][open]')) return
+  const source = { ownerId: owner.id, expectedSessionId: owner.sessionId }
+  let draft = null
+  let busy = false
+  const heading = 'handoff-summary-title'
+  const area = el('textarea', { rows: '9', 'aria-label': '交接摘要正文' })
+  const provenance = el('p', { class: 'quiet small' })
+  const status = el('p', { 'aria-live': 'polite' })
+  const dialog = el('dialog', { 'data-handoff-editor': '', 'aria-labelledby': heading })
+  const actions = el('div', { class: 'run-filters' })
+  const send = (action, fields = {}) => api('owners/handoff-summary', {
+    method: 'POST', body: { action, ...source, ...fields },
+  })
+  const current = () => ({ draftId: draft.draftId, revision: draft.revision })
+  async function run(work) {
+    if (busy) return
+    busy = true
+    status.textContent = ''
+    status.setAttribute('role', 'status')
+    update()
+    try { await work() } catch (error) {
+      status.setAttribute('role', 'alert')
+      status.textContent = error.message
+    } finally { busy = false; update() }
+  }
+  function useDraft(value) {
+    draft = value
+    area.value = draft?.text ?? ''
+  }
+  const button = (label, onClick) => el('button', { class: 'btn', type: 'button', onclick: () => void run(onClick) }, text(label))
+  const generate = button('生成草稿', async () => useDraft(await send('generate')))
+  const confirmDraft = button('确认这版摘要', async () => {
+    if (area.value !== draft.text) useDraft(await send('edit', { ...current(), text: area.value }))
+    useDraft(await send('confirm', current()))
+    status.textContent = '摘要已确认。'
+  })
+  function closeEditor() {
+    if (dialog.open) dialog.close()
+    dialog.remove()
+  }
+  const discard = button('放弃摘要', async () => { await send('discard', current()); closeEditor() })
+  async function start(mode) {
+    if (draft.status !== 'confirmed' || area.value !== draft.text) return
+    if (mode === 'stop' && !window.confirm('确认停止原负责人会话当前处理，等它空闲后携摘要更换？')) return
+    await api('owners/switch', { method: 'POST', body: { action: 'request', ...source, mode, summary: current() } })
+    closeEditor()
+    await refresh()
+  }
+  const wait = button('携摘要更换', () => start('wait'))
+  const stop = button('停止后携摘要更换', () => start('stop'))
+  const close = el('button', { class: 'btn', type: 'button', onclick: closeEditor }, text('关闭'))
+  function update() {
+    provenance.textContent = draft ? '来源会话 ' + draft.sourceSessionId + ' · ' + fmtTime(draft.sourceReadAt)
+      + (draft.sourceThroughSeq != null ? ' · 截至事件 ' + draft.sourceThroughSeq : '') + ' · 有效至 ' + fmtTime(draft.expiresAt) : '来源会话 ' + owner.sessionId
+    area.hidden = !draft
+    area.disabled = busy
+    for (const control of [generate, confirmDraft, discard, wait, stop]) control.disabled = busy
+    confirmDraft.hidden = !draft || (draft.status === 'confirmed' && area.value === draft.text)
+    discard.hidden = !draft
+    wait.hidden = stop.hidden = draft?.status !== 'confirmed' || area.value !== draft.text
+  }
+  area.addEventListener('input', update)
+  dialog.addEventListener('cancel', event => { event.preventDefault(); closeEditor() })
+  actions.append(generate, confirmDraft, discard, wait, stop, close)
+  dialog.append(el('h2', { id: heading }, text('交接摘要')),
+    el('p', { class: 'quiet' }, text('请预览并编辑草稿。摘要补充讨论背景，任务状态和授权以当前记录为准。')), provenance, area, actions, status)
+  document.body.append(dialog)
+  dialog.showModal()
+  void run(async () => {
+    const drafts = await send('list')
+    if (drafts?.length) useDraft(await send('get', { draftId: drafts[0].draftId }))
+  })
+}
+
 function ownerSwitchControls(owner, operation) {
   const controls = el('div', { class: 'run-filters' })
   const busy = operation && ['waiting', 'preparing', 'committed', 'archive-failed'].includes(operation.status)
@@ -306,7 +383,8 @@ function ownerSwitchControls(owner, operation) {
   }
   if (owner.sessionId && !owner.recycled && !busy) {
     const request = { action: 'request', expectedSessionId: owner.sessionId }
-    controls.append(actionButton('空闲后更换', { ...request, mode: 'wait' }), actionButton('停止后更换', { ...request, mode: 'stop' }))
+    controls.append(actionButton('空闲后更换', { ...request, mode: 'wait' }), actionButton('停止后更换', { ...request, mode: 'stop' }),
+      el('button', { class: 'btn', type: 'button', onclick: () => openHandoffSummary(owner) }, text('交接摘要')))
   }
   if (operation) {
     const { operationId, status } = operation
