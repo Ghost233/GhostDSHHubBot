@@ -150,9 +150,10 @@ test('only a complete own-session history can rule out an in-flight prompt recei
   const reads = []
   let reportCount = events.length
   let closes = 0
+  let flushError = false
   root.provide('sessionController', { async prompt() { return release.promise } })
   root.provide('sessionPersistence', {
-    async flush() {},
+    async flush() { if (flushError) throw new Error('Fixture persistence failure') },
     async stat() { return { eventCount: reportCount } },
     async open(id, access) {
       assert.equal(id, sessionId)
@@ -183,6 +184,53 @@ test('only a complete own-session history can rule out an in-flight prompt recei
   release.resolve({ accepted: true })
   await pending
   assert.equal(await receipt('still-in-flight'), false)
+  flushError = true
+  assert.equal(await receipt('unflushed'), undefined)
+  assert.equal(reads.length, 5)
+})
+
+test('an old mount can flush a Host answer accepted during reload', async t => {
+  const homeRepo = await mkdtemp(join(tmpdir(), 'hub-bot-reload-prompt-'))
+  const Context = contexts.at(-1)[1]
+  const sessionId = 'session-reload-fixture'
+  const requestId = 'hub-bot-answer-reload-fixture'
+  const waiting = Promise.withResolvers()
+  const visible = []
+  const buffered = []
+  const persistence = {
+    async flush() { visible.push(...buffered.splice(0)) },
+    async stat() { return { eventCount: visible.length } },
+    async open(id, access) {
+      assert.equal(access, 'read')
+      return { id, inheritedEventCount: 0, async close() {},
+        async read(offset, limit) { return { events: visible.slice(offset, offset + limit) } } }
+    },
+  }
+  let mounted
+  t.after(async () => { waiting.resolve(); await mounted?.dispose(); await rm(homeRepo, { recursive: true, force: true }) })
+  async function boot() {
+    const root = new Context()
+    root.provide('sessionController', { async prompt() {
+      await waiting.promise
+      buffered.push({ seq: 0, type: 'agent/inbox/spliced', data: { inserted: [{ source: { kind: 'user', rpcId: requestId } }] } })
+      return { accepted: true }
+    } })
+    root.provide('sessionPersistence', persistence)
+    root.provide('webServer', { host: '127.0.0.1', port: 3199 })
+    mounted = root.plugin(plugin, { homeRepo, stateDir: join(homeRepo, 'state'), workspaces: { enabled: false } })
+    await mounted
+    return root.reflect.get('hubBot', false)
+  }
+  const former = await boot()
+  const input = { sessionId, requestId, text: 'fixture' }
+  const prompt = former.sessions.prompt(input).catch(error => error)
+  await mounted.dispose()
+  const current = await boot()
+  assert.equal(await current.sessions.hasPromptReceipt(input), undefined)
+  waiting.resolve()
+  assert.deepEqual(await prompt, { accepted: true })
+  assert.equal(visible.length, 1)
+  assert.equal(await current.sessions.hasPromptReceipt(input), true)
 })
 
 test('authenticated handoff summary previews the exact source and carries only the confirmed edit', async t => {
@@ -201,7 +249,7 @@ test('authenticated handoff summary previews the exact source and carries only t
     async page(request) {
       pages.push(request)
       return { hasMore: true, records: [
-        { event: { type: 'user/message', seq: 33, data: { message: { content: [{ type: 'text', text: '旧讨论：选择验收范围' }] } } } },
+        { event: { type: 'user/message', seq: 33, data: { content: [{ type: 'text', text: '旧讨论：选择验收范围' }] } } },
         { event: { type: 'system/message', seq: 34, data: { message: { content: [{ type: 'text', text: '不应出现在草稿的系统文本' }] } } } },
         { event: { type: 'assistant/message', seq: 35, data: { message: { content: [{ type: 'text', text: '此前讨论了两个方案' }, { type: 'tool-call', arguments: '不应出现在草稿的工具参数' }] } } } },
       ] }
@@ -240,6 +288,7 @@ test('authenticated handoff summary previews the exact source and carries only t
   assert.equal(draft.sourceSessionId, oldSession)
   assert.equal(draft.sourceThroughSeq, 35)
   assert.match(draft.text, /#33.*选择验收范围/)
+  assert.match(draft.text, /#35.*此前讨论了两个方案/)
   assert.doesNotMatch(draft.text, /系统文本|工具参数/)
   assert.deepEqual(pages, [{ address: { kind: 'session', sessionId: oldSession }, maxMessages: 16 }])
   const reference = value => ({ draftId: value.draftId, revision: value.revision })
@@ -259,6 +308,102 @@ test('authenticated handoff summary previews the exact source and carries only t
   assert.doesNotMatch(bootstrap.content[0].text, /此前讨论了两个方案/)
   assert.equal(hub.registry.get(owner.id).sessionId, bootstrap.sessionId)
   assert.equal(pages.length, 1)
+})
+
+test('Feishu private-chat summary is idempotent, editable and usable only by its originating actor', async t => {
+  const homeRepo = await mkdtemp(join(tmpdir(), 'hub-feishu-handoff-'))
+  const Context = contexts.at(-1)[1]
+  const root = new Context()
+  const token = 'fixture-feishu-handoff-token'
+  const oldSession = 'session-feishu-handoff-old'
+  const chatId = 'oc_original_summary_fixture'
+  const actor = 'ou_original_summary_fixture'
+  const calls = { read: [], prompts: [], creates: [], cancels: [] }
+  let handler
+  let oldBusy = true
+  root.provide('sessionController', {
+    async state({ sessionId }) {
+      if (sessionId === oldSession || calls.creates.some(entry => entry.sessionId === sessionId)) {
+        return { running: sessionId === oldSession && oldBusy, queue: [], pendingInput: [] }
+      }
+      throw Object.assign(Error('Fixture session missing'), { code: 'session/not-found' })
+    },
+    async create(request) { calls.creates.push(request); return request },
+    async prompt(request) { calls.prompts.push(request); return { accepted: true } },
+    async cancel(request) { calls.cancels.push(request); oldBusy = false; return { accepted: true } },
+    async page(input) {
+      calls.read.push(input.address.sessionId)
+      return { hasMore: false, records: [{ event: { type: 'user/message', seq: 22,
+        data: { content: [{ type: 'text', text: '原私聊摘要来源' + '续'.repeat(75) }] } } }] }
+    },
+  })
+  root.provide('sessionPersistence', { async flush() {} })
+  root.provide('webServer', { host: '127.0.0.1', port: 3199, register(entry) {
+    handler = entry.handler
+    return () => { handler = undefined }
+  } })
+  const mounted = root.plugin(plugin, { homeRepo, stateDir: join(homeRepo, 'state'), workspaces: { enabled: false },
+    devApi: { token }, feishu: { enabled: false }, github: { enabled: false } })
+  t.after(async () => { await mounted.dispose(); await rm(homeRepo, { recursive: true, force: true }) })
+  await mounted
+  const hub = root.reflect.get('hubBot', false)
+  const settings = root.reflect.get('hubBotSettings', false)
+  const owner = hub.registry.create({ kind: 'dir', cwd: homeRepo })
+  hub.registry.bindSession(owner.id, oldSession)
+  async function post(path, body) {
+    const req = Readable.from([Buffer.from(JSON.stringify(body))])
+    Object.assign(req, { url: '/hub-bot/api/' + path, method: 'POST', headers: { host: '127.0.0.1:3199', 'x-hub-bot-token': token } })
+    let status, payload
+    await handler(req, { writeHead(code) { status = code }, end(value) { payload = JSON.parse(value) } })
+    assert.equal(status, 200, path)
+    return payload
+  }
+  async function receive(messageId, text, { sender = actor, chat = chatId } = {}) {
+    const result = await post('feishu/simulate', {
+      sender: { sender_type: 'user', sender_id: { open_id: sender } },
+      message: { message_id: messageId, chat_id: chat, chat_type: 'p2p', message_type: 'text', content: JSON.stringify({ text }) },
+    })
+    await post('deliver', {})
+    const receipt = hub.router.listOutbox().find(row => row.id === 'out-owner-switch-control-feishu-' + messageId)
+    assert.equal(receipt?.to, 'feishu:chat:' + chat)
+    assert.equal(receipt.state, 'recorded')
+    return { result, body: receipt.body }
+  }
+  const generate = '/hub-switch summary ' + owner.id
+  const initial = await receive('om_fixture_summary_generate', generate)
+  const draftId = initial.body.match(/summary-[a-f0-9-]+/)?.[0]
+  assert.ok(draftId && initial.body.includes('原私聊摘要来源') && initial.body.includes('1/2'))
+  assert.match((await receive('om_fixture_summary_page', '/hub-switch preview ' + draftId + ' 2')).body, /2[/]2/)
+  assert.equal((await receive('om_fixture_summary_generate', generate)).result.deduped, true)
+  assert.deepEqual(calls.read, [oldSession])
+  for (const [id, override] of [['actor', { sender: 'ou_other_fixture' }], ['chat', { chat: 'oc_other_fixture' }]]) {
+    const denied = await receive('om_fixture_summary_wrong_' + id, '/hub-switch preview ' + draftId + ' 1', override)
+    assert.match(denied.body, /摘要.*未受理/)
+    assert.doesNotMatch(denied.body, /原私聊摘要来源/)
+  }
+  const draft = await settings.handoffSummaryAction({ action: 'get', ownerId: owner.id, expectedSessionId: oldSession, draftId })
+  assert.ok(!Object.hasOwn(draft, 'origin'))
+  const premature = await receive('om_fixture_summary_early', '/hub-switch wait-summary ' + draftId + ' 1')
+  assert.match(premature.body, /摘要.*未受理/)
+  assert.equal(hub.router.ownerSwitch.list({ ownerId: owner.id }).length, 0)
+  const edited = await receive('om_fixture_summary_edit', '/hub-switch edit-summary ' + draftId + ' 1 已审阅的飞书背景')
+  assert.match(edited.body, /v2.*待确认/)
+  assert.match((await receive('om_fixture_summary_confirm', '/hub-switch confirm-summary ' + draftId + ' 2')).body, /v3/)
+  const control = await receive('om_fixture_summary_switch', '/hub-switch stop-summary ' + draftId + ' 3')
+  assert.match(control.body, /等待旧会话空闲/)
+  await hub.router.ownerSwitch.tick()
+  await hub.router.ownerSwitch.tick()
+  const operation = hub.router.ownerSwitch.list({ ownerId: owner.id })[0]
+  assert.deepEqual(operation.summary, { draftId, revision: 3 })
+  assert.equal(operation.mode, 'stop')
+  assert.deepEqual(calls.cancels, [{ sessionId: oldSession }])
+  const initialized = calls.prompts.find(entry => entry.requestId === operation.initializationRequestId)
+  assert.equal(initialized.sessionId, operation.newSessionId)
+  assert.match(initialized.content[0].text, /已审阅的飞书背景/)
+  assert.doesNotMatch(initialized.content[0].text, /原私聊摘要来源/)
+  assert.deepEqual(calls.read, [oldSession])
+  assert.ok(hub.router.listOutbox().some(row => row.id === 'out-owner-switch-' + operation.operationId + '-committed'
+    && row.to === 'feishu:chat:' + chatId && row.state === 'recorded'))
 })
 
 test('Feishu explicit switch and the management panel share a durable owner operation', async t => {

@@ -331,26 +331,29 @@ function openHandoffSummary(owner) {
     dialog.remove()
   }
   const discard = button('放弃摘要', async () => { await send('discard', current()); closeEditor() })
-  const start = button('携摘要更换', async () => {
+  async function start(mode) {
     if (draft.status !== 'confirmed' || area.value !== draft.text) return
-    await api('owners/switch', { method: 'POST', body: { action: 'request', ...source, mode: 'wait', summary: current() } })
+    if (mode === 'stop' && !window.confirm('确认停止原负责人会话当前处理，等它空闲后携摘要更换？')) return
+    await api('owners/switch', { method: 'POST', body: { action: 'request', ...source, mode, summary: current() } })
     closeEditor()
     await refresh()
-  })
+  }
+  const wait = button('携摘要更换', () => start('wait'))
+  const stop = button('停止后携摘要更换', () => start('stop'))
   const close = el('button', { class: 'btn', type: 'button', onclick: closeEditor }, text('关闭'))
   function update() {
     provenance.textContent = draft ? '来源会话 ' + draft.sourceSessionId + ' · ' + fmtTime(draft.sourceReadAt)
       + (draft.sourceThroughSeq != null ? ' · 截至事件 ' + draft.sourceThroughSeq : '') + ' · 有效至 ' + fmtTime(draft.expiresAt) : '来源会话 ' + owner.sessionId
     area.hidden = !draft
     area.disabled = busy
-    for (const control of [generate, confirmDraft, discard, start]) control.disabled = busy
+    for (const control of [generate, confirmDraft, discard, wait, stop]) control.disabled = busy
     confirmDraft.hidden = !draft || (draft.status === 'confirmed' && area.value === draft.text)
     discard.hidden = !draft
-    start.hidden = draft?.status !== 'confirmed' || area.value !== draft.text
+    wait.hidden = stop.hidden = draft?.status !== 'confirmed' || area.value !== draft.text
   }
   area.addEventListener('input', update)
   dialog.addEventListener('cancel', event => { event.preventDefault(); closeEditor() })
-  actions.append(generate, confirmDraft, discard, start, close)
+  actions.append(generate, confirmDraft, discard, wait, stop, close)
   dialog.append(el('h2', { id: heading }, text('交接摘要')),
     el('p', { class: 'quiet' }, text('请预览并编辑草稿。摘要补充讨论背景，任务状态和授权以当前记录为准。')), provenance, area, actions, status)
   document.body.append(dialog)

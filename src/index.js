@@ -209,6 +209,7 @@ export function apply(ctx, rawConfig) {
   // access then throws "cannot get required service in inactive context" on every call. The captured service
   // object itself stays alive and usable regardless of the context state marker.
   const sessionController = ctx.sessionController
+  const sessionPersistence = ctx.sessionPersistence
   const promptKey = (sessionId, requestId) => JSON.stringify([store.stateDir, sessionId, requestId])
 
   // The Sessions port of src/router.js over the real sessionController. prompt uses queue mode: an owner Session
@@ -223,18 +224,21 @@ export function apply(ctx, rawConfig) {
       const listed = await sessionController.list({}, deadline(10_000))
       const item = (listed.items ?? []).find(entry => entry.sessionId === sessionId)
       if (!item) return undefined
-      const stored = await ctx.sessionPersistence.stat(sessionId, { signal: deadline(10_000) })
+      const stored = await sessionPersistence.stat(sessionId, { signal: deadline(10_000) })
       return { cwd: item.cwd, agentPreset: stored?.header?.agentPreset ?? item.projections?.values?.agentPreset }
     },
     async hasPromptReceipt({ sessionId, requestId }) {
-      const persistence = ctx.sessionPersistence
       const key = promptKey(sessionId, requestId)
-      if (promptAdmissions.has(key) || typeof persistence.open !== 'function') return undefined
+      if (promptAdmissions.has(key) || typeof sessionPersistence.open !== 'function') return undefined
       const signal = deadline(7000)
       let reader
       try {
-        const snapshot = await persistence.stat?.(sessionId, { signal })
-        reader = await persistence.open(sessionId, 'read', { signal })
+        // A prior Host admission may remain in its buffer after a plugin reload.
+        await sessionPersistence.flush()
+        signal.throwIfAborted()
+        if (promptAdmissions.has(key)) return undefined
+        const snapshot = await sessionPersistence.stat?.(sessionId, { signal })
+        reader = await sessionPersistence.open(sessionId, 'read', { signal })
         const firstOwn = reader.inheritedEventCount
         if (reader.id !== sessionId || !Number.isSafeInteger(firstOwn) || firstOwn < 0) return undefined
         const budget = 8192
@@ -269,7 +273,7 @@ export function apply(ctx, rawConfig) {
         const value = await sessionController.prompt({
           requestId, sessionId, mode: 'queue', content: content ?? [{ type: 'text', text }],
         }, deadline(30_000))
-        await ctx.sessionPersistence.flush()
+        await sessionPersistence.flush()
         return value
       } finally {
         const remaining = promptAdmissions.get(key) - 1
@@ -314,7 +318,7 @@ export function apply(ctx, rawConfig) {
         const event = record.event ?? record
         if (Number.isSafeInteger(event.seq) && event.seq >= 0) throughSeq = Math.max(throughSeq ?? 0, event.seq)
         if (!['user/message', 'assistant/message'].includes(event.type)) continue
-        const message = event.data?.message
+        const message = event.data?.message ?? event.data
         const parts = Array.isArray(message?.content) ? message.content : []
         const text = parts.filter(part => part?.type === 'text' && typeof part.text === 'string')
           .slice(0, 3).map(part => part.text.slice(0, 320)).join(' ').replace(/\s+/gu, ' ').trim()
@@ -382,6 +386,7 @@ export function apply(ctx, rawConfig) {
     recordChange: operation => hub.router.publishOwnerSwitchProgress(operation),
   })
   hub.router.ownerSwitch = ownerSwitch
+  hub.router.handoffSummaries = handoffSummaries
   const ownerSwitchAction = request => {
     if (request != null && (typeof request !== 'object' || Array.isArray(request))) {
       throw new HttpError(400, 'An owner switch request must be an object.')

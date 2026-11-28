@@ -402,7 +402,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       intakeDiscarded: '已丢弃投递',
       timersSection: '提醒',
       handoffSummary: '交接摘要', handoffGenerate: '生成草稿', handoffConfirm: '确认这版摘要', handoffConfirmed: '摘要已确认。',
-      handoffCarry: '携摘要更换', handoffDiscard: '放弃摘要', handoffClose: '关闭', handoffDraft: '交接摘要正文',
+      handoffCarry: '携摘要更换', handoffCarryStop: '停止后携摘要更换', handoffDiscard: '放弃摘要', handoffClose: '关闭', handoffDraft: '交接摘要正文',
       handoffSource: '来源会话', handoffEvent: '截至事件', handoffExpires: '有效至',
       handoffHint: '请预览并编辑草稿。摘要补充讨论背景，任务状态和授权以当前记录为准。',
       decisionQueued: '决定已保存，等待处理。', batchDecisionQueued: '{count} 条已保存，等待处理。',
@@ -805,7 +805,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       intakeDiscarded: 'delivery discarded',
       timersSection: 'Follow-ups',
       handoffSummary: 'Handoff summary', handoffGenerate: 'Generate draft', handoffConfirm: 'Confirm this summary', handoffConfirmed: 'Summary confirmed.',
-      handoffCarry: 'Replace with summary', handoffDiscard: 'Discard summary', handoffClose: 'Close', handoffDraft: 'Handoff summary text',
+      handoffCarry: 'Replace with summary', handoffCarryStop: 'Stop and replace with summary', handoffDiscard: 'Discard summary', handoffClose: 'Close', handoffDraft: 'Handoff summary text',
       handoffSource: 'Source session', handoffEvent: 'Through event', handoffExpires: 'Expires',
       handoffHint: 'Review and edit the draft. The summary carries discussion context. Current records govern task status and authorization.',
       decisionQueued: 'Decision saved and awaiting processing.', batchDecisionQueued: '{count} saved and awaiting processing.',
@@ -2045,9 +2045,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             place(reviewed);
             setStatus(t('handoffConfirmed'));
           }
-          async function start() {
-            if (!confirmed) return;
-            unwrap(await scoped.remote.hubBotSettings.ownerSwitchAction({ action: 'request', mode: 'wait', ...current, summary: version }));
+          async function start(mode) {
+            if (!confirmed || (mode === 'stop' && !window.confirm(t('switchStopConfirm')))) return;
+            unwrap(await scoped.remote.hubBotSettings.ownerSwitchAction({ action: 'request', mode, ...current, summary: version }));
             onClose();
             await onRefresh();
           }
@@ -2063,7 +2063,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '6px 8px' } },
               button('handoffGenerate', async () => place(await send('generate'))),
               draft && !confirmed ? button('handoffConfirm', confirmDraft) : null,
-              confirmed ? button('handoffCarry', start) : null,
+              confirmed ? button('handoffCarry', () => start('wait')) : null,
+              confirmed ? button('handoffCarryStop', () => start('stop')) : null,
               draft ? button('handoffDiscard', async () => { await send('discard', version); onClose(); }) : null,
               h('button', { type: 'button', style: settingsButtonStyle, onClick: onClose }, t('handoffClose'))),
             status ? h('p', { role: 'status' }, status) : null,

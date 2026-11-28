@@ -19,6 +19,7 @@ import { randomUUID } from 'node:crypto'
 import { TaskBoard, STAGE_TEXT, normalizeStage, translateTaskError, CONFIRM_TIMEOUT_MS } from './tasks.js'
 import { OutboxRunner, insertOutbox, updateOutboxRow } from './outbox.js'
 import { feishuPrompt, UNSUPPORTED_MESSAGE_TYPE } from './inbox.js'
+import { feishuHandoffCommand, feishuHandoffPreview, applyFeishuHandoff } from './feishu-handoff.js'
 import { truncateWords } from './discipline.js'
 import { buildDigestText, buildAutoSummary, factLine } from './reporting.js'
 import { isWithinCwd } from './paths.js'
@@ -396,16 +397,22 @@ export class Router {
     return ticket
   }
 
+  async #reconcileDeferredPrompt(sessionId, promptId) {
+    if (!sessionId || this.store.closed) return null
+    const admitted = await this.sessions.hasPromptReceipt?.({ sessionId, requestId: promptId })
+    if (this.store.closed || admitted === false) return null
+    if (admitted === true) return { sessionId }
+    throw new RouterError('answer-receipt-unavailable', 'The previous answer delivery could not be verified.')
+  }
+
   async #admitDeferredPrompt(request, promptId, sessionId, send) {
     const { requestId } = request
     const attemptedSessionId = this.deferred.get(requestId)?.outcome?.delivery?.attemptedSessionId
     if (attemptedSessionId && (attemptedSessionId !== sessionId || this.sessions.isArchived?.(sessionId))) {
       // Host prompt IDs deduplicate within a session. A retry on a different session must first
       // establish whether the previous session accepted it before the local receipt was written.
-      const admitted = await this.sessions.hasPromptReceipt?.({ sessionId: attemptedSessionId, requestId: promptId })
-      if (this.store.closed) return null
-      if (admitted === true) return { sessionId: attemptedSessionId }
-      if (admitted !== false) throw new RouterError('answer-receipt-unavailable', 'The previous answer delivery could not be verified.')
+      const delivery = await this.#reconcileDeferredPrompt(attemptedSessionId, promptId)
+      if (delivery) return delivery
     }
     if (this.store.closed || !this.#currentDeferredWork(request.ticketId, requestId)) return null
     if (this.sessions.isArchived?.(sessionId)) {
@@ -413,7 +420,8 @@ export class Router {
     }
     this.deferred.noteAnswerDeliveryAttempt(requestId, sessionId)
     try {
-      return await send()
+      const admitted = await send()
+      return admitted && { ...admitted, freshAdmission: attemptedSessionId !== sessionId }
     } catch (error) {
       // A first attempt can clear a definitive rejection. A missing session on a retry cannot
       // disprove acceptance of the earlier attempt.
@@ -439,38 +447,53 @@ export class Router {
       })
       return inactive
     }
-    if (!ticket) return skipped()
-    const permanent = reason => Object.assign(new Error(reason), { permanent: true })
-    const text = () => (current()?.recoveryPending ? RECOVERY_NOTE + '\n\n' : '') + row.body
+    const text = (carriesRecoveryNote) => (carriesRecoveryNote ? RECOVERY_NOTE + '\n\n' : '') + row.body
     const admit = (sessionId, send) => this.#admitDeferredPrompt(request, row.requestId, sessionId, send)
+    const worker = request?.receiver?.kind === 'worker'
     let delivered
-    if (request.receiver?.kind === 'worker') {
+    let unavailable
+    if (ticket && worker) {
       const sessionId = request.receiver.sessionId
       const available = await this.#canReceiveWorkerAnswer(ticket, sessionId)
-      if (!current()) return skipped()
-      const unavailable = 'The original execution session is no longer available.'
-      if (!available) throw permanent(unavailable)
-      try {
-        delivered = await admit(sessionId, async () => {
-          const result = await this.sessions.prompt({ sessionId, requestId: row.requestId, text: text() })
-          if (result?.accepted === false) throw new RouterError('worker-not-admitted', 'The execution Session did not accept the answer.')
-          return { sessionId }
-        })
-      } catch (error) {
-        if (isMissingSession(error) || error?.code === 'session/not-found') throw permanent(unavailable)
-        throw error
+      if (available && current()) {
+        try {
+          delivered = await admit(sessionId, async () => {
+            const carriesRecoveryNote = current()?.recoveryPending === true
+            const result = await this.sessions.prompt({ sessionId, requestId: row.requestId, text: text(carriesRecoveryNote) })
+            if (result?.accepted === false) throw new RouterError('worker-not-admitted', 'The execution Session did not accept the answer.')
+            return { sessionId, carriesRecoveryNote }
+          })
+        } catch (error) {
+          if (!isMissingSession(error) && error?.code !== 'session/not-found') throw error
+        }
       }
-    } else {
+      if (delivered === undefined) unavailable = 'The original execution session is no longer available.'
+    } else if (ticket) {
       const owner = this.registry.get(request.ownerId)
-      if (!owner || owner.recycled) throw permanent('The original owner is no longer available.')
-      delivered = await this.#promptOwner(owner.id, ticket.id, row.requestId, text(), { isCurrent: current, neededWhileWaiting: true, admit })
+      if (!owner || owner.recycled) unavailable = 'The original owner is no longer available.'
+      else {
+        const carriesRecoveryNote = current()?.recoveryPending === true
+        delivered = await this.#promptOwner(owner.id, ticket.id, row.requestId, text(carriesRecoveryNote), { isCurrent: current, neededWhileWaiting: true, admit })
+        if (delivered) delivered.carriesRecoveryNote = carriesRecoveryNote
+      }
     }
     if (delivered?.postponeMs) return delivered
-    if (!delivered) return skipped()
+    if (!delivered) {
+      // A ticket may advance or its original worker may disappear after admission. Reconcile historical
+      // evidence before recording failure, and never prompt from this recovery path.
+      const attempted = request?.outcome?.delivery?.attemptedSessionId
+      if (attempted && (!worker || attempted === request.receiver.sessionId)) {
+        delivered = await this.#reconcileDeferredPrompt(attempted, row.requestId)
+      }
+      if (!delivered && unavailable && current()) throw Object.assign(new Error(unavailable), { permanent: true })
+      if (!delivered) return skipped()
+    }
     if (this.store.closed) return
     this.#persistWork(() => {
       this.deferred.recordAnswerDelivery(requestId, { state: 'sent', sessionId: delivered.sessionId })
-      if (current()?.recoveryPending) this.tasks.noteRecoveryCarried(ticket.id)
+      if (delivered.freshAdmission && delivered.carriesRecoveryNote && current()?.recoveryPending) {
+        this.tasks.noteRecoveryCarried(request.ticketId)
+      }
     })
   }
 
@@ -511,8 +534,11 @@ export class Router {
     const command = !previous && !incoming.dropped && this.deferred
       ? /^[/]hub-answer +([a-z0-9-]+) +(approve|reject|answer)(?: +([\s\S]+))?$/.exec(incoming.message) : null,
       stop = !previous && !incoming.dropped && ['停', '停止'].includes(incoming.message)
-    const ownerCommand = !previous && !incoming.dropped && this.ownerSwitch ? ownerSwitchCommand(incoming.message) : null
-    if (ownerCommand?.action === 'request') ownerCommand.expectedSessionId = this.registry.get(ownerCommand.ownerId)?.sessionId ?? null
+    const ownerCommand = !previous && !incoming.dropped && this.ownerSwitch
+      ? feishuHandoffCommand(incoming.message) ?? ownerSwitchCommand(incoming.message) : null
+    if (ownerCommand && ['request', 'summary-generate'].includes(ownerCommand.action)) {
+      ownerCommand.expectedSessionId = this.registry.get(ownerCommand.ownerId)?.sessionId ?? null
+    }
     const sessionId = stop ? this.registry.get('chief')?.sessionId ?? null : null
     const skipStop = stop && (!sessionId ? 'no-current-session' : this.#currentStops.has(sessionId) ? 'interrupt-in-flight' : null)
     const trigger = {
@@ -539,11 +565,14 @@ export class Router {
         }, () => Date.parse(trigger.at))
       } else if (ownerCommand) {
         if (ownerCommand.action === 'request' && ownerCommand.ownerId === 'chief') this.store.set('chief-inbox-switch-ref', id)
+        const generation = ownerCommand.action === 'summary-generate'
         const control = insertOutbox(this.store, {
-          id: outboxId, ticketId: null, triggerId: id, kind: 'owner-switch-control', to: 'owner:chief',
-          body: trigger.message, requestId, state: 'recorded', recordedAt: this.now(),
+          id: outboxId, ticketId: null, triggerId: id,
+          kind: generation ? 'handoff-summary-generate' : 'owner-switch-control', to: 'owner:chief',
+          body: trigger.message, requestId,
+          ...(generation ? { state: 'queued' } : { state: 'recorded', recordedAt: this.now() }),
         }, () => Date.parse(trigger.at))
-        this.#deliverOwnerSwitch(control)
+        if (!generation) this.#deliverOwnerSwitch(control)
       } else if (!trigger.dropped) {
         this.runner.enqueue({
           id: outboxId, ticketId: null, triggerId: id, kind: stop ? 'stop' : command ? 'deferred-decision' : 'inbox',
@@ -585,10 +614,38 @@ export class Router {
   publishOwnerSwitchProgress(operation) {
     if (this.store.closed || operation?.status === 'waiting' || typeof operation?.requestId !== 'string' || !operation.requestId.startsWith('feishu-')) return
     const original = this.getTrigger(operation.requestId)
-    if (!this.#authorizedSwitchTrigger(original) || original.ownerCommand.action !== 'request'
-      || original.ownerCommand.ownerId !== operation.ownerId || original.ownerCommand.expectedSessionId !== operation.oldSessionId) return
+    const command = original?.switchRequest ?? original?.ownerCommand
+    if (!this.#authorizedSwitchTrigger(original) || command?.action !== 'request'
+      || command.ownerId !== operation.ownerId || command.expectedSessionId !== operation.oldSessionId) return
     const id = 'out-owner-switch-' + operation.operationId + '-' + operation.status
     this.#ownerSwitchReply(original, id, describeOwnerSwitch(operation))
+  }
+
+  #requireFeishuHandoff(trigger) {
+    if (trigger.policy?.chatType !== 'p2p') throw new RouterError('handoff-private-chat-required', '请在与 Bot 的私聊中处理交接摘要。')
+    if (!this.handoffSummaries) throw new RouterError('handoff-summary-unavailable', '交接摘要暂不可用。')
+  }
+
+  async #generateFeishuHandoff(row) {
+    const trigger = this.getTrigger(row.triggerId)
+    if (!this.#authorizedSwitchTrigger(trigger) || trigger.ownerCommand.action !== 'summary-generate') {
+      return { recorded: true, skipped: 'invalid-owner-switch' }
+    }
+    const id = 'out-owner-switch-control-' + trigger.id
+    if (this.#outboxRow(id)) return { recorded: true }
+    const { ownerId, expectedSessionId } = trigger.ownerCommand
+    let body
+    try {
+      this.#requireFeishuHandoff(trigger)
+      const draft = await this.handoffSummaries.generate({ ownerId, expectedSessionId,
+        origin: { actor: trigger.authorization.actor, chatId: trigger.source.chatId, triggerId: trigger.id } })
+      body = feishuHandoffPreview(draft)
+    } catch (error) {
+      if (!['HandoffSummaryError', 'RouterError'].includes(error?.name)) throw error
+      body = '交接摘要未受理。' + String(error.message).slice(0, 160)
+    }
+    if (!this.store.closed) this.#ownerSwitchReply(trigger, id, body)
+    return { recorded: true }
   }
 
   #deliverOwnerSwitch(row) {
@@ -601,7 +658,16 @@ export class Router {
       let body
       try {
         if (command.action === 'help') {
-          body = '使用 /hub-switch wait|stop|status <负责人ID>，或者 /hub-switch cancel|retry-archive <操作编号> <负责人ID>。'
+          body = '使用 /hub-switch wait|stop|status <负责人ID>，或 cancel|retry-archive <操作编号> <负责人ID>。私聊可用 /hub-switch summary <负责人ID>。'
+        } else if (command.action.startsWith('summary-')) {
+          this.#requireFeishuHandoff(trigger)
+          const result = applyFeishuHandoff(this.handoffSummaries, command, trigger)
+          if (result.request) {
+            const operation = this.ownerSwitchAction(result.request)
+            if (result.request.ownerId === 'chief') this.store.set('chief-inbox-switch-ref', trigger.id)
+            this.#updateTrigger({ ...trigger, switchRequest: result.request })
+            body = describeOwnerSwitch(operation)
+          } else body = result.body
         } else {
           if (command.operationId) {
             const target = this.ownerSwitch?.get({ ownerId: command.ownerId, operationId: command.operationId })
@@ -614,8 +680,9 @@ export class Router {
           body = describeOwnerSwitch(this.ownerSwitchAction({ ...command, requestId: trigger.id }))
         }
       } catch (error) {
-        if (!['RouterError', 'OwnerSwitchError'].includes(error?.name)) throw error
-        body = '负责人更换未受理。' + String(error.message).slice(0, 160)
+        if (!['RouterError', 'OwnerSwitchError', 'HandoffSummaryError'].includes(error?.name)) throw error
+        const label = command.action.startsWith('summary-') ? '交接摘要' : '负责人更换'
+        body = label + '未受理。' + String(error.message).slice(0, 160)
       }
       this.#ownerSwitchReply(trigger, id, body)
       return { recorded: true }
@@ -1273,6 +1340,7 @@ export class Router {
   async #deliverRow(row) {
     if (row.kind === 'inbox' || row.kind === 'stop') return this.#deliverIntake(row)
     if (row.kind === 'owner-switch-control') return this.#deliverOwnerSwitch(row)
+    if (row.kind === 'handoff-summary-generate') return this.#generateFeishuHandoff(row)
     if (row.kind === 'background-report') return this.#deliverBackgroundReport(row)
     if (row.kind === 'deferred-answer') return this.#deliverDeferredAnswer(row)
     if (row.kind === 'approved-owner-inject') return this.#deliverApprovedOwner(row)

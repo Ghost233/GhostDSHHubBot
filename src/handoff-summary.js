@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 
 const DRAFTS = 'handoff-summary:draft:'
 const DRAFTS_END = 'handoff-summary:draft;'
+const FEISHU_TRIGGERS = 'handoff-summary:feishu-trigger:'
 const DRAFT_LIFETIME_MS = 24 * 60 * 60 * 1000
 const TRANSCRIPT_MAX_BYTES = 32 * 1024
 const SUMMARY_MAX_BYTES = 8 * 1024
@@ -23,7 +24,16 @@ function boundedText(value, maxBytes) {
   return typeof value === 'string' && Buffer.byteLength(value, 'utf8') <= maxBytes && value.trim() !== ''
 }
 
-function publicDraft({ sourceBindingVersion, ...draft }) {
+function normalizeOrigin(input) {
+  if (input === undefined) return undefined
+  const { actor, chatId, triggerId } = input ?? {}
+  if (![actor, chatId, triggerId].every(identifier)) {
+    throw new HandoffSummaryError('invalid-handoff-summary', 'Specify the original Feishu sender, chat and trigger.')
+  }
+  return { actor, chatId, triggerId }
+}
+
+function publicDraft({ sourceBindingVersion, feishuOrigin, ...draft }) {
   return draft
 }
 
@@ -51,15 +61,14 @@ export class HandoffSummaryRegistry {
   #write(work) {
     this.#requireOpen()
     const db = this.store.db
-    // Work performs one write after its checks and can participate in an intake transaction.
-    if (db.isTransaction) return work()
-    db.exec('BEGIN IMMEDIATE')
+    const nested = db.isTransaction
+    db.exec(nested ? 'SAVEPOINT handoff_summary' : 'BEGIN IMMEDIATE')
     try {
       const value = work()
-      db.exec('COMMIT')
+      db.exec(nested ? 'RELEASE handoff_summary' : 'COMMIT')
       return value
     } catch (error) {
-      if (db.isTransaction) db.exec('ROLLBACK')
+      if (db.isTransaction) db.exec(nested ? 'ROLLBACK TO handoff_summary; RELEASE handoff_summary' : 'ROLLBACK')
       throw error
     }
   }
@@ -92,9 +101,26 @@ export class HandoffSummaryRegistry {
     }
   }
 
-  async generate({ ownerId, expectedSessionId } = {}) {
+  #replay(address, origin, sourceBindingVersion) {
+    if (!origin) return undefined
+    const draftId = this.store.get(FEISHU_TRIGGERS + origin.triggerId)
+    if (draftId === undefined) return undefined
+    const draft = this.store.get(DRAFTS + draftId)
+    if (draft?.ownerId !== address.ownerId || draft.sourceSessionId !== address.expectedSessionId
+      || draft.feishuOrigin?.triggerId !== origin.triggerId || draft.feishuOrigin.actor !== origin.actor
+      || draft.feishuOrigin.chatId !== origin.chatId) {
+      throw new HandoffSummaryError('handoff-summary-origin-conflict', 'This Feishu trigger belongs to a different handoff summary request.')
+    }
+    return this.#requireCurrentDraft(draft, sourceBindingVersion)
+  }
+
+  /** Pass origin only for an authorized command from a Feishu private chat. */
+  async generate({ ownerId, expectedSessionId, origin } = {}) {
     const address = { ownerId, expectedSessionId }
     const sourceBindingVersion = this.#requireBinding(address)
+    const feishuOrigin = normalizeOrigin(origin)
+    const replay = this.#replay(address, feishuOrigin, sourceBindingVersion)
+    if (replay) return publicDraft(replay)
     if (typeof this.readTranscript !== 'function' || typeof this.summarize !== 'function') {
       throw new HandoffSummaryError('handoff-summary-unavailable', 'Handoff summary generation is unavailable.')
     }
@@ -116,6 +142,9 @@ export class HandoffSummaryRegistry {
     }))
     return this.#write(() => {
       this.#requireBinding(address, sourceBindingVersion)
+      // Another execution can finish this trigger while either Host call is pending.
+      const replay = this.#replay(address, feishuOrigin, sourceBindingVersion)
+      if (replay) return publicDraft(replay)
       const at = this.now()
       this.#requireFresh(expiresAt, at)
       if (!boundedText(text, SUMMARY_MAX_BYTES)) {
@@ -129,8 +158,10 @@ export class HandoffSummaryRegistry {
       const draft = {
         draftId, ownerId, ...provenance, sourceBindingVersion, text,
         status: 'draft', revision: 1, createdAt: at, updatedAt: at, expiresAt,
+        ...(feishuOrigin && { feishuOrigin }),
       }
       this.store.set(key, draft)
+      if (feishuOrigin) this.store.set(FEISHU_TRIGGERS + feishuOrigin.triggerId, draftId)
       return publicDraft(draft)
     })
   }
@@ -144,6 +175,10 @@ export class HandoffSummaryRegistry {
     if (draft?.ownerId !== address.ownerId || draft.sourceSessionId !== address.expectedSessionId) {
       throw new HandoffSummaryError('handoff-summary-not-found', 'This handoff summary draft does not belong to the selected owner and session.')
     }
+    return this.#requireCurrentDraft(draft, sourceBindingVersion)
+  }
+
+  #requireCurrentDraft(draft, sourceBindingVersion) {
     if (draft.sourceBindingVersion !== sourceBindingVersion) {
       throw new HandoffSummaryError('stale-owner-binding', 'The selected session is no longer the current owner binding.')
     }
@@ -182,11 +217,25 @@ export class HandoffSummaryRegistry {
     return publicDraft(this.#read(address))
   }
 
+  /** Reopen a draft from the original Feishu sender and private chat. */
+  getFeishu({ draftId, actor, chatId } = {}) {
+    this.#requireOpen()
+    if (![draftId, actor, chatId].every(identifier)) {
+      throw new HandoffSummaryError('invalid-handoff-summary', 'Specify the draft and the original Feishu sender and chat.')
+    }
+    const draft = this.store.get(DRAFTS + draftId)
+    if (draft?.feishuOrigin?.actor !== actor || draft.feishuOrigin.chatId !== chatId) {
+      throw new HandoffSummaryError('handoff-summary-not-found', 'This handoff summary draft is unavailable in the selected Feishu chat.')
+    }
+    const version = this.#requireBinding({ ownerId: draft.ownerId, expectedSessionId: draft.sourceSessionId })
+    return publicDraft(this.#requireCurrentDraft(draft, version))
+  }
+
   list({ ownerId, expectedSessionId } = {}) {
     const version = this.#requireBinding({ ownerId, expectedSessionId })
     const at = new Date(this.now()).toISOString()
     return this.store.db.prepare(`
-      SELECT json_remove(value, '$.text', '$.sourceBindingVersion') AS metadata FROM kv
+      SELECT json_remove(value, '$.text', '$.sourceBindingVersion', '$.feishuOrigin') AS metadata FROM kv
       WHERE key >= ? AND key < ?
         AND json_extract(value, '$.ownerId') = ?
         AND json_extract(value, '$.sourceSessionId') = ?

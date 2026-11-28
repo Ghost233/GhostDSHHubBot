@@ -260,6 +260,7 @@ test('an admitted answer is not replayed after restart and a committed switch wi
     await delivering
     await restarted.router.tick()
     assert.equal(restarted.deferred.get(requestId).outcome.delivery.state, 'sent')
+    assert.equal(restarted.router.getTicket(ticketId).recoveryPending, true)
     assert.deepEqual(prompts.filter(prompt => prompt.requestId === answerPrompt).map(prompt => prompt.sessionId), [ownerSession])
     await restarted.router.tick()
     assert.equal(prompts.filter(prompt => prompt.requestId === answerPrompt).length, 1)
@@ -311,6 +312,178 @@ test('the scheduled timer keeps its exact worker for a timely answer while the o
     preparing?.release()
     await preparing?.done
     env.cleanup()
+  }
+})
+
+async function openOneShotTimerQuestion({ router, owner, timers, advance }) {
+  const timer = timers.create({ ownerId: owner.id, createdBy: 'fixture-user', message: 'Check fixture.',
+    fireAt: new Date(Date.parse(router.now()) + 1000).toISOString() })
+  advance(1000)
+  await timers.tick()
+  const { ticketId, state } = timers.get(timer.id).delivery
+  assert.equal(state, 'sent')
+  const sessionId = router.getTicket(ticketId).workerSession.sessionId
+  router.askWorker({ ticketId, sessionId, question: 'Which fixture file?' })
+  return { ticketId, sessionId, requestId: router.getTicket(ticketId).deferred.requestId }
+}
+
+function pauseAnswerReceipt({ router, sessions }, promptId, accepted = true) {
+  const entered = Promise.withResolvers()
+  const paused = Promise.withResolvers()
+  const prompt = sessions.prompt
+  const attempts = []
+  sessions.prompt = async input => {
+    if (input.requestId !== promptId) return prompt(input)
+    attempts.push(input.sessionId)
+    const result = accepted ? await prompt(input) : undefined
+    entered.resolve()
+    await paused.promise
+    if (!result) throw Error('The Host admission did not complete.')
+    return result
+  }
+  const done = router.tick()
+  return { entered: Promise.race([entered.promise, done]), release: paused.resolve, done, attempts }
+}
+
+test('an archived timer worker answer settles from its exact Host receipt after SQLite reopens', async t => {
+  for (const [label, receipt] of [['accepted', true], ['verified absent', false], ['unavailable', undefined]]) {
+    await t.test(label, async () => {
+      const env = handoffFixture()
+      const { router, sessions, store, host, prompts, advance } = env
+      let delivering
+      try {
+        const { ticketId, sessionId: worker, requestId } = await openOneShotTimerQuestion(env)
+        const promptId = 'hub-bot-answer-' + requestId
+        await router.resolveDeferred({ ticketId, requestId, decision: 'answer', text: 'Use the fixture manifest.', channel: 'panel' })
+        delivering = pauseAnswerReceipt(env, promptId, receipt !== false)
+        await delivering.entered
+        assert.deepEqual(delivering.attempts, [worker])
+        assert.equal(env.deferred.get(requestId).outcome.delivery.state, 'queued')
+        store.close()
+        host.get(worker).archived = true
+        const originalReceipt = sessions.hasPromptReceipt
+        const lookups = []
+        sessions.hasPromptReceipt = async query => {
+          lookups.push(query)
+          return receipt === undefined ? undefined : originalReceipt(query)
+        }
+
+        const restarted = env.open()
+        await restarted.router.markRestart()
+        delivering.release()
+        await delivering.done
+        for (const waitMs of [0, 2000, 4000]) {
+          advance(waitMs)
+          await restarted.router.tick()
+        }
+        assert.ok(lookups.length > 0)
+        assert.ok(lookups.every(query => query.sessionId === worker && query.requestId === promptId))
+        const delivery = restarted.deferred.get(requestId).outcome.delivery
+        assert.equal(delivery.sessionId, worker)
+        assert.deepEqual(delivering.attempts, [worker])
+        assert.equal(prompts.filter(input => input.requestId === promptId).length, receipt === false ? 0 : 1)
+        if (receipt === true) {
+          assert.equal(delivery.state, 'sent')
+          assert.equal(restarted.router.getTicket(ticketId).stage, 'working')
+          assert.equal(restarted.router.getTicket(ticketId).recoveryPending, true)
+        } else {
+          assert.equal(delivery.state, 'failed')
+          assert.match(delivery.reason, receipt === false ? /original execution session is no longer available/ : /previous answer delivery could not be verified/)
+          assert.equal(restarted.router.getTicket(ticketId).stage, 'blocked')
+        }
+      } finally {
+        delivering?.release()
+        await delivering?.done
+        env.cleanup()
+      }
+    })
+  }
+})
+
+test('a deduplicated timer worker answer keeps the restart recovery note pending', async () => {
+  const env = handoffFixture()
+  const { router, store, prompts } = env
+  let delivering
+  try {
+    const { ticketId, requestId, sessionId } = await openOneShotTimerQuestion(env)
+    const promptId = 'hub-bot-answer-' + requestId
+    await router.resolveDeferred({ ticketId, requestId, decision: 'answer', text: 'Use the fixture manifest.', channel: 'panel' })
+    delivering = pauseAnswerReceipt(env, promptId)
+    await delivering.entered
+    assert.deepEqual(delivering.attempts, [sessionId])
+    store.close()
+    const restarted = env.open()
+    await restarted.router.markRestart()
+    delivering.release()
+    await delivering.done
+    await restarted.router.tick()
+    const admitted = prompts.filter(input => input.requestId === promptId)
+    assert.equal(admitted.length, 1)
+    assert.equal(admitted[0].text.includes(RECOVERY_NOTE), false)
+    assert.equal(restarted.deferred.get(requestId).outcome.delivery.state, 'sent')
+    assert.equal(restarted.router.getTicket(ticketId).recoveryPending, true)
+  } finally {
+    delivering?.release()
+    await delivering?.done
+    env.cleanup()
+  }
+})
+
+test('an admitted answer settles after its task advances during Host delivery', async t => {
+  for (const [label, stage] of [['timer report', 'person/review'], ['next worker question', 'person/answer'], ['owner completion', 'done']]) {
+    await t.test(label, async () => {
+      const env = handoffFixture()
+      const { router, owner, ownerSession, store } = env
+      let delivering
+      try {
+        let question
+        if (stage === 'done') {
+          const { ticketId } = await router.routeToOwner({ ownerId: owner.id, message: 'Start fixture work.' })
+          const { requestId } = router.openQuestion({ ticketId, question: 'Which fixture file?' }).deferred
+          question = { ticketId, requestId, sessionId: ownerSession }
+        } else {
+          question = await openOneShotTimerQuestion(env)
+        }
+        const { ticketId, requestId, sessionId } = question
+        const promptId = 'hub-bot-answer-' + requestId
+        await router.resolveDeferred({ ticketId, requestId, decision: 'answer', text: 'Use the fixture manifest.', channel: 'panel' })
+        delivering = pauseAnswerReceipt(env, promptId)
+        await delivering.entered
+        assert.deepEqual(delivering.attempts, [sessionId])
+
+        let nextQuestion
+        if (stage === 'done') {
+          router.tasks.report({ ticketId, summary: 'Fixture work complete.' })
+          await router.routeToOwner({ ownerId: owner.id, ticketId, resolution: 'accept', message: 'Accept fixture work.' })
+        } else {
+          await router.reportBackground({ ticketId, sessionId, summary: 'Checked the fixture manifest.' })
+          if (stage === 'person/answer') {
+            router.tasks.resume(ticketId, { by: 'user' })
+            router.askWorker({ ticketId, sessionId, question: 'Which version should I check next?' })
+            nextQuestion = router.getTicket(ticketId).deferred
+            assert.notEqual(nextQuestion.requestId, requestId)
+          }
+        }
+        assert.equal(router.getTicket(ticketId).stage, stage)
+        assert.equal(env.deferred.get(requestId).outcome.delivery.state, 'queued')
+        store.close()
+        const restarted = env.open()
+        await restarted.router.markRestart()
+        delivering.release()
+        await delivering.done
+        await restarted.router.tick()
+        const { delivery } = restarted.deferred.get(requestId).outcome
+        assert.equal(delivery.state, 'sent')
+        assert.equal(delivery.sessionId, sessionId)
+        assert.deepEqual(delivering.attempts, [sessionId])
+        assert.equal(restarted.router.getTicket(ticketId).stage, stage)
+        if (nextQuestion) assert.deepEqual(restarted.router.getTicket(ticketId).deferred, nextQuestion)
+      } finally {
+        delivering?.release()
+        await delivering?.done
+        env.cleanup()
+      }
+    })
   }
 })
 
@@ -400,7 +573,10 @@ test('retry on a new owner requires verified absence at the attempted recipient'
         if (receipt === false) {
           assert.equal(delivery.state, 'sent')
           assert.equal(delivery.sessionId, operation.newSessionId)
-          assert.deepEqual(prompts.filter(input => input.requestId === promptId).map(input => input.sessionId), [operation.newSessionId])
+          const admitted = prompts.filter(input => input.requestId === promptId)
+          assert.deepEqual(admitted.map(input => input.sessionId), [operation.newSessionId])
+          assert.ok(admitted[0].text.startsWith(RECOVERY_NOTE))
+          assert.equal(restarted.router.getTicket(ticketId).recoveryPending, undefined)
         } else {
           assert.equal(delivery.state, 'failed')
           assert.match(delivery.reason, /could not be verified/)
