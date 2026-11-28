@@ -4,10 +4,17 @@
  * 扫码一键建应用: register() drives @larksuiteoapi/node-sdk's lark.registerApp() (OAuth 2.0 Device
  * Authorization Grant, RFC 8628): the QR url surfaces via status()/devApi for the panel; once the user
  * confirms on the phone, the application binding is saved in DSH credentials before the long connection
- * starts. The event-subscription MODE (long-connection vs webhook) is a
- * sensitive setting addons cannot carry, so after credentials land the plugin calls the application-config
- * patch OpenAPI once — 未对真实 API 验证: on failure the plugin logs a manual-fallback warning and continues
- * (the WSClient simply receives nothing until the mode is set by hand).
+ * starts. The event-subscription MODE (long-connection vs webhook) is a sensitive setting addons cannot
+ * carry, so after credentials land the plugin calls the application-config patch OpenAPI once and reports the
+ * truthful outcome as status().eventMode: 'configured' only when that API actually answers code 0; a denied
+ * (nonzero) response or a thrown error surfaces 'manual' so the panel tells the user to set 长连接 in the
+ * developer console once (the WSClient simply receives nothing until it is set by hand).
+ *
+ * 扫码状态诚实: status().registration is pending while a scan is outstanding, expired once the QR's own
+ * expireIn has elapsed (the QR is then withheld — 过期二维码不再展示), and failed only for a real failure.
+ * Registration attempts are scoped: a superseded/expired/cancelled attempt can never write its QR or its
+ * credentials over the current attempt, and a failed rebind keeps the previous binding (凭据只在宿主记录
+ * 确认写入之后才出现).
  *
  * 消息通道: WSClient im.message.receive_v1 events normalize into Triggers (id feishu-<messageId>, dedup on
  * replay — 重启不重放) and inject the L1 chief Session with a plugin-owned source mark
@@ -125,6 +132,7 @@ export class FeishuSource {
     const bound = this.credentialState === 'ok' && this.credentials
     const appId = bound ? this.credentials.appId : null
     const enabled = this.config.enabled === true
+    const registering = this.registering
     const wsState = enabled ? this.ws?.getConnectionStatus?.().state ?? this.wsState : 'off'
     return {
       enabled,
@@ -135,9 +143,10 @@ export class FeishuSource {
         ? undefined
         : this.credentialState === 'invalid' ? this.credentialError ?? UNAVAILABLE : MISSING,
       wsState,
-      registration: enabled ? (this.registering ? 'pending' : this.registrationError ? 'failed' : undefined) : undefined,
+      registration: enabled ? (registering ? 'pending' : this.registrationExpired ? 'expired' : this.registrationError ? 'failed' : undefined) : undefined,
       registrationError: enabled ? this.registrationError ?? undefined : undefined,
-      qr: enabled ? this.lastQr ?? undefined : undefined,
+      qr: enabled && registering ? this.lastQr ?? undefined : undefined,
+      eventMode: enabled ? this.eventMode : undefined,
       preset: BOT_PRESET,
       permissions: DECLARED_PERMISSIONS,
       bot: bound ? {
@@ -156,78 +165,111 @@ export class FeishuSource {
    * visible via status().qr while pending. Permission addon principle: 一次性全部申请 (im:message:send_as_bot,
    * im:message, im:chat:readonly + im.message.receive_v1).
    */
-  get registering() { return this.registrationAttempt !== null }
+  get registering() {
+    this.#expireRegistration(this.registrationAttempt)
+    return this.registrationAttempt !== null
+  }
+
+  #clearRegistrationQr(registration) {
+    clearTimeout(registration.expiryTimer)
+    registration.expiresAt = undefined
+    this.lastQr = null
+  }
+
+  #expireRegistration(registration) {
+    if (!registration || this.registrationAttempt !== registration || registration.expiresAt === undefined
+      || Date.parse(this.now()) < registration.expiresAt) return
+    registration.expired = true
+    this.registrationExpired = true
+    this.registrationAttempt = null
+    this.#clearRegistrationQr(registration)
+    registration.abort()
+  }
 
   async register() {
     if (this.config.enabled !== true) throw new Error('Enable Feishu before registering a bot')
     if (this.registering) return { started: false, registration: 'pending' }
     const registration = new AbortController()
+    const { signal } = registration
     this.registrationAttempt = registration
     this.registrationError = null
-    this.lastQr = null
+    this.registrationExpired = false
     let previousSecret
     let issuedSecret
+    let awaitingGrant = true
     try {
       this.credentialsPort.requireService()
       await this.credentialsReady
-      registration.signal.throwIfAborted()
+      signal.throwIfAborted()
       previousSecret = this.credentials?.appSecret
       const lark = await this.#sdk()
-      registration.signal.throwIfAborted()
+      signal.throwIfAborted()
       const result = await lark.registerApp({
-        signal: registration.signal,
-        createOnly: true, // 只允许创建新应用，避免误覆盖已有应用
+        signal,
+        createOnly: true,
         appPreset: { name: BOT_PRESET.name, desc: BOT_PRESET.desc },
         addons: {
           preset: true,
           scopes: { tenant: ['im:message:send_as_bot', 'im:message', 'im:chat:readonly'] },
           events: { items: { tenant: ['im.message.receive_v1'] } },
         },
-        onQRCodeReady: info => {
-          if (!registration.signal.aborted) this.lastQr = { url: info.url, expireIn: info.expireIn }
+        onQRCodeReady: ({ url, expireIn }) => {
+          this.#expireRegistration(registration)
+          if (!awaitingGrant || this.registrationAttempt !== registration || signal.aborted) return
+          clearTimeout(registration.expiryTimer)
+          const lifetime = Number.isFinite(expireIn) && expireIn > 0 ? Math.min(expireIn, 2_147_483) : 3600
+          registration.expiresAt = Date.parse(this.now()) + lifetime * 1000
+          this.lastQr = { url, expireIn: lifetime, expiresAt: new Date(registration.expiresAt).toISOString() }
+          registration.expiryTimer = setTimeout(() => this.#expireRegistration(registration), lifetime * 1000)
+          registration.expiryTimer.unref()
         },
       })
-      registration.signal.throwIfAborted()
+      this.#expireRegistration(registration)
+      signal.throwIfAborted()
+      awaitingGrant = false
+      this.#clearRegistrationQr(registration)
       issuedSecret = result.client_secret
-      await this.saveCredentials({ appId: result.client_id, appSecret: issuedSecret }, registration.signal)
-      registration.signal.throwIfAborted()
+      await this.saveCredentials({ appId: result.client_id, appSecret: issuedSecret }, signal)
+      signal.throwIfAborted()
+      // A transport failure after persistence must leave the saved binding visible.
+      this.eventMode = undefined
       this.#closeSocket()
-      await this.#configureEventMode()
-      registration.signal.throwIfAborted()
-      await this.connect()
-      registration.signal.throwIfAborted()
+      const eventMode = await this.#configureEventMode()
+      signal.throwIfAborted()
+      this.eventMode = eventMode
+      try { await this.connect() } catch { /* connect() records the transport failure */ }
+      signal.throwIfAborted()
       return { appId: result.client_id }
     } catch (error) {
-      if (registration.signal.aborted) return { cancelled: true }
+      if (registration.expired) return { expired: true }
+      if (signal.aborted) return { cancelled: true }
       this.registrationError = feishuErrorText(error, previousSecret, issuedSecret).slice(0, 300)
       if (error instanceof CredentialsError) throw error
       throw new Error(this.registrationError)
     } finally {
       if (this.registrationAttempt === registration) {
         this.registrationAttempt = null
-        this.lastQr = null
+        this.#clearRegistrationQr(registration)
       }
     }
+
   }
 
-  /**
-   * Event-subscription mode auto-config (spec: 创建后调 application-config patch 设为长连接).
-   * 未对真实 API 验证 — the endpoint/payload follow the application-v7 patch doc; on failure the plugin logs
-   * a manual-fallback warning and continues (手工降级: set 长连接 in the developer console once).
-   */
   async #configureEventMode() {
-    const client = await this.#client()
     try {
-      await client.request({
+      const client = await this.#client()
+      const result = await client.request({
         method: 'PATCH',
         url: 'https://open.feishu.cn/open-apis/application/v7/application-config',
         data: { event_subscription: { mode: 'long_connection' } },
       })
-      this.logger.info('hub-bot feishu: event-subscription mode set to long_connection (未对真实 API 验证)')
-    } catch (error) {
-      // 实测（2026-11-16）: 设备流权限包不含 application:application:patch → 404。手工降级为正式路径。
-      this.logger.warn('hub-bot feishu: event-mode auto-config failed (%s) — 请手工配置（一次性）: open.feishu.cn/app →「DSH 中转 Bot」→ 事件与回调 → 订阅方式 → 使用长连接接收事件/回调', feishuErrorText(error, this.credentials?.appSecret))
-    }
+      if (result?.code === 0) {
+        this.logger.info('hub-bot feishu: event-subscription mode set to long_connection')
+        return 'configured'
+      }
+    } catch { /* Some Feishu tenants require manual configuration. */ }
+    this.logger.warn('hub-bot feishu: configure long-connection event subscription in the Feishu developer console')
+    return 'manual'
   }
 
   /** The authenticated REST client (created once credentials exist). */
@@ -316,9 +358,13 @@ export class FeishuSource {
 
   /** Pausing preserves saved credentials and cancels outstanding registration and socket work. */
   disconnect() {
-    this.registrationAttempt?.abort()
+    const registration = this.registrationAttempt
     this.registrationAttempt = null
-    this.lastQr = null
+    if (registration) {
+      this.#clearRegistrationQr(registration)
+      registration.abort()
+    }
+    this.registrationExpired = false
     this.registrationError = null
     this.#closeSocket()
   }
