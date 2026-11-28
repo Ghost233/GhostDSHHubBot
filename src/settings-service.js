@@ -147,6 +147,32 @@ export class HubBotSettingsService extends TypertRemoteService {
     return detail
   }
 
+  async ticketDetail(ticketId) {
+    if (typeof ticketId !== 'string' || !ticketId.trim()) throw new RemoteError('ticket/invalid', 'A ticket ID is required.', {})
+    const detail = await this.deps.ticketDetail(ticketId)
+    if (!detail) throw new RemoteError('ticket/not-found', 'Unknown ticket.', {})
+    return detail
+  }
+
+  async notificationDetail(request) {
+    const id = request?.id
+    if (typeof id !== 'string' || !id.trim()) throw new RemoteError('notification/invalid', 'A notification ID is required.', {})
+    const detail = await this.deps.notificationDetail(id)
+    if (!detail) throw new RemoteError('notification/not-found', 'Unknown notification.', {})
+    return detail
+  }
+
+  async ownerSwitchAction(request) {
+    try {
+      return await this.deps.ownerSwitchAction(request ?? {})
+    } catch (error) {
+      if (error?.status === 400 || ['OwnerSwitchError', 'RouterError'].includes(error?.name)) {
+        throw new RemoteError('owner-switch/' + (error.code ?? 'invalid'), error.message, {})
+      }
+      throw error
+    }
+  }
+
   async listRuns(request) {
     try {
       return await this.deps.listRuns(request ?? {})
@@ -210,6 +236,9 @@ markRemote(HubBotSettingsService, 'discardOutbox', {})
 markRemote(HubBotSettingsService, 'selfTest', {})
 markRemote(HubBotSettingsService, 'overview', {})
 markRemote(HubBotSettingsService, 'messageDetail', {})
+markRemote(HubBotSettingsService, 'ticketDetail', {})
+markRemote(HubBotSettingsService, 'notificationDetail', {})
+markRemote(HubBotSettingsService, 'ownerSwitchAction', {})
 markRemote(HubBotSettingsService, 'listRuns', {})
 markRemote(HubBotSettingsService, 'runDetail', {})
 markRemote(HubBotSettingsService, 'timerAction', {})

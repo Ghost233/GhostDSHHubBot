@@ -21,6 +21,14 @@ test('reporting defaults to OFF (无自动汇报) and parses explicit overrides'
 })
 
 
+test('ordinary notification window is configurable in positive whole milliseconds', () => {
+  const config = resolveConfig({ ...valid(), notifications: { windowMs: 30_000 } })
+  assert.deepEqual(config.notifications, { windowMs: 30_000 })
+  for (const notifications of [{ windowMs: 0 }, { windowMs: 1.5 }, { windowMs: '30' }, { interval: 1000 }, true]) {
+    assert.throws(() => resolveConfig({ ...valid(), notifications }), ConfigError)
+  }
+})
+
 test('rejects a missing stateDir', () => {
   const { stateDir, ...rest } = valid()
   void stateDir

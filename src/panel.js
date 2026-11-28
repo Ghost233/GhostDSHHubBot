@@ -14,7 +14,7 @@
  */
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, renameSync, unlinkSync, chmodSync } from 'node:fs'
 import { join } from 'node:path'
-import { STAGE_TEXT } from './tasks.js'
+import { normalizeStage, STAGE_TEXT } from './tasks.js'
 import { validateChiefModel } from './config.js'
 
 /** The overlay file holding panel-written settings (stateDir, 0600). */
@@ -355,7 +355,7 @@ function indexMessageReplies(store, triggers, ticketTriggers) {
     const marker = String(row.body ?? row.text ?? '').match(FEISHU_TEST_MARKER)?.[0] ?? null
     if (trigger?.kind === 'feishu' && trigger.source?.chatId === chatId) {
       if (marker === feishuSelfTestMarker(trigger.source.messageId)) pick(linked, triggerId, row)
-    } else if (!row.triggerId && !row.ticketId) {
+    } else if (!row.triggerId && !row.ticketId && !(row.notificationWindowMs > 0)) {
       if (marker) pick(testsByMarker, chatId + ':' + marker, row)
       else if (!unlinkedByChat.has(chatId) || (row.createdAt ?? '') >= (unlinkedByChat.get(chatId).createdAt ?? '')) unlinkedByChat.set(chatId, row)
     }
@@ -530,16 +530,78 @@ export function buildIntakePolicy(store, { now } = {}) {
   })
 }
 
+const OVERVIEW_STAGES = new Map([
+  'person/answer', 'person/confirm', 'person/review', 'blocked', 'failed', 'working', 'queued', 'idle', 'done', 'canceled',
+].map((stage, index) => [stage, index]))
+
+function excerpt(text, limit) {
+  return typeof text === 'string' && text.length > limit ? text.slice(0, limit) + '…' : text
+}
+
+function projectTicket(ticket, { trigger, owner, findAnswer, compact, listDir }) {
+  const stage = normalizeStage(ticket.stage)
+  const message = ticket.routedMessage ?? (typeof trigger?.message === 'string' ? trigger.message : null)
+  const deferred = ticket.deferred
+  let answerDelivery = deferred?.outcome?.delivery ?? null
+  if (answerDelivery?.state === 'queued') {
+    const row = findAnswer('out-answer-' + deferred.requestId)
+    if (!row) answerDelivery = { state: 'discarded' }
+    else if (row.state === 'failed') answerDelivery = { state: 'failed', reason: row.lastError ?? null }
+  }
+  const report = ticket.report ?? null
+  const attentionReason = stage === 'failed' ? ticket.failed?.reason
+    : stage === 'blocked' ? ticket.escalated?.reason ?? ticket.confirmOutcome?.reason : null
+  return {
+    id: ticket.id, owner: ticket.owner, ownerLabel: owner?.workspace ?? ticket.owner,
+    ownerSessionId: owner?.sessionId ?? null, stage, stageText: STAGE_TEXT[stage] ?? stage,
+    message,
+    createdAt: ticket.createdAt ?? null, updatedAt: ticket.updatedAt ?? null,
+    recoveryPending: ticket.recoveryPending === true,
+    ...(attentionReason && { attentionReason: compact ? excerpt(attentionReason, 240) : attentionReason }),
+    authorization: compact ? null : ticket.authorization ?? null,
+    trigger: trigger ? { id: trigger.id, kind: trigger.kind ?? null, at: trigger.at ?? null, sourceRef: trigger.sourceRef ?? null } : null,
+    assignments: compact ? [] : ticket.assignments ?? [],
+    workerSession: ticket.workerSession ?? null,
+    lastDelivery: ticket.lastDelivery ? { state: ticket.lastDelivery.state ?? null } : null,
+    background: ticket.background ? { kind: ticket.background.kind, timerId: ticket.background.timerId ?? null } : null,
+    question: !compact || stage === 'person/answer' ? ticket.question ?? null : null,
+    pendingConfirm: !compact || stage === 'person/confirm' ? ticket.pendingConfirm ?? null : null,
+    deferred: deferred ? { requestId: deferred.requestId, type: deferred.type, status: deferred.status, expiresAt: deferred.expiresAt,
+      target: deferred.target ?? null,
+      answer: !compact && deferred.outcome?.decision === 'answer' ? deferred.outcome.text ?? null : null,
+      delivery: answerDelivery, reason: deferred.outcome?.reason ?? ticket.failed?.reason ?? null } : null,
+    report: compact && report ? { summary: excerpt(report.summary ?? report.text, 240), at: report.at ?? null } : report,
+    dirListing: !compact && (stage === 'person/review' || stage === 'working') && owner && !owner.recycled
+      ? listDir(owner.cwd) : null,
+  }
+}
+
+/** Read a full report and ticket facts by ID without evaluating the Overview or reading other tickets. */
+export function readTicketDetail({ store, registry, ticketId, listDir = listDirCapped }) {
+  const ticket = readStoredRow(store, 'ticket', ticketId)
+  if (!ticket) return null
+  return projectTicket(ticket, {
+    trigger: ticket.triggerId ? readStoredRow(store, 'trigger', ticket.triggerId) : null,
+    owner: ticket.owner == null ? null : registry.get(ticket.owner),
+    findAnswer: id => readStoredRow(store, 'outbox', id),
+    listDir,
+  })
+}
+
+function readStoredRow(store, table, id) {
+  const raw = store.db.prepare('SELECT value FROM ' + table + ' WHERE id = ?').get(id)
+  return raw ? JSON.parse(String(raw.value)) : null
+}
+
 /**
- * The 三问 overview (spec「观测性：独立 web 面板」):
- *  1. 什么状态 — every ticket with its stage + stageText 朗读, grouped client-side (计数 = 列表长度);
- *  2. 在干什么 — the ticket face facts (report 四段, pendingConfirm, question, assignments);
- *  3. 结果在哪 — 等验收票 additionally carry the owner directory listing (产物在哪).
+ * The shared Overview lists tickets in priority order, retaining arrival order within each stage.
+ * Polling clients request compact ticket previews and load complete reports and artifacts by ID.
  * @param {{ store: import('./store.js').Store, registry: import('./registry.js').OwnerRegistry,
- *   health?: object, now?: () => string, listDir?: (cwd: string) => string[] | null }} args
+ *   health?: object, now?: () => string, listDir?: (cwd: string) => string[] | null, compact?: boolean }} args
  */
-export function buildOverview({ store, registry, health, now, listDir }) {
-  const readAll = table => store.db.prepare('SELECT value FROM ' + table).all().map(r => JSON.parse(String(r.value)))
+
+export function buildOverview({ store, registry, health, now, listDir = listDirCapped, compact = false }) {
+  const readAll = table => store.db.prepare('SELECT value FROM ' + table + ' ORDER BY rowid').all().map(r => JSON.parse(String(r.value)))
   const triggerRows = readAll('trigger')
   const triggers = new Map(triggerRows.map(t => [t.id, t]))
   const owners = registry.list().map(o => ({
@@ -548,54 +610,23 @@ export function buildOverview({ store, registry, health, now, listDir }) {
     createdAt: o.createdAt ?? null, updatedAt: o.updatedAt ?? null,
   }))
   const ownerById = new Map(owners.map(o => [o.id, o]))
-  const ticketRows = readAll('ticket')
   const outboxRows = readAll('outbox')
   const answersById = new Map(outboxRows.filter(row => row.kind === 'deferred-answer').map(row => [row.id, row]))
-  const tickets = ticketRows.map(t => {
-    let answerDelivery = t.deferred?.outcome?.delivery ?? null
-    if (answerDelivery?.state === 'queued') {
-      const row = answersById.get('out-answer-' + t.deferred.requestId)
-      if (!row) answerDelivery = { state: 'discarded' }
-      else if (row.state === 'failed') answerDelivery = { state: 'failed', reason: row.lastError ?? null }
+  const tickets = []
+  const ticketTriggers = new Map()
+  const ticketByTriggerId = new Map()
+  const ticketValues = store.db.prepare('SELECT value FROM ticket ORDER BY rowid')
+  for (const { value } of ticketValues.iterate()) {
+    const ticket = JSON.parse(String(value))
+    const row = projectTicket(ticket, { trigger: triggers.get(ticket.triggerId), owner: ownerById.get(ticket.owner),
+      findAnswer: id => answersById.get(id), compact, listDir })
+    tickets.push(row)
+    if (row.trigger) {
+      ticketTriggers.set(row.id, row.trigger.id)
+      ticketByTriggerId.set(row.trigger.id, row)
     }
-    const trigger = t.triggerId ? triggers.get(t.triggerId) : undefined
-    const owner = ownerById.get(t.owner)
-    const row = {
-      id: t.id,
-      owner: t.owner,
-      ownerLabel: owner ? (owner.workspace ?? owner.id) : t.owner,
-      stage: t.stage,
-      stageText: STAGE_TEXT[t.stage] ?? t.stage,
-      message: t.routedMessage ?? (typeof trigger?.message === 'string' ? trigger.message : null),
-      createdAt: t.createdAt ?? null,
-      updatedAt: t.updatedAt ?? null,
-      recoveryPending: t.recoveryPending === true,
-      // 授权记录 (AC 11: 谁授权的、什么时候、基于哪条消息) 与任务历史都在票面上
-      authorization: t.authorization ?? null,
-      trigger: trigger ? { id: trigger.id, kind: trigger.kind ?? null, at: trigger.at ?? null, sourceRef: trigger.sourceRef ?? null } : null,
-      assignments: t.assignments ?? [],
-      workerSession: t.workerSession ?? null,
-      lastDelivery: t.lastDelivery ? { state: t.lastDelivery.state ?? null } : null,
-      background: t.background ? { kind: t.background.kind, timerId: t.background.timerId ?? null } : null,
-      question: t.question ?? null,
-      pendingConfirm: t.pendingConfirm ?? null,
-      deferred: t.deferred ? { requestId: t.deferred.requestId, type: t.deferred.type,
-        status: t.deferred.status, expiresAt: t.deferred.expiresAt,
-        target: t.deferred.target ?? null,
-        answer: t.deferred.outcome?.decision === 'answer' ? t.deferred.outcome.text ?? null : null,
-        delivery: answerDelivery, reason: t.deferred.outcome?.reason ?? t.failed?.reason ?? null } : null,
-      report: t.report ?? null,
-      dirListing: null,
-    }
-    // 结果在哪: list artifacts for review/working tickets whose owner directory still exists (recycled 已删).
-    // review 行内展示，working 收进详情折叠——干活干到一半也能瞄一眼产物。
-    if ((t.stage === 'person/review' || t.stage === 'working') && owner && !owner.recycled) {
-      row.dirListing = (listDir ?? listDirCapped)(owner.cwd)
-    }
-    return row
-  })
-  const ticketTriggers = new Map(tickets.map(ticket => [ticket.id, ticket.trigger?.id]))
-  const ticketByTriggerId = new Map(tickets.filter(ticket => ticket.trigger?.id).map(ticket => [ticket.trigger.id, ticket]))
+  }
+  tickets.sort((a, b) => (OVERVIEW_STAGES.get(a.stage) ?? OVERVIEW_STAGES.size) - (OVERVIEW_STAGES.get(b.stage) ?? OVERVIEW_STAGES.size))
   const replyFor = indexMessageReplies(store, triggers, ticketTriggers)
   const generatedAt = (now ?? (() => new Date().toISOString()))()
   const nowMs = Date.parse(generatedAt) || Date.now()
@@ -625,7 +656,8 @@ export function buildOverview({ store, registry, health, now, listDir }) {
     .map(({ id, dropped, reply }) => ({ id, dropped, reply }))
   const unprocessedTriggers = projected.filter(row => row.unprocessed).length
   // S06: 投喂面口径只读投影 — 完全由上面已读出的 trigger/ticket/outbox 行推导，不读设置、不写任何东西。
-  const intake = intakeProjection({ triggers: triggerRows, tickets: ticketRows, outbox: outboxRows, generatedAt })
+  const intakeTickets = [...ticketByTriggerId].map(([triggerId, ticket]) => ({ ...ticket, triggerId }))
+  const intake = intakeProjection({ triggers: triggerRows, tickets: intakeTickets, outbox: outboxRows, generatedAt })
   return {
     generatedAt,
     owners,

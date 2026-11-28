@@ -135,6 +135,91 @@ test('Feishu registration acknowledgement and asynchronous write failure are sep
   assert.deepEqual(JSON.parse(JSON.stringify((await settings.read()).feishu.status)), failed)
 })
 
+test('Feishu explicit switch and the management panel share a durable owner operation', async t => {
+  const homeRepo = await mkdtemp(join(tmpdir(), 'hub-bot-owner-switch-host-'))
+  const Context = contexts.at(-1)[1]
+  const root = new Context()
+  const token = 'fixture-switch-token'
+  const oldSession = 'fixture-original-owner'
+  const activity = { running: true, queue: [], pendingInput: [] }
+  const prompts = [], creations = [], archived = [], cancellations = []
+  let handle, hub, owner
+  root.provide('sessionController', {
+    async state({ sessionId }) {
+      if (sessionId === oldSession) return activity
+      if (!creations.some(row => row.sessionId === sessionId)) throw Object.assign(new Error('Fixture session unavailable'), { code: 'session/not-found' })
+      return { running: false, queue: [], pendingInput: [] }
+    },
+    async create(request) { creations.push(request); return request },
+    async prompt(input) {
+      prompts.push(input)
+      if (input.requestId.startsWith('hub-bot-switch-')) assert.equal(hub.registry.get(owner.id).sessionId, oldSession)
+      return { accepted: true }
+    },
+    async cancel({ sessionId }) { cancellations.push(sessionId); return { accepted: true } },
+  })
+  root.provide('sessionPersistence', { async flush() {} })
+  root.provide('workspaceController', {
+    async archiveSession(request) { archived.push(request); return { archivedSessionIds: [request.sessionId] } },
+  })
+  root.provide('webServer', { host: '127.0.0.1', port: 3199, register(entry) {
+    handle = entry.handler
+    return () => { handle = undefined }
+  } })
+  const mounted = root.plugin(plugin, { homeRepo, stateDir: join(homeRepo, 'state'),
+    workspaces: { enabled: false }, devApi: { token } })
+  t.after(async () => { await mounted.dispose(); await rm(homeRepo, { recursive: true, force: true }) })
+  await mounted
+  await setImmediate()
+  hub = root.reflect.get('hubBot', false)
+  owner = hub.registry.create({ kind: 'repo', workspace: 'Switch fixture 仓库', cwd: homeRepo })
+  hub.registry.bindSession(owner.id, oldSession)
+
+  async function request(path, data, authenticated = true) {
+    const req = Readable.from(data === undefined ? [] : [Buffer.from(JSON.stringify(data))])
+    Object.assign(req, { url: '/hub-bot/api/' + path, method: data === undefined ? 'GET' : 'POST',
+      headers: { host: '127.0.0.1:3199', ...(authenticated && { 'x-hub-bot-token': token }) } })
+    let status, body
+    await handle(req, { writeHead(code) { status = code }, end(value) { body = value && JSON.parse(value) } })
+    return { status, body }
+  }
+
+  const input = { action: 'request', ownerId: owner.id, expectedSessionId: oldSession }
+  assert.equal((await request('owners/switch', input, false)).status, 401)
+  assert.equal((await request('owners/switch', { ...input, expectedSessionId: 'unrelated-session' })).status, 400)
+  const simulate = (command, messageId = 'om_fixture_switch_wait', actor = 'fixture-feishu-actor') => request('feishu/simulate', {
+    sender: { sender_type: 'user', sender_id: { open_id: actor } },
+    message: { message_id: messageId, chat_id: 'oc_fixture_switch', chat_type: 'p2p', message_type: 'text', content: JSON.stringify({ text: command }) },
+  })
+  assert.equal((await simulate('/hub-switch wait ' + owner.id)).status, 200)
+  await request('deliver', {})
+  assert.equal((await simulate('/hub-switch wait ' + owner.id)).body.deduped, true)
+  await hub.router.ownerSwitch.tick()
+  const current = (await request('overview')).body.ownerSwitches.find(row => row.ownerId === owner.id)
+  assert.equal(current.status, 'waiting')
+  assert.equal(creations.length, 0)
+  assert.ok(hub.router.listOutbox().some(row => row.to === 'feishu:chat:oc_fixture_switch' && row.body.includes(current.operationId)))
+  await simulate('/hub-switch cancel ' + current.operationId + ' ' + owner.id, 'om_fixture_switch_denied', 'fixture-other-actor')
+  await request('deliver', {})
+  assert.equal(hub.router.ownerSwitch.get({ ownerId: owner.id, operationId: current.operationId }).status, 'waiting')
+  assert.ok(hub.router.listOutbox().some(row => row.triggerId === 'feishu-om_fixture_switch_denied' && row.body.includes('请从发起更换的飞书账号')))
+  activity.running = false
+  await hub.router.ownerSwitch.tick()
+  const accepted = hub.registry.get(owner.id).sessionId
+  assert.notEqual(accepted, oldSession)
+  assert.equal(creations[0].agentPreset, 'hub-bot-owner')
+  assert.equal(creations[0].sessionId, accepted)
+  assert.match(prompts[0].content[0].text, /负责人事实/)
+  assert.equal(archived.length, 0)
+  await hub.router.ownerSwitch.tick()
+  assert.deepEqual(archived, [{ sessionId: oldSession, stopActivity: false }])
+  const settings = root.reflect.get('hubBotSettings', false)
+  const final = await settings.ownerSwitchAction({ action: 'status', ownerId: owner.id, operationId: current.operationId })
+  assert.equal(final.status, 'completed')
+  assert.equal(final.newSessionId, accepted)
+  assert.equal(cancellations.length, 0)
+})
+
 test('both authenticated run timeline endpoints expose the same exact persisted result', async t => {
   const homeRepo = await mkdtemp(join(tmpdir(), 'hub-bot-run-host-'))
   const Context = contexts.at(-1)[1]

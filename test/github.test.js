@@ -728,6 +728,30 @@ test('repeated empty and failed lookups leave an ambiguous reply retryable witho
   } finally { reopened?.store.close(); f.cleanup() }
 })
 
+test('a late exact GitHub receipt settles ordinary work held for manual retry', async () => {
+  const target = 'repos/' + REPO + '/issues/42/comments'
+  const f = fixture()
+  try {
+    const { insertOutbox, retryOutboxRows } = await import('../src/outbox.js')
+    const row = insertOutbox(f.store, { kind: 'reply', to: 'github:' + REPO + ':42', body: 'fixture ordinary', state: 'recorded', notificationWindowMs: 60_000 })
+    let posted
+    f.script['POST ' + target] = args => {
+      posted = comment({ id: 9001, body: args.find(arg => arg.startsWith('body=')).slice('body='.length) })
+      throw new Error('fixture timeout with ambiguous outcome')
+    }
+    for (let attempt = 0; attempt < 5; attempt++) await f.source.deliverReplies()
+    assert.equal(retryOutboxRows(f.store, [row.id], f.source.now), 1)
+    const read = () => f.outbox().find(item => item.id === row.id)
+    assert.equal(read().state, 'held')
+    assert.equal(read().notificationRetry, true)
+    assert.deepEqual(await f.source.handleCommentEvent(posted, REPO_CFG), { skipped: 'self-generated' })
+    assert.equal(read().state, 'sent')
+    assert.equal(read().notificationRetry, undefined)
+    assert.equal(read().requestId, row.requestId)
+    assert.equal(f.posts.length, 1)
+  } finally { f.cleanup() }
+})
+
 test('polling settles a failed ambiguous reply when its marker becomes visible', async () => {
   const issues = 'repos/' + REPO + '/issues'
   const target = issues + '/42/comments'

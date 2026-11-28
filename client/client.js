@@ -111,6 +111,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           parameters: [],
           result: anyCodec('dsh-hub-bot#json-result'),
         },
+        'hubBotSettings/ticketDetail': {
+          service: 'hubBotSettings', description: 'Read the complete report and facts for one ticket.', invocation: { kind: 'direct' },
+          parameters: [{ name: 'ticketId', source: 'json', description: 'Ticket ID',
+            codec: { mode: 'strict', typeSymbol: 'dsh-hub-bot#ticket-id', create: () => zodLib.z.string() },
+            strictCodec: { mode: 'strict', typeSymbol: 'dsh-hub-bot#ticket-id', create: () => zodLib.z.string() } }],
+          result: anyCodec('dsh-hub-bot#json-result'),
+        },
         'hubBotSettings/timerAction': {
           service: 'hubBotSettings', description: 'Pause, resume, or cancel a timer.', invocation: { kind: 'direct' },
           parameters: [{ name: 'request', source: 'json', description: '{ id, action }',
@@ -125,6 +132,18 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
         },
         'hubBotSettings/runDetail': {
           service: 'hubBotSettings', description: 'Read one background run and its delivery evidence.', invocation: { kind: 'direct' },
+          parameters: [{ name: 'request', source: 'json', description: '{ id }',
+            codec: anyCodec('dsh-hub-bot#json-request'), strictCodec: anyCodec('dsh-hub-bot#json-request') }],
+          result: anyCodec('dsh-hub-bot#json-result'),
+        },
+        'hubBotSettings/ownerSwitchAction': {
+          service: 'hubBotSettings', description: 'Request, read or manage an owner switch.', invocation: { kind: 'direct' },
+          parameters: [{ name: 'request', source: 'json', description: 'Owner switch operation',
+            codec: anyCodec('dsh-hub-bot#json-request'), strictCodec: anyCodec('dsh-hub-bot#json-request') }],
+          result: anyCodec('dsh-hub-bot#json-result'),
+        },
+        'hubBotSettings/notificationDetail': {
+          service: 'hubBotSettings', description: 'Read the complete ticket index for a notification.', invocation: { kind: 'direct' },
           parameters: [{ name: 'request', source: 'json', description: '{ id }',
             codec: anyCodec('dsh-hub-bot#json-request'), strictCodec: anyCodec('dsh-hub-bot#json-request') }],
           result: anyCodec('dsh-hub-bot#json-result'),
@@ -185,7 +204,14 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       loading: '正在读取…',
       loadFailed: '读取失败',
       retry: '重试',
-      statusSection: '概览',
+      statusSection: '总览',
+      connectionsSection: '连接',
+      outcomesSection: '结果',
+      openReport: '查看报告与详情',
+      noResults: '暂无结果。',
+      nextWake: '下次唤醒',
+      noWake: '暂无计划中的提醒。',
+      ticketUnavailable: '工单已不可用。',
       boardNavigation: 'Hub Bot 页内导航',
       feishuCard: '飞书',
       githubCard: 'GitHub 监听',
@@ -369,6 +395,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       intakeFailed: '投递失败',
       intakeDiscarded: '已丢弃投递',
       timersSection: '提醒',
+      switchWait: '空闲后更换', switchStop: '停止后更换', switchStopConfirm: '确认停止原负责人会话当前处理，等它空闲后更换？',
+      switchCancel: '取消等待', switchRetryArchive: '重试归档', switchOpenPrevious: '打开原会话',
+      switchWaiting: '等待原会话空闲', switchPreparing: '正在准备新会话', switchCommitted: '新会话已接管，等待归档',
+      switchArchiveFailed: '旧会话归档失败', switchCompleted: '更换完成', switchFailed: '更换失败', switchCancelled: '已取消更换',
+      notificationId: '通知编号', notificationLookup: '查找通知', notificationLoading: '正在读取通知索引…',
       runSection: '后台运行记录', runStateFilter: '通知状态', runSourceFilter: '运行来源', runAll: '全部',
       runSilent: '未通知', runWaiting: '待发送或汇总', runSent: '通道已接受', runFailed: '发送失败', runUnsent: '无发送记录',
       runTimer: '提醒', runResult: '有结果', runExecutionFailed: '执行失败', runBlocked: '需要介入', runTask: '查看关联任务',
@@ -431,7 +462,6 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       replyShortcut: 'Enter 提交，Shift+Enter 换行',
       answerBtn: '回复',
 
-      acceptBtn: '验收通过',
       retryTicketBtn: '重新尝试',
       cancelTicketBtn: '取消任务',
       cancelDone: '已取消，任务关闭',
@@ -529,7 +559,6 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       retriedNotice: '已重投 {count} 条，回到投递队列',
       confirmDone: '已记录确认',
       rejectDone: '已拒绝，任务转被卡住',
-      acceptDone: '已验收通过',
       batchConfirmed: '已批量确认 {count} 条',
       batchRejected: '已批量拒绝 {count} 条',
       answerDone: '已提交回复',
@@ -575,6 +604,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       loadFailed: 'Load failed',
       retry: 'Retry',
       statusSection: 'Overview',
+      connectionsSection: 'Connections',
+      outcomesSection: 'Results',
+      openReport: 'View report and details',
+      noResults: 'No results yet.',
+      nextWake: 'Next wake-up',
+      noWake: 'No follow-ups scheduled.',
+      ticketUnavailable: 'This ticket is unavailable.',
       boardNavigation: 'Hub Bot section navigation',
       feishuCard: 'Feishu',
       githubCard: 'GitHub watch',
@@ -757,6 +793,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       intakeFailed: 'delivery failed',
       intakeDiscarded: 'delivery discarded',
       timersSection: 'Follow-ups',
+      switchWait: 'Replace when idle', switchStop: 'Stop and replace', switchStopConfirm: 'Stop the current owner turn and replace its session once it is idle?',
+      switchCancel: 'Cancel waiting', switchRetryArchive: 'Retry archiving', switchOpenPrevious: 'Open previous session',
+      switchWaiting: 'Waiting for current session to go idle', switchPreparing: 'Preparing a new session', switchCommitted: 'New session is current, awaiting archive',
+      switchArchiveFailed: 'Previous session could not be archived', switchCompleted: 'Replacement complete', switchFailed: 'Replacement failed', switchCancelled: 'Replacement cancelled',
+      notificationId: 'Notification ID', notificationLookup: 'Find notification', notificationLoading: 'Loading notification index…',
       runSection: 'Background runs', runStateFilter: 'Notification status', runSourceFilter: 'Run source', runAll: 'All',
       runSilent: 'Silent', runWaiting: 'Awaiting send or summary', runSent: 'Accepted by channel', runFailed: 'Delivery failed', runUnsent: 'No delivery record',
       runTimer: 'Reminder', runResult: 'Result available', runExecutionFailed: 'Work failed', runBlocked: 'Needs attention', runTask: 'Open linked task',
@@ -819,7 +860,6 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       replyShortcut: 'Enter to send. Shift+Enter for a new line.',
       answerBtn: 'Reply',
 
-      acceptBtn: 'Accept',
       retryTicketBtn: 'Retry',
       cancelTicketBtn: 'Cancel task',
       cancelDone: 'Cancelled — the task is closed',
@@ -917,7 +957,6 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       retriedNotice: 'Requeued {count} row(s) to the delivery queue',
       confirmDone: 'Approval recorded',
       rejectDone: 'Rejected, ticket blocked',
-      acceptDone: 'Accepted',
       batchConfirmed: 'Confirmed {count} ticket(s)',
       batchRejected: 'Rejected {count} ticket(s)',
       answerDone: 'Reply submitted',
@@ -1141,6 +1180,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       });
       // 第二段：namespace 就绪后（服务 key remote.hubBotSettings 出现）再注册字典与配置表单。
       ctx.inject(['remote.hubBotSettings', 'slots', 'locale'], function (scoped) {
+        var ownerLinkError = null;
+        var ownerLinkListeners = new Set();
         scoped.effect(function () {
           return scoped.locale.register(NS, { zh: zh, en: en });
         }, 'hub-bot: dictionaries');
@@ -1184,8 +1225,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
         var tableStyle = { width: '100%', borderCollapse: 'collapse', fontSize: '13px' };
         var thStyle = { textAlign: 'left', padding: '6px 8px', opacity: 0.65, fontSize: '12px', borderBottom: '1px solid var(--dsh-border, rgba(127,127,127,0.3))' };
         var tdStyle = { padding: '7px 8px', borderBottom: '1px solid var(--dsh-border, rgba(127,127,127,0.15))', verticalAlign: 'top' };
-        var NEEDS_ME = ['person/confirm', 'person/answer', 'person/review', 'blocked', 'failed'];
-        var STAGE_ORDER = ['person/confirm', 'person/answer', 'person/review', 'blocked', 'failed', 'working', 'queued', 'idle', 'done', 'canceled'];
+        var NEEDS_ME = ['person/answer', 'person/confirm', 'person/review', 'blocked', 'failed'];
+        var STAGE_ORDER = [...NEEDS_ME, 'working', 'queued', 'idle', 'done', 'canceled'];
         var STAGE_TONE = {
           'person/confirm': 'amber', 'person/answer': 'amber', 'person/review': 'amber',
           working: 'blue', queued: 'gray', blocked: 'red', failed: 'red',
@@ -1817,6 +1858,26 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
         var runStateLabels = { silent: 'runSilent', waiting: 'runWaiting', sent: 'runSent', failed: 'runFailed', 'in-progress': 'runUnsent' };
         var runResultLabels = { result: 'runResult', failure: 'runExecutionFailed', blocked: 'runBlocked' };
 
+        function TicketFacts({ ticket, render, generationId }) {
+          var t = scoped.locale.bind(NS);
+          var [reading, setReading] = React.useState(null);
+          var [attempt, retry] = React.useState(0);
+          React.useEffect(function () {
+            var current = true;
+            setReading(null);
+            if (!generationId) return;
+            void scoped.remote.hubBotSettings.ticketDetail(ticket.id).then(unwrap).then(detail => {
+              if (!detail) throw new Error(t('ticketUnavailable'));
+              if (current) setReading({ detail });
+            }).catch(error => { if (current) setReading({ error: error?.message ?? String(error) }); });
+            return () => { current = false; };
+          }, [ticket.id, ticket.updatedAt, generationId, attempt]);
+          if (!generationId) return h('p', { role: 'status' }, t('monitorDisconnected'));
+          if (reading?.error) return h('div', null, h('p', { role: 'alert' }, t('loadFailed') + ' · ' + reading.error),
+            h('button', { type: 'button', style: settingsButtonStyle, onClick: () => retry(value => value + 1) }, t('retry')));
+          return reading?.detail ? render(reading.detail) : h('p', { role: 'status', style: settingsHintStyle }, t('loading'));
+        }
+
         function RunHistoryRow({ run, onTask, onWorker, t }) {
           var [open, setOpen] = React.useState(false);
           var [detail, setDetail] = React.useState(null);
@@ -1855,7 +1916,31 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 [notice.channel, notice.channelAccepted ? t('runSent') : t(runStateLabels[notice.state] ?? (['held', 'queued', 'recorded'].includes(notice.state) ? 'runWaiting' : 'runUnsent')), date(notice.acceptedAt)].filter(Boolean).join(' · ')))) : null);
         }
 
-        function RunHistory({ onTask, onWorker }) {
+        function NotificationLookup({ onTask, t }) {
+          var [id, setId] = React.useState('');
+          var [state, setState] = React.useState({});
+          async function lookup(event) {
+            event.preventDefault();
+            if (!id.trim() || state.loading) return;
+            setState({ loading: true });
+            try {
+              var detail = unwrap(await scoped.remote.hubBotSettings.notificationDetail({ id: id.trim() }));
+              setState({ detail });
+            } catch (error) {
+              setState({ error: error?.message ?? String(error) });
+            }
+          }
+          return h('div', { style: { margin: '8px 0' } },
+            h('form', { onSubmit: lookup, style: { display: 'flex', flexWrap: 'wrap', gap: '6px 8px', alignItems: 'center' } },
+              h('label', null, t('notificationId'), ' ', h('input', { type: 'text', value: id, onChange: event => setId(event.target.value), required: true, maxLength: 200, style: settingsInputStyle })),
+              h('button', { type: 'submit', style: settingsButtonStyle, disabled: state.loading }, t('notificationLookup'))),
+            state.loading ? h('p', { role: 'status' }, t('notificationLoading')) : null,
+            state.error ? h('p', { role: 'alert' }, state.error) : null,
+            state.detail ? h('ul', null, state.detail.tickets.map(ticket => h('li', { key: ticket.ticketId },
+              h('button', { type: 'button', style: settingsButtonStyle, onClick: () => onTask(ticket.ticketId) }, t('runTask') + ' ' + ticket.ticketId)))) : null);
+        }
+
+        function RunHistory({ onTask, onWorker, active }) {
           var t = scoped.locale.bind(NS);
           var [status, setStatus] = React.useState('');
           var [source, setSource] = React.useState('');
@@ -1864,6 +1949,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var [page, setPage] = React.useState(null);
           var [error, setError] = React.useState(null);
           React.useEffect(function () {
+            if (!active) return;
             var current = true;
             setPage(null);
             setError(null);
@@ -1872,7 +1958,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               if (current) setPage(value);
             }).catch(error => { if (current) setError(error?.message ?? String(error)); });
             return () => { current = false; };
-          }, [source, status, offset, refresh]);
+          }, [source, status, offset, refresh, active]);
           function select(label, value, options, setValue) {
             return h('label', null, t(label), ' ', h('select', { style: settingsButtonStyle, value, onChange: event => {
               setOffset(0); setValue(event.target.value);
@@ -1884,6 +1970,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               select('runStateFilter', status, [['', 'runAll'], ...Object.entries(runStateLabels)], setStatus),
               select('runSourceFilter', source, [['', 'runAll'], ['github', 'kindGitHub'], ['timer', 'runTimer']], setSource),
               h('button', { type: 'button', style: settingsButtonStyle, onClick: () => setRefresh(value => value + 1) }, t('runRefresh'))),
+            h(NotificationLookup, { onTask, t }),
             error ? h('p', { role: 'alert' }, error) : !page ? h('p', { style: settingsHintStyle }, t('runLoading')) : null,
             page && page.runs.length === 0 ? h('p', { style: settingsHintStyle }, t('runEmpty')) : null,
             ...(page?.runs ?? []).map(run => h(RunHistoryRow, { key: run.id, run, onTask, onWorker, t })),
@@ -1892,19 +1979,48 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
         }
 
         var boardSections = [
-          ['hub-bot-overview-title', 'statusSection'], ['hub-bot-needs-title', 'needsCard'],
-          ['hub-bot-stream-title', 'ticketsSection'], ['hub-bot-timers-title', 'timersSection'], ['hub-bot-runs-title', 'runSection'], ['hub-bot-intake-title', 'intakeSection'],
-          ['hub-bot-recent-title', 'recentSection'],
-          ['hub-bot-owners-title', 'ownersSection'], ['hub-bot-settings', 'settingsDivider'],
+          ['hub-bot-overview-title', 'statusSection'], ['hub-bot-timers-title', 'timersSection'],
+          ['hub-bot-runs-title', 'runSection'], ['hub-bot-connections', 'connectionsSection'], ['hub-bot-settings', 'settingsDivider'],
         ];
         var boardScrollGap = 16;
+
+        var ownerSwitchLabels = {
+          waiting: 'switchWaiting', preparing: 'switchPreparing', committed: 'switchCommitted', 'archive-failed': 'switchArchiveFailed',
+          completed: 'switchCompleted', failed: 'switchFailed', cancelled: 'switchCancelled',
+        };
+
+        function OwnerSwitchControls({ owner, operation, onRefresh, onOldSession, t }) {
+          var [busy, setBusy] = React.useState(false);
+          var [error, setError] = React.useState(null);
+          async function act(request) {
+            if (busy || (request.mode === 'stop' && !window.confirm(t('switchStopConfirm')))) return;
+            setBusy(true);
+            setError(null);
+            try {
+              unwrap(await scoped.remote.hubBotSettings.ownerSwitchAction({ ownerId: owner.id, ...request }));
+              await onRefresh();
+            } catch (error) {
+              setError(error?.message ?? String(error));
+            } finally { setBusy(false); }
+          }
+          var pending = ['waiting', 'preparing', 'committed', 'archive-failed'].includes(operation?.status);
+          var newRequest = { action: 'request', expectedSessionId: owner.sessionId };
+          var button = (label, request) => h('button', { type: 'button', style: settingsButtonStyle, disabled: busy, onClick: () => void act(request) }, t(label));
+          return h('div', { style: { display: 'flex', gap: '6px 8px', flexWrap: 'wrap', alignItems: 'center' } },
+            owner.sessionId && !owner.recycled && !pending ? button('switchWait', { ...newRequest, mode: 'wait' }) : null,
+            owner.sessionId && !owner.recycled && !pending ? button('switchStop', { ...newRequest, mode: 'stop' }) : null,
+            operation ? h('span', { role: 'status', style: settingsHintStyle }, t(ownerSwitchLabels[operation.status] ?? 'switchFailed')) : null,
+            operation?.status === 'waiting' ? button('switchCancel', { action: 'cancel', operationId: operation.operationId }) : null,
+            operation?.status === 'archive-failed' ? button('switchRetryArchive', { action: 'retry-archive', operationId: operation.operationId }) : null,
+            operation?.committedAt && onOldSession ? h('button', { type: 'button', style: settingsButtonStyle, onClick: () => onOldSession(operation.oldSessionId) }, t('switchOpenPrevious')) : null,
+            error || operation?.reason ? h('p', { role: 'alert', style: { margin: 0, overflowWrap: 'anywhere' } }, error ?? operation.reason) : null);
+        }
 
         function HubBotPanelPage() {
           var t = scoped.locale.bind(NS);
           var boardRef = React.useRef(null);
           var navigationRef = React.useRef(null);
-          var sectionJump = React.useRef(null);
-          var [currentSection, setCurrentSection] = React.useState(boardSections[0][0]);
+          var [panelPage, setPanelPage] = React.useState(boardSections[0][0]);
           var vs = React.useState(null); var view = vs[0]; var setView = vs[1];
           var viewReadId = React.useRef(0);
           var os = React.useState(null); var owners = os[0]; var setOwners = os[1];
@@ -1937,12 +2053,17 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var [timerBusy, setTimerBusy] = React.useState(false);
           var [timerError, setTimerError] = React.useState(null);
           var [ownerSessionError, setOwnerSessionError] = React.useState(null);
+          var linkedOwnerError = React.useSyncExternalStore(listener => {
+            ownerLinkListeners.add(listener);
+            return () => ownerLinkListeners.delete(listener);
+          }, () => ownerLinkError);
           var ticketInFlight = React.useRef(false);
           var fts = React.useState(''); var filterText = fts[0]; var setFilterText = fts[1];
           var fss = React.useState(''); var filterStage = fss[0]; var setFilterStage = fss[1];
           var fos = React.useState(''); var filterOwner = fos[0]; var setFilterOwner = fos[1];
           var [streamTarget, setStreamTarget] = React.useState(null);
           var [openGroups, setOpenGroups] = React.useState({});
+          var [openTicketDetails, setOpenTicketDetails] = React.useState({});
           var streamHeading = React.useRef(null);
           var targetCard = React.useRef(null);
           React.useLayoutEffect(function () {
@@ -1952,7 +2073,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             if (!target) return;
             var details = card?.querySelector('[data-hb-ticket-details]');
             if (details) details.open = true;
-            focusBoardTarget(target, 'hub-bot-stream-title');
+            focusBoardTarget(target);
           }, [streamTarget]);
           var rks = React.useState(''); var recentKind = rks[0]; var setRecentKind = rks[1];
           var cps = React.useState(''); var copiedId = cps[0]; var setCopiedId = cps[1];
@@ -2156,7 +2277,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             if (ticketInFlight.current) return;
             var labels = {
               confirm: ['confirmBtn', 'confirmDone'], reject: ['rejectBtn', 'rejectDone'],
-              accept: ['acceptBtn', 'acceptDone'], retry: ['retryTicketBtn', 'retryDone'],
+              retry: ['retryTicketBtn', 'retryDone'],
               cancel: ['cancelTicketBtn', 'cancelDone'], answer: ['answerBtn', 'answerDone'],
             };
             var [actionLabel, successLabel] = labels[resolution];
@@ -2217,38 +2338,24 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             var board = boardRef.current;
             var navigation = navigationRef.current;
             if (!board || !navigation) return;
-            var headings = boardSections.map(([id]) => document.getElementById(id)).filter(Boolean);
-            function trackSection() {
-              var jump = sectionJump.current;
-              // An explicit jump can stop short of the requested heading when near the bottom.
-              if (jump && Math.abs(board.scrollTop - jump.top) < 1 && board.contains(jump.target)) return;
-              sectionJump.current = null;
-              var cutoff = navigation.getBoundingClientRect().bottom + boardScrollGap + 4;
-              var active = headings[0];
-              for (var heading of headings) {
-                if (heading.getBoundingClientRect().top <= cutoff) active = heading;
-              }
-              if (board.scrollTop > 0 && board.scrollHeight - board.clientHeight - board.scrollTop < 3) active = headings.at(-1);
-              if (active) setCurrentSection(active.id);
-            }
             function measureNavigation() {
               board.style.setProperty('--hb-nav-height', navigation.offsetHeight + 'px');
-              trackSection();
             }
             var resize = new ResizeObserver(measureNavigation);
             resize.observe(navigation);
-            resize.observe(board);
-            board.addEventListener('scroll', trackSection, { passive: true });
             measureNavigation();
-            return function () {
-              resize.disconnect();
-              board.removeEventListener('scroll', trackSection);
-            };
+            return () => resize.disconnect();
           }, [Boolean(view && owners && overview)]);
+
+          function switchPage(page) {
+            setPanelPage(page);
+            boardRef.current?.scrollTo({ top: 0, behavior: 'instant' });
+          }
 
           if (!view || !owners || !overview) {
             var initialError = settingsReadError || monitor.error;
-            return h('div', { style: { padding: '20px 24px' } }, initialError
+            return h('div', { style: { padding: '20px 24px' } },
+              linkedOwnerError ? h('p', { role: 'alert' }, linkedOwnerError) : null, initialError
               ? h(React.Fragment, null, h('p', { role: 'alert' }, t('loadFailed') + ' · ' + initialError),
                   h('button', { type: 'button', onClick: load, disabled: refreshing, style: settingsButtonStyle }, t('retry')))
               : h('p', { role: 'status' }, t(connectionState === 'connecting' ? 'monitorReconnecting' : 'loading')));
@@ -2260,14 +2367,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var feishuStatus = feishuPresentation(fs.enabled ?? feishu.enabled, fs);
           var feishuOn = feishuStatus.stage === 'done';
           var feishuText = t(feishuStatus.label);
-          var feishuColor = TONES[STAGE_TONE[feishuStatus.stage]].fg;
           var github = overview.health?.github || view.github?.status || view.github || {};
           var followed = github.followed || [];
           var githubProblems = github.enabled ? githubProblemCount(github) : 0;
           var githubText = !github.enabled ? t('disabled') : followed.length ? fill(t('watching'), followed.length) : t('githubNoRepos');
-          var githubColor = githubProblems ? TONES.amber.fg : followed.length && github.enabled ? TONES.blue.fg : TONES.muted.fg;
           // 副标（turn 109 信息密度）: 飞书卡显示 bot 名；负责人卡显示活跃会话数。
-          var feishuSub = feishuOn && fs.bot && fs.bot.name ? fs.bot.name : null;
           // 未受理消息可见性（round 26）: 状态卡直接提示最近一条 dropped，省得翻到最近消息区才发现。
           var lastDropped = (overview.recentTriggers || []).find(tr => tr.kind === 'feishu' && tr.dropped);
           var activeSessions = owners.filter(function (o) { return !!o.sessionId; }).length;
@@ -2275,11 +2379,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var cardSubStyle = { fontSize: '11px', opacity: 0.6, marginTop: '2px', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' };
 
           var tickets = overview.tickets || [];
-          var NEEDS_PRIORITY = { 'person/confirm': 0, 'person/answer': 1, 'person/review': 2, failed: 3, blocked: 4 };
-          var needs = tickets.filter(function (tk) { return NEEDS_ME.indexOf(tk.stage) >= 0; })
-            .map(function (tk, i) { return { tk: tk, i: i }; })
-            .sort(function (a, b) { var d = (NEEDS_PRIORITY[a.tk.stage] !== undefined ? NEEDS_PRIORITY[a.tk.stage] : 5) - (NEEDS_PRIORITY[b.tk.stage] !== undefined ? NEEDS_PRIORITY[b.tk.stage] : 5); return d !== 0 ? d : a.i - b.i; })
-            .map(function (x) { return x.tk; });
+          var needs = tickets.filter(ticket => NEEDS_ME.includes(ticket.stage));
           var confirmable = needs.filter(function (tk) { return tk.stage === 'person/confirm'; });
           // 状态卡第四张（round 32）: 待办计数 + 阶段分解副标。
           var needsStages = [];
@@ -2329,7 +2429,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var presentStages = STAGE_ORDER.filter(st => tickets.some(ticket => ticket.stage === st));
           var visibleStages = presentStages.filter(st => filtered.some(ticket => ticket.stage === st));
           function groupIsOpen(stage) {
-            return openGroups[stage] ?? (NEEDS_ME.includes(stage) || filterActive);
+            return openGroups[stage] ?? (stage === 'working' || stage === 'queued' || filterActive);
           }
           var allGroupsOpen = visibleStages.length > 0 && visibleStages.every(groupIsOpen);
           function toggleGroups() {
@@ -2338,6 +2438,11 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           var healthItems = healthProblems(overview.health || {}, t);
 
           var recent = overview.recentTriggers || [];
+          var nextTimer = (overview.timers || []).filter(timer => timer.status === 'pending' && timer.fireAt)
+            .sort((a, b) => a.fireAt.localeCompare(b.fireAt))[0];
+          var recentResults = tickets.filter(ticket => ticket.report)
+            .sort((a, b) => String(b.report.at ?? b.updatedAt ?? '').localeCompare(String(a.report.at ?? a.updatedAt ?? '')))
+            .slice(0, 12);
           // S06 投喂口径（只读）: 只把 overview.intake 里已落库的事实念出来——没有输入框、没有保存按钮，
           // 缺记录就显示 —（不猜、不补、不伪造处置结果）。
           var intakeSources = (overview.intake && overview.intake.sources) || [];
@@ -2500,6 +2605,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             resetStreamTarget();
           }
           function openStream({ ticketId = null, ownerId = '', stage = '' }) {
+            setPanelPage(boardSections[0][0]);
+            if (ticketId) setOpenTicketDetails(current => ({ ...current, ['stream:' + ticketId]: true }));
             setFilterText('');
             setFilterStage(stage);
             setFilterOwner(ownerId);
@@ -2536,7 +2643,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             } catch (e) { /* 剪贴板不可达就算了 */ }
           };
 
-          function focusBoardTarget(target, section) {
+          function focusBoardTarget(target) {
             var board = boardRef.current;
             var navigation = navigationRef.current;
             if (!board?.contains(target) || !navigation) return;
@@ -2545,28 +2652,29 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             var top = board.scrollTop + target.getBoundingClientRect().top - board.getBoundingClientRect().top
               - navigation.offsetHeight - boardScrollGap - (status?.offsetHeight ?? 0);
             board.scrollTo({ top, behavior: 'instant' });
-            sectionJump.current = { top: board.scrollTop, target };
-            setCurrentSection(section);
           }
-          function scrollToSection(id, section = id) {
+          function scrollToSection(id) {
             var target = document.getElementById(id);
-            if (target) focusBoardTarget(target, section);
+            if (target) focusBoardTarget(target);
           }
-          function statusCard(id, label, value, color, details, section = id) {
+          function statusCard(id, label, value, color, details) {
             return h('button', { type: 'button', className: 'hb-status-card',
-              'aria-controls': id, onClick: () => scrollToSection(id, section), title: t('cardJumpHint'),
+              'aria-controls': id, onClick: () => scrollToSection(id), title: t('cardJumpHint'),
               style: Object.assign({}, cardStyle, { color: 'inherit', textAlign: 'start', cursor: 'pointer' }),
             },
               h('span', { style: Object.assign({ display: 'block' }, cardTitleStyle) }, t(label)),
               h('span', { style: cardValueStyle }, color ? dot(color) : null, value), details);
           }
 
-          function openOwnerSession(owner) {
+          async function openOwnerSession(owner) {
             setOwnerSessionError(null);
             try {
               var workspace = scoped.get('uiWorkspace');
               if (typeof workspace?.openSession !== 'function') throw new Error(t('ownerSessionUnavailable'));
-              workspace.openSession(owner.sessionId);
+              var rows = unwrap(await scoped.remote.hubBotSettings.listOwners());
+              var current = rows.find(row => row.id === owner.id);
+              if (!current?.sessionId) throw new Error(t('sessionNone'));
+              await workspace.openSession(current.sessionId);
             } catch (error) {
               setOwnerSessionError({ ownerId: owner.id, sessionId: owner.sessionId, message: error?.message || String(error) });
             }
@@ -2625,6 +2733,9 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                   }, copiedId === sessionKey ? t('copiedBtn') : t('copySessionButton'))) : null,
                 sessionError ? h('div', { role: 'alert', style: { flexBasis: '100%', color: 'var(--dsw-alias-state-error-primary)', fontSize: '12px', overflowWrap: 'anywhere' } },
                   t('openSessionFailed') + ' · ' + sessionError) : null),
+              h(OwnerSwitchControls, { owner, t, operation: (overview.ownerSwitches ?? []).find(row => row.ownerId === owner.id),
+                onRefresh: () => scoped.remote.hubBotSettings.overview().then(unwrap).then(publishOverview),
+                onOldSession: canOpenOwnerSession ? sessionId => openOwnerSession({ id: owner.id, sessionId }) : null }),
               current ? h('button', { type: 'button', className: 'hb-text-action', onClick: () => openStream({ ticketId: current.id }),
                 title: current.message || current.id, 'aria-label': fill(t('openTicketLabel'), current.id) + (current.message ? ' · ' + current.message : ''),
                 style: { fontSize: '12px', alignSelf: 'start', maxWidth: '100%' },
@@ -2672,7 +2783,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
 
           var ticketRowItem = function (tk, scope, isTarget, archiveDetails) {
             var rows = [];
-            var inlineActions = scope === 'needs' || tk.stage === 'idle' || tk.stage === 'queued';
+            var reviewing = tk.stage === 'person/review';
+            var inlineActions = scope === 'needs' || reviewing || tk.stage === 'idle' || tk.stage === 'queued';
+            var detailKey = scope + ':' + tk.id;
+            var detailsOpen = archiveDetails || (openTicketDetails[detailKey] ?? Boolean(isTarget));
             if (!archiveDetails) rows.push(h('div', { key: 'head', style: { display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0 } },
               stagePill(tk.stage, tk.stageText || tk.stage),
               tk.trigger && tk.trigger.kind
@@ -2747,27 +2861,16 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               rows.push(h('p', { key: 'deferred-result', style: settingsHintStyle },
                 [answerStatusKey && t(answerStatusKey), decisionNote].filter(Boolean).join(' · ')));
             }
-            if (tk.deferred?.answer) rows.push(h('details', { key: 'deferred-answer-text', style: settingsHintStyle },
-              h('summary', null, t('deferredAnswer')), h('p', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } }, tk.deferred.answer)));
-            var report = tk.report ? h(TicketReport, { key: 'report', report: tk.report,
-              copied: copiedId === 'rp:' + tk.id, copy: text => copyText(text, 'rp:' + tk.id),
-            }) : null;
-            if (tk.stage === 'person/review' && report) rows.push(report);
-            // 结果在哪（三问之一）: 等验收票的产物目录——投影层早已产出 dirListing，这里补上渲染。
-            if (tk.stage === 'person/review' && Array.isArray(tk.dirListing) && tk.dirListing.length > 0) {
-              rows.push(h('div', { key: 'art', style: { marginTop: '8px' } },
-                h('div', { style: { fontSize: '11px', opacity: 0.55, marginBottom: '4px' } }, t('artifactsLabel')),
-                h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px', maxHeight: '88px', overflowY: 'auto' } },
-                  tk.dirListing.map(function (name, i) {
-                    var isDir = name.endsWith('/');
-                    return h('span', { key: i, style: {
-                      fontFamily: 'monospace', fontSize: '11px', padding: '1px 7px', borderRadius: '5px',
-                      background: 'rgba(127,127,127,0.08)', border: '1px solid rgba(127,127,127,0.16)',
-                      color: isDir ? TONES.blue.fg : 'inherit', opacity: isDir ? 1 : 0.8,
-                    } }, name);
-                  }))));
-            }
+            if (tk.attentionReason) rows.push(h('p', { key: 'attention', style: settingsHintStyle }, tk.attentionReason));
+            if (reviewing && tk.report?.summary) rows.push(h('p', { key: 'report-preview',
+              style: { margin: '6px 0', fontSize: '13px', overflowWrap: 'anywhere' } }, tk.report.summary));
             var actions = [];
+            if (reviewing && tk.ownerSessionId && canOpenOwnerSession) {
+              actions.push(h('button', { key: 'owner-session', type: 'button', style: settingsButtonStyle,
+                onClick: () => openOwnerSession({ id: tk.owner, sessionId: tk.ownerSessionId }),
+                'aria-label': fill(t('openOwnerSession'), ownerFilterLabel(tk.owner)),
+              }, t('openSessionButton')));
+            }
             function actionButton(resolution, label, tone, disabled) {
               return h('button', { key: resolution, type: 'button', disabled: ticketBusy || disabled,
                 onClick: () => resolve(tk, resolution, scope),
@@ -2785,10 +2888,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               actions.push(actionButton('retry', 'retryTicketBtn', TONES.blue));
             }
             if (tk.stage === 'person/answer' || tk.stage === 'person/review') {
-              var reviewing = tk.stage === 'person/review';
               var inputLabel = t(reviewing ? 'reworkPlaceholder' : 'answerPlaceholder');
               var draft = answers[tk.id] || '';
-              if (reviewing) actions.push(actionButton('accept', 'acceptBtn', TONES.green));
               actions.push(h('textarea', { key: 'reply', rows: 2,
                 style: Object.assign({}, settingsInputStyle, { flex: '1 1 180px', minWidth: 0, padding: '5px 10px', fontSize: '13px', resize: 'vertical' }),
                 value: draft, disabled: ticketBusy, placeholder: inputLabel, 'aria-label': inputLabel,
@@ -2809,24 +2910,27 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               style: { marginTop: '8px', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' },
             }, actions) : null;
             if (inlineActions && actionBar) rows.push(actionBar);
-            // 时间线（round 11）: 创建→分派→提问→确认→报告→当前，按时间排序。
-            // 字段以 tasks.js 为准： report.summary / pendingConfirm.text / assignment.endReason。
-            var evs = [];
-            if (tk.createdAt) evs.push({ at: tk.createdAt, tone: 'muted', label: t('tlCreated'), detail: tk.authorization ? tk.authorization.actor + ' · ' + tk.authorization.source : null });
-            (tk.assignments || []).forEach(function (a) {
-              if (a.at) evs.push({ at: a.at, tone: 'blue', label: t('tlAssign'), detail: a.sessionId ? String(a.sessionId).replace(/^session-/, '').slice(0, 8) : null, copy: a.sessionId || null });
-              if (a.endedAt) evs.push({ at: a.endedAt, tone: 'muted', label: t('tlAssignEnd'), detail: a.endReason || null });
-            });
-            if (tk.question && tk.question.at) evs.push({ at: tk.question.at, tone: 'amber', label: t('tlQuestion'), detail: tk.question.text });
-            if (tk.pendingConfirm && tk.pendingConfirm.at) evs.push({ at: tk.pendingConfirm.at, tone: 'amber', label: t('tlConfirm'), detail: tk.pendingConfirm.text });
-            if (tk.report && tk.report.at) evs.push({ at: tk.report.at, tone: 'blue', label: t('tlReport'), detail: tk.report.summary || '' });
-            evs.push({ at: tk.updatedAt || tk.createdAt, tone: STAGE_TONE[tk.stage] || 'gray', label: tk.stageText || tk.stage, detail: null, current: true });
-            evs.sort(function (a, b) { return String(a.at || '').localeCompare(String(b.at || '')); });
-            rows.push(h(archiveDetails ? 'div' : 'details', { key: 'd', 'data-hb-ticket-details': '',
-              open: isTarget || undefined, style: { marginTop: '6px', fontSize: '12px' },
-            },
-              archiveDetails ? null : h('summary', { style: { cursor: 'pointer' } }, t(!inlineActions && actionBar ? 'detailActionsToggle' : 'detailToggle')),
-              inlineActions ? null : actionBar,
+            if (reviewing && ownerSessionError?.ownerId === tk.owner && ownerSessionError.sessionId === tk.ownerSessionId) {
+              rows.push(h('p', { key: 'session-error', role: 'alert', style: settingsHintStyle },
+                t('openSessionFailed') + ' · ' + ownerSessionError.message));
+            }
+            function renderFacts(detail) {
+              var evs = [];
+              if (detail.createdAt) evs.push({ at: detail.createdAt, tone: 'muted', label: t('tlCreated'), detail: detail.authorization ? detail.authorization.actor + ' · ' + detail.authorization.source : null });
+              (detail.assignments || []).forEach(function (a) {
+                if (a.startedAt || a.at) evs.push({ at: a.startedAt ?? a.at, tone: 'blue', label: t('tlAssign'), detail: a.sessionId ? String(a.sessionId).replace(/^session-/, '').slice(0, 8) : null, copy: a.sessionId || null });
+                if (a.endedAt) evs.push({ at: a.endedAt, tone: 'muted', label: t('tlAssignEnd'), detail: a.endedReason ?? a.endReason ?? null });
+              });
+              if (detail.question && detail.question.at) evs.push({ at: detail.question.at, tone: 'amber', label: t('tlQuestion'), detail: detail.question.text });
+              if (detail.pendingConfirm && detail.pendingConfirm.at) evs.push({ at: detail.pendingConfirm.at, tone: 'amber', label: t('tlConfirm'), detail: detail.pendingConfirm.text });
+              if (detail.report && detail.report.at) evs.push({ at: detail.report.at, tone: 'blue', label: t('tlReport'), detail: detail.report.summary || '' });
+              evs.push({ at: detail.updatedAt || detail.createdAt, tone: STAGE_TONE[detail.stage] || 'gray', label: detail.stageText || detail.stage, detail: null, current: true });
+              evs.sort(function (a, b) { return String(a.at || '').localeCompare(String(b.at || '')); });
+              return h(React.Fragment, null,
+                detail.message ? h('div', { style: { marginTop: '6px', overflowWrap: 'anywhere' } },
+                  h('strong', null, t('messageOriginal')), h('p', { style: { margin: '3px 0', whiteSpace: 'pre-wrap' } }, detail.message)) : null,
+                detail.deferred?.answer ? h('p', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } },
+                  h('strong', null, t('deferredAnswer')), ' · ', detail.deferred.answer) : null,
               h('div', { style: { marginTop: '6px', paddingLeft: '4px', display: 'flex', flexDirection: 'column' } },
                 evs.map(function (ev, i) {
                   var tone = TONES[ev.tone] || TONES.gray;
@@ -2852,12 +2956,14 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     }, ev.detail) : null);
                   return gapRow ? [gapRow, evRow] : evRow;
                 })),
-               tk.stage !== 'person/review' ? report : null,
-               tk.stage !== 'person/review' && Array.isArray(tk.dirListing) && tk.dirListing.length > 0
+                detail.report ? h(TicketReport, { report: detail.report,
+                  copied: copiedId === 'rp:' + detail.id, copy: text => copyText(text, 'rp:' + detail.id),
+                }) : null,
+               Array.isArray(detail.dirListing) && detail.dirListing.length > 0
                  ? h('div', { style: { marginTop: '8px' } },
-                     h('div', { style: { fontSize: '11px', opacity: 0.55, marginBottom: '4px' } }, t('artifactsWorkingLabel')),
+                     h('div', { style: { fontSize: '11px', opacity: 0.55, marginBottom: '4px' } }, t(detail.stage === 'person/review' ? 'artifactsLabel' : 'artifactsWorkingLabel')),
                      h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px', maxHeight: '88px', overflowY: 'auto' } },
-                       tk.dirListing.map(function (name, i) {
+                       detail.dirListing.map(function (name, i) {
                          var isDir = name.endsWith('/');
                          return h('span', { key: i, style: {
                            fontFamily: 'monospace', fontSize: '11px', padding: '1px 7px', borderRadius: '5px',
@@ -2867,17 +2973,30 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                        })))
                  : null,
                h('div', { style: { marginTop: '4px', display: 'flex', alignItems: 'center', gap: '8px' } },
-                 h('span', { style: { opacity: 0.5, fontFamily: 'monospace', fontSize: '11px' } }, tk.id),
-                  archiveDetails ? ownerFilterButton(tk.owner, t('ownerTicketsButton'), { fontSize: '11px' }) : null,
+                 h('span', { style: { opacity: 0.5, fontFamily: 'monospace', fontSize: '11px' } }, detail.id),
+                  archiveDetails ? ownerFilterButton(detail.owner, t('ownerTicketsButton'), { fontSize: '11px' }) : null,
                  h('button', {
-                   onClick: function (ev) { ev.preventDefault(); copyTicketId(tk.id); },
+                   onClick: function (ev) { ev.preventDefault(); copyTicketId(detail.id); },
                    title: t('copyIdHint'),
                    style: { fontSize: '10px', padding: '0 7px', borderRadius: '5px', cursor: 'pointer',
-                     background: copiedId === tk.id ? 'rgba(70,180,100,0.14)' : 'rgba(127,127,127,0.1)',
-                     color: copiedId === tk.id ? TONES.green.fg : 'inherit',
-                     border: '1px solid ' + (copiedId === tk.id ? TONES.green.border : 'rgba(127,127,127,0.25)'),
-                     opacity: copiedId === tk.id ? 1 : 0.6 },
-                 }, copiedId === tk.id ? t('copiedBtn') : t('copyIdBtn')))));
+                     background: copiedId === detail.id ? 'rgba(70,180,100,0.14)' : 'rgba(127,127,127,0.1)',
+                     color: copiedId === detail.id ? TONES.green.fg : 'inherit',
+                     border: '1px solid ' + (copiedId === detail.id ? TONES.green.border : 'rgba(127,127,127,0.25)'),
+                     opacity: copiedId === detail.id ? 1 : 0.6 },
+                 }, copiedId === detail.id ? t('copiedBtn') : t('copyIdBtn'))));
+            }
+            rows.push(h(archiveDetails ? 'div' : 'details', { key: 'd', 'data-hb-ticket-details': '',
+              open: detailsOpen || undefined, style: { marginTop: '6px', fontSize: '12px' },
+              onToggle: archiveDetails ? undefined : event => {
+                if (event.target !== event.currentTarget) return;
+                var open = event.currentTarget.open;
+                if (open !== detailsOpen) setOpenTicketDetails(current => ({ ...current, [detailKey]: open }));
+              },
+            },
+              archiveDetails ? null : h('summary', { style: { cursor: 'pointer' } },
+                t(tk.report ? 'openReport' : !inlineActions && actionBar ? 'detailActionsToggle' : 'detailToggle')),
+              detailsOpen && !inlineActions ? actionBar : null,
+              detailsOpen ? h(TicketFacts, { ticket: tk, generationId: generation?.id, render: renderFacts }) : null));
             var stageTone = TONES[STAGE_TONE[tk.stage] || 'gray'];
             var isHover = hoverTicket === tk.id;
             return h('div', {
@@ -2923,13 +3042,22 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 gap: '4px', padding: '8px 0', marginBottom: '12px', borderBottom: '1px solid var(--dsw-alias-border-l2)',
                 background: 'var(--dsw-alias-card-fill)' },
             }, boardSections.map(function ([id, label]) {
-              var active = currentSection === id;
+              var active = panelPage === id;
               return h('button', { key: id, type: 'button', className: 'hb-nav-button', 'data-hb-section': id,
-                'aria-controls': id, 'aria-current': active ? 'location' : undefined, onClick: () => scrollToSection(id),
+                'aria-controls': id, 'aria-current': active ? 'page' : undefined, onClick: () => switchPage(id),
                 style: { fontSize: '12px', fontWeight: 500, whiteSpace: 'nowrap', padding: '5px 9px', border: 0, borderRadius: '6px',
                   cursor: 'pointer', background: active ? 'var(--dsw-alias-state-business-tertiary)' : 'transparent', color: 'inherit' },
               }, t(label));
-            })),
+             }), h('button', { type: 'button', className: 'hb-text-action',
+               onClick: () => switchPage('hub-bot-connections'),
+               style: { marginInlineStart: 'auto', fontSize: '11px', whiteSpace: 'normal', color: 'var(--dsw-alias-label-secondary)' },
+             }, t('feishuCard') + ' ' + feishuText + ' · ' + t('githubCard') + ' ' + githubText
+               + (githubProblems ? ' · ' + t('githubWatchProblems').replace('{count}', String(githubProblems)) : ''))),
+             linkedOwnerError ? h('p', { role: 'alert' }, linkedOwnerError) : null,
+             panelPage !== 'hub-bot-overview-title' && (monitorStale || settingsReadError)
+               ? h('p', { role: 'status', style: settingsHintStyle },
+                   !generation ? t('monitorDisconnected') : (monitor.error || settingsReadError || t('monitorWaiting'))) : null,
+             h('div', { hidden: panelPage !== 'hub-bot-overview-title' },
             h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px 16px', flexWrap: 'wrap', marginBottom: '8px' } },
               h('div', { style: { display: 'flex', alignItems: 'baseline', gap: '8px', flexWrap: 'wrap' } },
                 h('h2', { id: 'hub-bot-overview-title', tabIndex: -1, className: 'hb-scroll-target', style: { fontSize: '17px', fontWeight: 600, margin: 0 } }, t('title')),
@@ -2953,16 +3081,13 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             h('div', { id: 'hub-bot-self-test-status', role: 'status', style: { margin: '0 0 14px', fontSize: '12px',
               color: selfTestResult?.stage === 'error' ? TONES.red.fg : selfTestResult?.stage === 'success' ? TONES.green.fg : 'inherit',
             } }, selfTestResult ? t(selfTestResult.label) + (selfTestResult.detail ? ' · ' + selfTestResult.detail : '') : t(feishuOn ? 'selfTestHint' : 'selfTestNeedsConnection')),
-            h('div', { style: cardRowStyle },
-              statusCard('hub-bot-feishu-title', 'feishuCard', feishuText, feishuColor, h(React.Fragment, null,
-                feishuSub ? h('span', { style: cardSubStyle }, feishuSub) : null,
-                lastDropped ? h('span', { style: Object.assign({}, cardSubStyle, { color: TONES.amber.fg, opacity: 0.85 }), title: lastDropped.message || '' },
-                  t('droppedCardHint') + ' ' + relTime(t, lastDropped.at) + ' · ' + String(lastDropped.dropped).slice(0, 24)) : null), 'hub-bot-settings'),
-              statusCard('hub-bot-github-title', 'githubCard', githubText, githubColor,
-                githubProblems ? h('span', { style: cardSubStyle }, fill(t('githubWatchProblems'), githubProblems)) : null, 'hub-bot-settings'),
-              statusCard('hub-bot-owners-title', 'ownersCard', String(owners.length), null, h('span', { style: cardSubStyle }, ownersSub)),
-              statusCard('hub-bot-needs-title', 'needsCard', String(needs.length), needs.length > 0 ? TONES.amber.fg : TONES.green.fg,
-                h('span', { style: cardSubStyle }, needsCardSub))),
+             h('div', { style: cardRowStyle },
+               statusCard('hub-bot-needs-title', 'needsCard', String(needs.length), needs.length > 0 ? TONES.amber.fg : TONES.green.fg,
+                 h('span', { style: cardSubStyle }, needsCardSub)),
+               statusCard('hub-bot-owners-title', 'ownersCard', String(owners.length), null, h('span', { style: cardSubStyle }, ownersSub)),
+               statusCard('hub-bot-recent-title', 'recentSection', String(recent.length), null, lastDropped
+                 ? h('span', { style: Object.assign({}, cardSubStyle, { color: TONES.amber.fg }), title: lastDropped.message || '' },
+                   t('droppedCardHint') + ' ' + relTime(t, lastDropped.at) + ' · ' + String(lastDropped.dropped).slice(0, 24)) : null)),
             h(DeliveryHealth, { health: overview.health || {}, alerts: healthItems, stale: monitorStale,
               tickets: ticketById, unprocessed: overview.unprocessedTriggers || 0, onTicket: ticketId => openStream({ ticketId }),
               onMessages: recent.some(row => row.unprocessed) ? () => {
@@ -3070,7 +3195,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 : visibleStages.map(function (stage) {
                     var list = filtered.filter(ticket => ticket.stage === stage);
                     var open = groupIsOpen(stage);
-                    var shown = filterActive || expandedGroups[stage] ? list : list.slice(0, 12);
+                    var shown = open ? list.slice(0, expandedGroups[stage] ?? 12) : [];
                     var rows = shown.map(function (tk) {
                       var isTarget = tk.id === focusedTicketId;
                       if (tk.stage !== 'done' || isTarget) return ticketRowItem(tk, 'stream', isTarget);
@@ -3092,10 +3217,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                           h('span', { 'aria-hidden': true, style: settingsHintStyle }, expanded ? '▴' : '▾')),
                         expanded ? ticketRowItem(tk, 'stream', false, true) : null);
                     });
-                    if (list.length > shown.length) {
+                    if (open && list.length > shown.length) {
                       rows.push(h('button', {
                         key: 'more-' + stage, type: 'button',
-                        onClick: function () { setExpandedGroups(current => ({ ...current, [stage]: true })); },
+                        onClick: function () { setExpandedGroups(current => ({ ...current, [stage]: (current[stage] ?? 12) + 12 })); },
                         style: { display: 'block', width: '100%', textAlign: 'center', fontSize: '12px', padding: '6px 0', marginTop: '2px', borderRadius: '6px', cursor: 'pointer', background: 'rgba(127,127,127,0.07)', border: '1px dashed rgba(127,127,127,0.3)', opacity: 0.8 },
                       }, fill(t('showMoreInGroup'), list.length - shown.length)));
                     }
@@ -3110,28 +3235,47 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                         stagePill(stage, (list[0].stageText || stage) + ' · ' + list.length)),
                       h('div', { style: { marginTop: '8px' } }, rows));
                   })),
-            renderTimers(),
-            h(RunHistory, { onTask: ticketId => openStream({ ticketId }),
-              onWorker: canOpenOwnerSession ? async sessionId => await scoped.get('uiWorkspace').openSession(sessionId) : undefined }),
-            renderIntake(),
-            renderRecentMessages(),
+             h('section', { style: sectionStyle, 'aria-labelledby': 'hub-bot-outcomes-title' },
+               h('h3', { id: 'hub-bot-outcomes-title', style: sectionTitleStyle }, t('outcomesSection')),
+               recentResults.length ? recentResults.map(ticket => h('div', { key: ticket.id,
+                 style: { display: 'flex', flexWrap: 'wrap', gap: '4px 10px', alignItems: 'baseline', padding: '6px 0' },
+               }, h('button', { type: 'button', className: 'hb-text-action',
+                 style: { whiteSpace: 'normal', overflowWrap: 'anywhere' }, onClick: () => openStream({ ticketId: ticket.id }),
+               }, ticket.report.summary || ticket.message || ticket.id), h('span', { style: settingsHintStyle }, ticket.ownerLabel)))
+                 : h('p', { style: settingsHintStyle }, t('noResults'))),
+             h('section', { style: sectionStyle, 'aria-labelledby': 'hub-bot-next-wake-title' },
+               h('h3', { id: 'hub-bot-next-wake-title', style: sectionTitleStyle }, t('nextWake')),
+               nextTimer ? h('button', { type: 'button', className: 'hb-text-action',
+                 style: { whiteSpace: 'normal', overflowWrap: 'anywhere' }, onClick: () => switchPage('hub-bot-timers-title'),
+               }, nextTimer.message + ' · ' + new Date(nextTimer.fireAt).toLocaleString())
+                 : h('p', { style: settingsHintStyle }, t('noWake'))),
+             renderIntake(),
+             renderRecentMessages(),
             h('section', { style: sectionStyle, id: 'hub-bot-owners', 'aria-labelledby': 'hub-bot-owners-title' },
               h('h3', { id: 'hub-bot-owners-title', tabIndex: -1, className: 'hb-scroll-target', style: Object.assign({}, sectionTitleStyle, { marginTop: 0 }) }, t('ownersSection'),
                 owners.length > 0 ? h('span', { style: { marginLeft: '8px', fontSize: '12px', fontWeight: 400, color: 'var(--dsw-alias-label-secondary)' } }, '· ' + owners.length) : null),
               owners.length === 0
                 ? h('p', { style: settingsHintStyle }, t('emptyOwners'))
                 : h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 315px), 1fr))', gap: '12px', maxWidth: '1080px' } },
-                    owners.map(renderOwnerCard))),
-            sectionDivider(t('settingsDivider'), 'hub-bot-settings'),
-            h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 350px), 1fr))',
-              alignItems: 'start', gap: '16px', maxWidth: '1080px' } },
-              h('div', { style: { minWidth: 0 } },
-                h(ChiefModelSection, { view: view, catalog: catalog, onSaved: settingsSaved }),
-                h(HubBotRowConfig, { hubBotCtx: scoped, view: view, onSaved: settingsSaved }),
-                h(RuntimeSection, { view: view, onSaved: settingsSaved })),
-              h('div', { style: { minWidth: 0 } },
-                h(FeishuSection, { view: view, status: fs, onRefresh: refreshView, onSaved: settingsSaved }),
-                h(GithubSection, { view: view, status: github, onSaved: settingsSaved }))));
+                     owners.map(renderOwnerCard)))),
+             h('div', { hidden: panelPage !== 'hub-bot-timers-title' }, renderTimers()),
+             h('div', { hidden: panelPage !== 'hub-bot-runs-title' },
+               h(RunHistory, { active: panelPage === 'hub-bot-runs-title', onTask: ticketId => openStream({ ticketId }),
+                 onWorker: canOpenOwnerSession ? async sessionId => await scoped.get('uiWorkspace').openSession(sessionId) : undefined })),
+             h('div', { hidden: panelPage !== 'hub-bot-connections' },
+               sectionDivider(t('connectionsSection'), 'hub-bot-connections'),
+               h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 350px), 1fr))',
+                 alignItems: 'start', gap: '16px', maxWidth: '1080px' } },
+                 h(FeishuSection, { view: view, status: fs, onRefresh: refreshView, onSaved: settingsSaved }),
+                 h(GithubSection, { view: view, status: github, onSaved: settingsSaved }))),
+             h('div', { hidden: panelPage !== 'hub-bot-settings' },
+               sectionDivider(t('settingsDivider'), 'hub-bot-settings'),
+               h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 350px), 1fr))',
+                 alignItems: 'start', gap: '16px', maxWidth: '1080px' } },
+                 h('div', { style: { minWidth: 0 } },
+                   h(ChiefModelSection, { view: view, catalog: catalog, onSaved: settingsSaved }),
+                   h(HubBotRowConfig, { hubBotCtx: scoped, view: view, onSaved: settingsSaved })),
+                 h(RuntimeSection, { view: view, onSaved: settingsSaved }))));
         }
         scoped.effect(function () {
           return scoped.slots.inject('sidebar.panellist', function () {
@@ -3153,6 +3297,54 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             }, HubBotPanelPage);
           });
         }, 'hub-bot: main panel');
+
+        if (typeof window !== 'undefined' && new URL(window.location.href).searchParams.has('hubBotOwner')) {
+          scoped.inject(['uiWorkspace'], function (linkScope) {
+            linkScope.effect(function () {
+              var current = true;
+              var pendingGeneration;
+              var generations = linkScope.connection.generation;
+              async function openLinkedOwner() {
+                var generationId = generations.getSnapshot()?.id;
+                var url = new URL(window.location.href);
+                var ownerId = url.searchParams.get('hubBotOwner');
+                var operationId = url.searchParams.get('hubBotSwitch');
+                if (!ownerId || !generationId || pendingGeneration === generationId) return;
+                pendingGeneration = generationId;
+                var t = linkScope.locale.bind(NS);
+                try {
+                  var sessionId;
+                  if (operationId) {
+                    var operation = unwrap(await linkScope.remote.hubBotSettings.ownerSwitchAction({ action: 'status', ownerId, operationId }));
+                    sessionId = operation?.committedAt ? operation.oldSessionId : null;
+                  } else {
+                    var owners = unwrap(await linkScope.remote.hubBotSettings.listOwners());
+                    sessionId = owners.find(row => row.id === ownerId)?.sessionId;
+                  }
+                  if (!current || generations.getSnapshot()?.id !== generationId) return;
+                  url = new URL(window.location.href);
+                  if (url.searchParams.get('hubBotOwner') !== ownerId || url.searchParams.get('hubBotSwitch') !== operationId) return;
+                  if (!sessionId) throw new Error(t('ownerSessionUnavailable'));
+                  linkScope.get('layout')?.beginNavigation?.();
+                  await linkScope.uiWorkspace.openSession(sessionId);
+                  url.searchParams.delete('hubBotOwner');
+                  if (operationId) url.searchParams.delete('hubBotSwitch');
+                  window.history.replaceState(window.history.state, '', url.pathname + url.search + url.hash);
+                  ownerLinkError = null;
+                  for (var listener of ownerLinkListeners) listener();
+                } catch (error) {
+                  if (!current || generations.getSnapshot()?.id !== generationId) return;
+                  ownerLinkError = t('openSessionFailed') + ' · ' + (error?.message ?? String(error));
+                  for (var listener of ownerLinkListeners) listener();
+                  linkScope.get('layout')?.selectPanel?.('hub-bot');
+                }
+              }
+              var unsubscribe = generations.subscribe(() => void openLinkedOwner());
+              void openLinkedOwner();
+              return () => { current = false; unsubscribe(); };
+            }, 'hub-bot: owner session link');
+          });
+        }
       });
     }
     exports.name = 'hub-bot-client';

@@ -14,7 +14,8 @@ import { Store } from '../src/store.js'
 import { OwnerRegistry } from '../src/registry.js'
 import { Router, RouterError, RECOVERY_NOTE } from '../src/router.js'
 import { DeferredRegistry } from '../src/deferred.js'
-import { discardOutboxRows } from '../src/outbox.js'
+import { discardOutboxRows, deliverRecordedReplies } from '../src/outbox.js'
+import { NotificationThrottle } from '../src/notifications.js'
 
 /** A registry+router with a scriptable fake Sessions port and a deterministic clock. */
 function fixture({ failSessions = [], config } = {}) {
@@ -43,6 +44,30 @@ function fixture({ failSessions = [], config } = {}) {
   const advance = (ms) => { nowMs += ms }
   return { router, registry, store, calls, advance, cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }) } }
 }
+
+test('ordinary owner messages wait through a handoff and resume at the new current binding', async () => {
+  const { router, registry, calls, advance, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'dir', cwd: '/repos/switch-queue' })
+    registry.bindSession(owner.id, 'fixture-old-owner')
+    let phase = 'waiting'
+    router.ownerSwitch = { phaseFor: () => phase }
+    const first = await router.routeToOwner({ ownerId: owner.id, message: 'fixture first after switch' })
+    const second = await router.routeToOwner({ ownerId: owner.id, message: 'fixture second after switch' })
+    assert.deepEqual([first.stage, second.stage], ['idle', 'idle'])
+    assert.equal(calls.prompt.length, 0)
+    phase = 'preparing'
+    advance(1000)
+    await router.tick()
+    assert.equal(calls.prompt.length, 0)
+    registry.bindSession(owner.id, 'fixture-new-owner')
+    phase = undefined
+    advance(1000)
+    await router.tick()
+    assert.deepEqual(calls.prompt.map(prompt => [prompt.sessionId, prompt.requestId]), [['fixture-new-owner', first.requestId], ['fixture-new-owner', second.requestId]])
+    assert.equal(router.getTicket(first.ticketId).stage, 'working')
+  } finally { cleanup() }
+})
 
 test('route stores the ticket as 待触发 first, then the runner delivers it into 进行中', async () => {
   const { router, registry, calls, cleanup } = fixture()
@@ -1049,6 +1074,66 @@ test('restart resumes interrupted background work in its original execution sess
       assert.ok(recovery[index].text.includes(old.id))
     }
   } finally { cleanup() }
+})
+
+test('ordinary results share a recipient window and a promised reminder stays immediate across reopen', async () => {
+  const { router, registry, store, advance, cleanup } = fixture()
+  let reopened
+  try {
+    const ownerA = registry.create({ kind: 'dir', cwd: '/repos/notice-a' })
+    const ownerB = registry.create({ kind: 'dir', cwd: '/repos/notice-b' })
+    const createThrottle = (target, db) => new NotificationThrottle({ store: db, runs: target.runs, now: () => Date.parse(target.now()) })
+    router.notifications = createThrottle(router, store)
+    const sent = []
+    const deliver = db => deliverRecordedReplies({
+      store: db, logger: { warn() {} }, now: router.now, channel: 'feishu', prefix: 'feishu:', maxAttempts: 5,
+      parseTarget: destination => destination, async send(to, body, row) { sent.push({ to, body, id: row.id }) },
+    })
+    async function launch(owner, number, options = {}) {
+      const chatId = options.chatId ?? 'oc_same_fixture'
+      const messageId = 'om_notice_fixture_' + number
+      const triggerId = 'feishu-' + messageId
+      const authorization = { actor: 'fixture-human', source: 'feishu', addressing: 'direct', messageId, at: router.now() }
+      await router.acceptFeishuTrigger({ id: triggerId, kind: 'feishu', message: 'fixture reminder request', at: router.now(),
+        source: { kind: 'feishu', chatId, messageId, openId: authorization.actor, addressing: 'direct' }, authorization })
+      const source = { kind: 'timer', timerId: 'fixture-throttle-' + number, occurrenceId: '1', fireAt: router.now(),
+        origin: { kind: 'feishu', triggerId, chatId, actor: authorization.actor }, ...(options.notifyAtFire && { notifyAtFire: true }) }
+      const result = await router.routeBackground({ ownerId: owner.id, message: 'fixture work ' + number,
+        triggerRef: 'timer:' + source.timerId + ':1', authorization, source })
+      await router.reportBackground({ ticketId: result.ticketId, sessionId: result.workerSession.sessionId,
+        ...(options.notifyAtFire ? { silenceReason: 'no-change' } : { summary: 'fixture result ' + number }) })
+      return result.ticketId
+    }
+    const first = await launch(ownerA, 1)
+    await deliver(store)
+    assert.equal(sent.length, 1)
+    const second = await launch(ownerB, 2)
+    const third = await launch(ownerA, 3)
+    const reminder = await launch(ownerB, 4, { notifyAtFire: true })
+    const elsewhere = await launch(ownerA, 5, { chatId: 'oc_other_fixture' })
+    await router.tick()
+    await deliver(store)
+    assert.deepEqual(sent.map(row => row.to), ['feishu:chat:oc_same_fixture', 'feishu:chat:oc_same_fixture', 'feishu:chat:oc_other_fixture'])
+    assert.match(sent[1].body, /提醒.*fixture work 4/)
+    const run = ticketId => router.runs.get('run-' + ticketId)
+    for (const id of [first, reminder, elsewhere]) assert.equal(run(id).status, 'sent')
+    for (const id of [second, third]) assert.equal(run(id).status, 'waiting')
+    store.close()
+    reopened = new Store(store.stateDir)
+    const nextRegistry = new OwnerRegistry(reopened, { scratchRoot: join(reopened.stateDir, 'scratch') })
+    const next = new Router({ store: reopened, registry: nextRegistry, sessions: router.sessions, now: router.now })
+    const throttle = createThrottle(next, reopened)
+    advance(59_999)
+    assert.deepEqual(throttle.flush(), [])
+    advance(1)
+    const [batch] = throttle.flush()
+    assert.deepEqual(throttle.flush(), [])
+    assert.deepEqual(throttle.details(batch.id).tickets.map(ticket => ticket.ticketId), [second, third])
+    await deliver(reopened)
+    assert.equal(sent.length, 4)
+    assert.equal(next.runs.get('run-' + second).notification.id, batch.id)
+    assert.equal(next.runs.get('run-' + third).status, 'sent')
+  } finally { reopened?.close(); cleanup() }
 })
 
 test('a local timer result records a panel-only outcome without channel delivery', async () => {

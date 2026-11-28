@@ -241,12 +241,15 @@ export class TimerService {
    * A verified Feishu event supplies the original ticket authorization. Direct reminders use the creator.
    *
    * @param {{ ownerId: string, createdBy: string, message: string, fireAt?: string,
-   *   schedule?: { frequency: 'daily' | 'weekly', time: string, weekday?: number },
+   *   notifyAtFire?: boolean, schedule?: { frequency: 'daily' | 'weekly', time: string, weekday?: number },
    *   origin?: { kind: 'feishu', triggerId: string, chatId: string, actor: string },
    *   authorization?: { actor: string, source: 'feishu', at: string, messageId?: string, addressing?: string } }} request
    * @returns {object} the stored timer document.
    */
-  create({ ownerId, createdBy, fireAt, schedule, message, origin, authorization } = {}) {
+  create({ ownerId, createdBy, fireAt, schedule, message, origin, authorization, notifyAtFire } = {}) {
+    if (notifyAtFire !== undefined && typeof notifyAtFire !== 'boolean') {
+      throw new TimerError('timer-notification-invalid', 'notifyAtFire must be a boolean.')
+    }
     if (typeof ownerId !== 'string' || !ownerId.trim()) {
       throw new TimerError('owner-required', 'timer_create: ownerId must be a non-empty string — a follow-up always belongs to one owner')
     }
@@ -292,6 +295,7 @@ export class TimerService {
       message: message.trim(),
       ...(sourceOrigin && { origin: sourceOrigin }),
       ...(sourceAuthorization && { authorization: sourceAuthorization }),
+      ...(notifyAtFire === true && { notifyAtFire: true }),
       // Canonical UTC instant for comparison and delivery. Preserve the input for one-shot display.
       fireAt: toIso(fireAtMs),
       ...(recurrence ? { schedule: recurrence } : { fireAtInput: fireAt }),
@@ -500,6 +504,7 @@ export class TimerService {
     const source = {
       kind: 'timer', timerId: timer.id, occurrenceId, fireAt, late,
       ...(timer.origin && { origin: timer.origin }),
+      ...(timer.notifyAtFire === true && { notifyAtFire: true }),
     }
     // Keep older Router tickets eligible while advancing to a new occurrence.
     const queuedDeliveries = timer.schedule && [

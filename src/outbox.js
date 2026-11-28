@@ -75,7 +75,7 @@ function failedOutboxGroups(store, ids) {
  * attempts 清零、退避清空——下一轮 tick 重新尝试。返回重投的行数。
  * 旧死信（v0.4.1 前，无 originState）默认回 'queued'。同一批的死信以原队头和冻结成员表整批重投。
  */
-export function retryOutboxRows(store, ids = null) {
+export function retryOutboxRows(store, ids = null, now = () => new Date().toISOString()) {
   return writeOutboxTransaction(store, () => {
     let retried = 0
     for (const [headId, rows] of failedOutboxGroups(store, ids)) {
@@ -86,7 +86,9 @@ export function retryOutboxRows(store, ids = null) {
       const memberIds = new Set(frozen.map(member => member?.id))
       if (frozen.length !== rows.length || rows.some(row => !memberIds.has(row.id))) continue
       for (const { originState, ...row } of rows) {
-        updateOutboxRow(store, { ...row, state: originState ?? 'queued', attempts: 0, nextRetryAt: null, lastError: null })
+        const ordinary = Number.isSafeInteger(row.notificationWindowMs) && row.notificationWindowMs > 0
+        updateOutboxRow(store, { ...row, state: ordinary ? 'held' : originState ?? 'queued',
+          ...(ordinary && { notificationRetry: true, notificationRetryAt: now() }), attempts: 0, nextRetryAt: null, lastError: null })
       }
       retried += rows.length
     }
@@ -232,7 +234,7 @@ export class OutboxRunner {
   releaseHeld({ ticketId }) {
     const rows = this.store.db.prepare('SELECT value FROM outbox ORDER BY at').all()
       .map(raw => JSON.parse(String(raw.value)))
-      .filter(row => row.ticketId === ticketId && row.state === 'held')
+      .filter(row => row.ticketId === ticketId && row.state === 'held' && row.kind !== 'notification-source' && !row.notificationRetry)
     for (const row of rows) this.#writeRow({ ...row, state: 'queued' })
     return rows.length
   }
@@ -254,7 +256,7 @@ export class OutboxRunner {
         && (excludeKind === undefined || row.kind !== excludeKind))
     const groups = new Map()
     for (const row of rows) {
-      const ownerLane = row.kind === 'inbox' || row.kind === 'stop' || row.kind === 'deferred-decision'
+      const ownerLane = ['inbox', 'stop', 'deferred-decision', 'owner-switch-control'].includes(row.kind)
       const key = row.ticketId ?? (ownerLane ? row.kind + ':' + row.to : '')
       if (!groups.has(key)) groups.set(key, [])
       groups.get(key).push(row)

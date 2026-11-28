@@ -47,6 +47,34 @@ function isMissingSession(error) {
   return /session\b[^\n]*\bnot found/i.test(message) || /absent from persistence|unknown session/i.test(message)
 }
 
+function ownerSwitchCommand(text) {
+  if (typeof text !== 'string' || !/^[/]hub-switch(?:\s|$)/.test(text)) return null
+  const match = /^[/]hub-switch[ \t]+(wait|stop|status|cancel|retry-archive)[ \t]+([^\r\n]+)$/.exec(text.trim())
+  if (!match) return { action: 'help' }
+  const [, command, rest] = match
+  if (['cancel', 'retry-archive'].includes(command)) {
+    const target = /^(\S+)[ \t]+(.+)$/.exec(rest.trim())
+    return target ? { action: command, operationId: target[1], ownerId: target[2].trim() } : { action: 'help' }
+  }
+  return command === 'status' ? { action: 'status', ownerId: rest.trim() }
+    : { action: 'request', ownerId: rest.trim(), mode: command }
+}
+
+function describeOwnerSwitch(operation) {
+  if (!operation) return '该负责人暂无更换记录。'
+  const stages = {
+    waiting: '等待旧会话空闲', preparing: '正在准备新会话', committed: '新会话已接管，等待归档旧会话',
+    'archive-failed': '新会话已接管，旧会话归档失败，可重试', completed: '更换完成', failed: '更换失败', cancelled: '已取消',
+  }
+  return [
+    '负责人 ' + operation.ownerId + ' · ' + (stages[operation.status] ?? operation.status),
+    '操作编号 ' + operation.operationId,
+    operation.oldSessionId && '原会话 ' + operation.oldSessionId,
+    operation.newSessionCreatedAt && operation.newSessionId && '新会话 ' + operation.newSessionId,
+    operation.reason && '原因 ' + String(operation.reason).slice(0, 160),
+  ].filter(Boolean).join('\n')
+}
+
 export class Router {
   /**
    * @param {{ store: import('./store.js').Store, registry: import('./registry.js').OwnerRegistry,
@@ -107,6 +135,17 @@ export class Router {
       if (db.isTransaction) db.exec('ROLLBACK')
       throw error
     }
+  }
+
+  ownerSwitchAction({ action, ownerId, expectedSessionId, operationId, mode, requestId } = {}) {
+    if (!this.ownerSwitch) throw new RouterError('owner-switch-unavailable', '负责人更换暂不可用。')
+    if (typeof ownerId !== 'string' || !ownerId.trim()) throw new RouterError('owner-switch-invalid', '需要指定负责人。')
+    if (action === 'request') return this.ownerSwitch.request({ ownerId, expectedSessionId, mode, requestId })
+    if (action === 'status') return (operationId ? this.ownerSwitch.get({ ownerId, operationId }) : this.ownerSwitch.list({ ownerId })[0]) ?? null
+    if (!['cancel', 'retry-archive'].includes(action) || typeof operationId !== 'string' || !operationId) {
+      throw new RouterError('owner-switch-invalid', '需要指定更换操作编号。')
+    }
+    return action === 'cancel' ? this.ownerSwitch.cancel({ ownerId, operationId }) : this.ownerSwitch.retryArchive({ ownerId, operationId })
   }
 
   installDeferred(book) {
@@ -173,6 +212,7 @@ export class Router {
         this.tasks.confirm({ ticketId: ticket.id, result: { deferred: request.requestId }, by: 'user' })
         const held = this.#workingCount(owner.id) > this.#slotsPerOwner()
         if (held) this.tasks.demote(ticket.id)
+        this.#queuePromisedReminder(ticket, this.getTrigger(ticket.triggerId))
         this.runner.enqueue({
           ticketId: ticket.id, triggerId: ticket.triggerId, kind: 'inject', to: 'owner:' + owner.id,
           body: '[后台任务 ' + ticket.id + '] ' + request.action.message
@@ -363,7 +403,8 @@ export class Router {
     } else {
       const owner = this.registry.get(request.ownerId)
       if (!owner || owner.recycled) throw permanent('The original owner is no longer available.')
-      const delivered = await this.#promptOwner(owner.id, ticket.id, row.requestId, text(), { isCurrent: current })
+      const delivered = await this.#promptOwner(owner.id, ticket.id, row.requestId, text(), { isCurrent: current, neededWhileWaiting: true })
+      if (delivered?.postponeMs) return delivered
       if (!delivered) return skipped()
     }
     if (this.store.closed) return
@@ -410,14 +451,17 @@ export class Router {
     const command = !previous && !incoming.dropped && this.deferred
       ? /^[/]hub-answer +([a-z0-9-]+) +(approve|reject|answer)(?: +([\s\S]+))?$/.exec(incoming.message) : null,
       stop = !previous && !incoming.dropped && ['停', '停止'].includes(incoming.message)
+    const ownerCommand = !previous && !incoming.dropped && this.ownerSwitch ? ownerSwitchCommand(incoming.message) : null
+    if (ownerCommand?.action === 'request') ownerCommand.expectedSessionId = this.registry.get(ownerCommand.ownerId)?.sessionId ?? null
     const sessionId = stop ? this.registry.get('chief')?.sessionId ?? null : null
     const skipStop = stop && (!sessionId ? 'no-current-session' : this.#currentStops.has(sessionId) ? 'interrupt-in-flight' : null)
     const trigger = {
       ...(previous ?? incoming),
       ownerId: 'chief',
       injectedAt: null,
-      policy: previous?.policy ?? { ...incoming.policy, mode: incoming.dropped ? 'drop' : stop ? 'interrupt' : command ? 'decision' : 'queue' },
+      policy: previous?.policy ?? { ...incoming.policy, mode: incoming.dropped ? 'drop' : stop ? 'interrupt' : command ? 'decision' : ownerCommand ? 'owner-switch' : 'queue' },
       ...(command && { decision: { requestId: command[1], decision: command[2], text: command[3] ?? '' } }),
+      ...(ownerCommand && { ownerCommand }),
     }
     this.#persistWork(() => {
       if (previous) this.#updateTrigger(trigger)
@@ -434,7 +478,7 @@ export class Router {
         }, () => Date.parse(trigger.at))
       } else if (!trigger.dropped) {
         this.runner.enqueue({
-          id: outboxId, ticketId: null, triggerId: id, kind: stop ? 'stop' : command ? 'deferred-decision' : 'inbox', to: 'owner:chief',
+          id: outboxId, ticketId: null, triggerId: id, kind: stop ? 'stop' : command ? 'deferred-decision' : ownerCommand ? 'owner-switch-control' : 'inbox', to: 'owner:chief',
           body: trigger.message, sessionId, requestId,
         })
       }
@@ -453,6 +497,60 @@ export class Router {
 
   #updateTrigger(row) {
     this.store.db.prepare('UPDATE trigger SET value = ? WHERE id = ?').run(JSON.stringify(row), row.id)
+  }
+
+  #ownerSwitchReply(trigger, id, body) {
+    if (this.#outboxRow(id)) return
+    insertOutbox(this.store, {
+      id, triggerId: trigger.id, kind: 'reply', state: 'recorded', to: 'feishu:chat:' + trigger.source.chatId,
+      requestId: id, body: truncateWords(body).text,
+    }, () => Date.parse(this.now()))
+  }
+
+  #authorizedSwitchTrigger(trigger) {
+    return trigger?.source?.kind === 'feishu' && !trigger.dropped && trigger.ownerCommand
+      && trigger.authorization?.source === 'feishu' && Boolean(trigger.authorization.actor)
+      && trigger.source.openId === trigger.authorization.actor && Boolean(trigger.source.chatId)
+  }
+
+  publishOwnerSwitchProgress(operation) {
+    if (this.store.closed || operation?.status === 'waiting' || typeof operation?.requestId !== 'string' || !operation.requestId.startsWith('feishu-')) return
+    const original = this.getTrigger(operation.requestId)
+    if (!this.#authorizedSwitchTrigger(original) || original.ownerCommand.action !== 'request'
+      || original.ownerCommand.ownerId !== operation.ownerId || original.ownerCommand.expectedSessionId !== operation.oldSessionId) return
+    const id = 'out-owner-switch-' + operation.operationId + '-' + operation.status
+    this.#ownerSwitchReply(original, id, describeOwnerSwitch(operation))
+  }
+
+  #deliverOwnerSwitch(row) {
+    const trigger = this.getTrigger(row.triggerId)
+    if (!this.#authorizedSwitchTrigger(trigger)) return { recorded: true, skipped: 'invalid-owner-switch' }
+    const command = trigger.ownerCommand
+    return this.#persistWork(() => {
+      const id = 'out-owner-switch-control-' + trigger.id
+      if (this.#outboxRow(id)) return { recorded: true }
+      let body
+      try {
+        if (command.action === 'help') {
+          body = '使用 /hub-switch wait|stop|status <负责人ID>，或者 /hub-switch cancel|retry-archive <操作编号> <负责人ID>。'
+        } else {
+          if (command.operationId) {
+            const target = this.ownerSwitch?.get({ ownerId: command.ownerId, operationId: command.operationId })
+            const original = target?.requestId && this.getTrigger(target.requestId)
+            if (this.#authorizedSwitchTrigger(original) && (original.authorization.actor !== trigger.authorization.actor
+              || original.source.chatId !== trigger.source.chatId)) {
+              throw new RouterError('owner-switch-actor-mismatch', '请从发起更换的飞书账号和聊天处理此操作。')
+            }
+          }
+          body = describeOwnerSwitch(this.ownerSwitchAction({ ...command, requestId: trigger.id }))
+        }
+      } catch (error) {
+        if (!['RouterError', 'OwnerSwitchError'].includes(error?.name)) throw error
+        body = '负责人更换未受理。' + String(error.message).slice(0, 160)
+      }
+      this.#ownerSwitchReply(trigger, id, body)
+      return { recorded: true }
+    })
   }
 
   async #deliverIntake(row) {
@@ -479,14 +577,9 @@ export class Router {
       throw Object.assign(new Error('The original intake cohort is invalid'), { permanent: true })
     }
     if (sources.every(entry => entry.injectedAt)) return
-    const ensured = await this.#ensureChiefSession()
-    const model = this.config.chief?.model
-    if (model) {
-      try { await this.sessions.selectModel?.({ sessionId: ensured.sessionId, ...model }) }
-      catch { /* Keep the configured deployment model if selection is unavailable. */ }
-    }
     const text = sources.map(feishuPrompt).join('\n\n')
-    await this.#promptOwner('chief', null, row.requestId, text)
+    const result = await this.#promptOwner('chief', null, row.requestId, text, { model: this.config.chief?.model })
+    if (result?.postponeMs) return result
     if (this.store.closed) return
     this.#persistWork(() => {
       const at = this.now()
@@ -841,7 +934,7 @@ export class Router {
           createdSession: false, rebuilt: false, deduped: true, stage: ticket ? normalizeStage(ticket.stage) : null,
         }
       }
-      if (existing.dropped || !existing.authorization || ['interrupt', 'decision'].includes(existing.policy?.mode)
+      if (existing.dropped || !existing.authorization || ['interrupt', 'decision', 'owner-switch'].includes(existing.policy?.mode)
         || String(existing.source?.messageId ?? '').startsWith('om_selftest-')) {
         throw new RouterError('invalid-route-trigger', 'route_to_owner: this event is not eligible for dispatch')
       }
@@ -871,8 +964,10 @@ export class Router {
         ...(background && { background }),
         ...(existing?.kind === 'feishu' && { routedMessage: instruction }),
       })
-      if (background) this.#ensureRun(this.tasks.getTicket(freshTicketId), trigger)
+      const runTicket = background ? this.tasks.getTicket(freshTicketId) : null
+      if (runTicket) this.#ensureRun(runTicket, trigger)
       if (this.#holdDangerous(freshTicketId, instruction, 'route')) return true
+      if (runTicket) this.#queuePromisedReminder(runTicket, trigger)
       const text = '[hub-bot 路由 ' + freshTicketId + '] ' + instruction + '\n\n授权：' + auth.actor + ' 经 ' + auth.source + ' 于 ' + auth.at + '；任务 ' + freshTicketId
       this.runner.enqueue({
         ticketId: freshTicketId, triggerId: trigger.id, kind: 'inject',
@@ -891,6 +986,10 @@ export class Router {
       ...(background && { admitted: stored.lastDelivery?.state === 'sent' }),
       rebuilt: stored.lastDelivery?.rebuilt ?? false, deduped: false, stage: stored.stage,
     }
+  }
+
+  withOwnerAdmission(ownerId, work) {
+    return this.#serialized('owner-prompt:' + ownerId, work)
   }
 
   #serialized(key, fn) {
@@ -1098,6 +1197,7 @@ export class Router {
    */
   async #deliverRow(row) {
     if (row.kind === 'inbox' || row.kind === 'stop') return this.#deliverIntake(row)
+    if (row.kind === 'owner-switch-control') return this.#deliverOwnerSwitch(row)
     if (row.kind === 'background-report') return this.#deliverBackgroundReport(row)
     if (row.kind === 'deferred-answer') return this.#deliverDeferredAnswer(row)
     if (row.kind === 'approved-owner-inject') return this.#deliverApprovedOwner(row)
@@ -1156,6 +1256,7 @@ export class Router {
     const needsNote = ticket.recoveryPending === true
     const body = needsNote ? RECOVERY_NOTE + '\n\n' + row.body : row.body
     const delivered = await this.#promptOwner(owner.id, ticket.id, row.requestId, body)
+    if (delivered?.postponeMs) return delivered
     if (!delivered) return { recorded: true, skipped: 'ticket-terminal' }
     // The host admitted the prompt even if the ticket closed while admission was pending.
     const settled = this.tasks.getTicket(ticket.id)
@@ -1175,8 +1276,9 @@ export class Router {
     if (!ticket) return { recorded: true, skipped: 'deferred-no-longer-active' }
     const text = ticket.recoveryPending ? RECOVERY_NOTE + '\n\n' + row.body : row.body
     const delivered = await this.#promptOwner(ticket.owner, ticket.id, row.requestId, text, {
-      isCurrent: current, fixedSessionId: row.sessionId ?? null,
+      isCurrent: current, fixedSessionId: row.sessionId ?? null, neededWhileWaiting: true,
     })
+    if (delivered?.postponeMs) return delivered
     if (!delivered) return { recorded: true, skipped: 'deferred-no-longer-active' }
     if (this.store.closed || !current()) return
     this.tasks.noteRecoveryCarried(ticket.id)
@@ -1375,6 +1477,8 @@ export class Router {
         const saved = this.tasks.finishBackgroundCheck(ticketId)
         if (trigger.source.kind === 'github' && trigger.source.event === 'comment') {
           this.#queueBackgroundNotification(saved, trigger, SILENCE_REASONS[silenceReason])
+        } else if (trigger.source.kind === 'timer' && trigger.source.notifyAtFire && this.#hasOriginalTimerAuthorization(trigger.source, ticket.authorization)) {
+          if (!this.runs.get('run-' + ticketId)?.notification) this.runs.recordSilent(ticketId, silenceReason)
         } else {
           this.runs.recordSilent(ticketId, silenceReason)
         }
@@ -1396,10 +1500,19 @@ export class Router {
     const kind = ticket.stage === 'failed' ? 'failure' : ticket.stage === 'blocked' ? 'blocked' : 'result'
     this.runs.recordResult(ticket.id, { kind, reportId: report.id })
     const status = { result: '有结果待验收', failure: '执行失败', blocked: '需要介入' }[kind]
-    this.#queueBackgroundNotification(ticket, trigger, '后台任务 ' + ticket.id + ' ' + status + '。在 Hub Bot 运行记录中可查看详情。')
+    const ordinary = kind === 'result' && !(trigger.source.kind === 'github' && trigger.source.event === 'comment')
+    this.#queueBackgroundNotification(ticket, trigger, '后台任务 ' + ticket.id + ' ' + status + '。在 Hub Bot 运行记录中可查看详情。', ordinary)
   }
 
-  #queueBackgroundNotification(ticket, trigger, body) {
+  #queuePromisedReminder(ticket, trigger) {
+    const source = trigger?.source
+    if (source?.kind !== 'timer' || !source.notifyAtFire || !this.#hasOriginalTimerAuthorization(source, ticket.authorization)) return
+    const timerState = this.#timerState(ticket)
+    if (timerState === 'closed' || timerState === 'paused') return
+    this.#queueBackgroundNotification(ticket, trigger, truncateWords('提醒：' + trigger.message).text)
+  }
+
+  #queueBackgroundNotification(ticket, trigger, body, ordinary = false) {
     const source = trigger.source
     let to, triggerId = trigger.id
     if (source.kind === 'github' && typeof source.repo === 'string' && /^[a-z0-9_-]+[/][a-z0-9_.-]+$/i.test(source.repo)
@@ -1413,6 +1526,10 @@ export class Router {
       this.runs.recordNotNotified(ticket.id, 'local-panel')
       return
     }
+    if (ordinary && this.notifications) {
+      this.notifications.record({ ticketId: ticket.id, triggerId, to, body })
+      return
+    }
     const row = insertOutbox(this.store, {
       ticketId: ticket.id, triggerId, kind: 'reply', state: 'recorded', to, body,
       requestId: 'hub-bot-run-notice-' + this.ids.uuid(),
@@ -1424,12 +1541,14 @@ export class Router {
     const ticket = this.tasks.getTicket(row.ticketId)
     const owner = ticket && this.registry.get(ticket.owner)
     if (!owner || owner.recycled) return { recorded: true, skipped: 'owner-unavailable' }
-    await this.#promptOwner(owner.id, null, row.requestId, row.body)
+    return this.#promptOwner(owner.id, null, row.requestId, row.body)
   }
 
   /** Admit a prompt, retrying a missing binding only while the originating ticket is active. */
-  #promptOwner(ownerId, ticketId, requestId, text, { isCurrent, fixedSessionId } = {}) {
-    return this.#serialized('owner-prompt:' + ownerId, async () => {
+  #promptOwner(ownerId, ticketId, requestId, text, { isCurrent, fixedSessionId, neededWhileWaiting, model } = {}) {
+    return this.withOwnerAdmission(ownerId, async () => {
+      const phase = this.ownerSwitch?.phaseFor(ownerId)
+      if (phase === 'preparing' || (phase === 'waiting' && !neededWhileWaiting)) return { postponeMs: 1000 }
       const ticketClosed = () => {
         if (this.store.closed || (isCurrent && !isCurrent())) return true
         if (ticketId === null) return false
@@ -1444,6 +1563,11 @@ export class Router {
           store: this.store, ownerId, isArchived: id => this.sessions.isArchived?.(id) === true,
         })) : ''
         const message = facts ? facts + '\n\n' + text : text
+        if (model) {
+          try { await this.sessions.selectModel?.({ sessionId, ...model }) }
+          catch { /* Keep the deployment model if selection is unavailable. */ }
+          if (ticketClosed()) return null
+        }
         const result = await this.sessions.prompt({ sessionId, requestId, text: message })
         if (result?.accepted === false) throw new RouterError('owner-not-admitted', 'The owner Session did not accept the prompt.')
         if (initializing && !this.store.closed) this.#persistWork(() => {
@@ -1498,7 +1622,7 @@ export class Router {
       if (ticketClosed()) return null
       try {
         const receipt = await send(replacement.sessionId)
-        return { ...receipt, rebuilt: replacement.sessionId !== sessionId }
+        return receipt && { ...receipt, rebuilt: replacement.sessionId !== sessionId }
       } catch (error) {
         if (ticketClosed()) return null
         throw error
@@ -1522,7 +1646,7 @@ export class Router {
     if (sessionId && this.sessions.isRunning && await this.sessions.isRunning(sessionId)) {
       return { postponeMs: 2000 } // the wake is still running — keep coalescing
     }
-    await this.#promptOwner('chief', null, row.requestId, buildDigestText(row))
+    return this.#promptOwner('chief', null, row.requestId, buildDigestText(row))
   }
 
   /**
@@ -1531,8 +1655,7 @@ export class Router {
    */
   async #deliverReply(row) {
     if (row.to === 'dsh:session:chief') {
-      await this.#promptOwner('chief', null, row.requestId, row.body)
-      return
+      return this.#promptOwner('chief', null, row.requestId, row.body)
     }
     if (typeof row.to === 'string' && row.to.startsWith('session:')) {
       await this.sessions.prompt({ sessionId: row.to.slice('session:'.length), requestId: row.requestId, text: row.body })
