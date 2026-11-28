@@ -133,3 +133,51 @@ test('Feishu registration acknowledgement and asynchronous write failure are sep
   assert.doesNotMatch(JSON.stringify(failed), new RegExp(fixtureSecret))
   assert.deepEqual(JSON.parse(JSON.stringify((await settings.read()).feishu.status)), failed)
 })
+
+test('timer creation is bound to current owners and the panel only manages existing reminders', async t => {
+  const homeRepo = await mkdtemp(join(tmpdir(), 'hub-bot-timer-host-'))
+  const root = new PackageContext()
+  const registered = new Map()
+  let handle
+  root.provide('tools', { register(tool, options) {
+    registered.set(tool.name, { tool, options })
+    return () => registered.delete(tool.name)
+  } })
+  root.provide('sessionController', {})
+  root.provide('sessionPersistence', {})
+  root.provide('webServer', { host: '127.0.0.1', port: 3199, register(entry) {
+    handle = entry.handler
+    return () => { handle = undefined }
+  } })
+  const mounted = root.plugin(plugin, { homeRepo, stateDir: join(homeRepo, 'state'),
+    workspaces: { enabled: false }, devApi: { token: 'fixture-timer-token' } })
+  t.after(async () => { await mounted.dispose(); await rm(homeRepo, { recursive: true, force: true }) })
+  await mounted
+  await setImmediate()
+  const hub = root.reflect.get('hubBot', false)
+  const settings = root.reflect.get('hubBotSettings', false)
+  hub.registry.bindSession('chief', 'fixture-timer-chief')
+  const repo = hub.registry.create({ kind: 'dir', cwd: homeRepo })
+  hub.registry.bindSession(repo.id, 'fixture-timer-owner')
+  const creator = registered.get('timer_create')
+  assert.ok(creator)
+  assert.equal(creator.options.when({ agent: { id: 'fixture-timer-chief' } }), true)
+  assert.equal(creator.options.when({ agent: { id: 'fixture-mismatched-worker' } }), false)
+  const input = { ownerId: repo.id, message: 'fixture follow-up', fireAt: new Date(Date.now() + 600_000).toISOString() }
+  await assert.rejects(creator.tool.execute(input, { agent: { id: 'fixture-mismatched-worker' } }), /cannot manage/)
+  const { timer } = await creator.tool.execute(input, { agent: { id: 'fixture-timer-chief' } })
+  assert.equal(timer.ownerId, repo.id)
+  assert.equal(timer.createdBy, 'fixture-timer-chief')
+  assert.equal((await settings.overview()).timers[0].id, timer.id)
+  const pause = await settings.timerAction({ id: timer.id, action: 'pause' })
+  assert.equal(pause.timer.status, 'paused')
+  assert.equal((await settings.timerAction({ id: timer.id, action: 'resume' })).timer.status, 'pending')
+  await assert.rejects(settings.timerAction({ id: timer.id, action: 'create' }), error => error.code === 'timer/invalid')
+  let status
+  await handle({ url: '/hub-bot/api/overview', method: 'GET', headers: { host: '127.0.0.1:3199' } },
+    { writeHead(code) { status = code }, end() {} })
+  assert.equal(status, 401)
+  hub.registry.bindSession(repo.id, 'fixture-rebound-owner')
+  assert.equal(creator.options.when({ agent: { id: 'fixture-timer-owner' } }), false)
+  assert.equal((await settings.timerAction({ id: timer.id, action: 'cancel' })).timer.status, 'cancelled')
+})

@@ -138,11 +138,15 @@ test('Feishu replies and dispatches use the original message and its authorizati
       source.handleEvent(event({ messageId: 'om_second', text: '另一条请求' })),
     ])
     await router.tick()
-    assert.equal(calls.prompt.length, 2)
-    assert.equal(calls.prompt[0].sessionId, calls.prompt[1].sessionId)
+    assert.equal(calls.prompt.length, 1)
     assert.equal(calls.create.length, 1)
-    assert.ok(calls.prompt.some(prompt => /triggerRef='feishu-om_first'/.test(prompt.text)))
-    assert.ok(router.getTrigger(first.triggerId).injectedAt)
+    assert.match(calls.prompt[0].text, /triggerRef='feishu-om_first'/)
+    assert.match(calls.prompt[0].text, /triggerRef='feishu-om_second'/)
+    for (const id of [first.triggerId, second.triggerId]) {
+      const trigger = router.getTrigger(id)
+      assert.ok(trigger.injectedAt)
+      assert.deepEqual(trigger.intakeCohort.triggerIds, [first.triggerId, second.triggerId])
+    }
     await assert.rejects(router.replySource({ text: '不发送', triggerRef: second.triggerId, to: 'feishu:chat:oc_other' }),
       { code: 'reply-target-mismatch' })
     await assert.rejects(router.replySource({ text: '不发送', triggerRef: 'missing' }), { code: 'invalid-reply-trigger' })

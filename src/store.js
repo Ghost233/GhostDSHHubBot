@@ -10,7 +10,7 @@ import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 /** The schema version this build writes. Bump by appending one migration to `migrations`. */
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 2
 
 /**
  * Ordered migrations: `migrations[v]` upgrades a database from version v to v+1. Each runs inside a transaction with
@@ -26,6 +26,16 @@ export const migrations = [
       CREATE TABLE IF NOT EXISTS ticket (id TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS owner (id TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, value TEXT NOT NULL, at TEXT NOT NULL);
+    `)
+  },
+  // 1 → 2: one-shot follow-up timers (S09). A timer row is the durable schedule document; `at` carries the due
+  // instant so `tick()` can scan due rows without parsing every value. The occurrence ledger lives on the timer
+  // document itself (one-shot ⇒ at most one occurrence), which is what makes delivery retries idempotent.
+  db => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS timer (id TEXT PRIMARY KEY, value TEXT NOT NULL, at TEXT NOT NULL, owner TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS timer_owner ON timer (owner);
+      CREATE INDEX IF NOT EXISTS timer_due ON timer (at);
     `)
   },
 ]

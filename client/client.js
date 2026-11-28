@@ -111,6 +111,12 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           parameters: [],
           result: anyCodec('dsh-hub-bot#json-result'),
         },
+        'hubBotSettings/timerAction': {
+          service: 'hubBotSettings', description: 'Pause, resume, or cancel a timer.', invocation: { kind: 'direct' },
+          parameters: [{ name: 'request', source: 'json', description: '{ id, action }',
+            codec: anyCodec('dsh-hub-bot#json-request'), strictCodec: anyCodec('dsh-hub-bot#json-request') }],
+          result: anyCodec('dsh-hub-bot#json-result'),
+        },
         'hubBotSettings/messageDetail': {
           service: 'hubBotSettings',
           description: 'Read original text and the reply attributed to one message.',
@@ -349,6 +355,20 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       intakeInjected: '已注入',
       intakePending: '待注入',
       intakeFailed: '投递失败',
+      intakeDiscarded: '已丢弃投递',
+      timersSection: '提醒',
+      timersEmpty: '暂无提醒。',
+      timerPause: '暂停',
+      timerResume: '恢复',
+      timerCancel: '取消提醒',
+      timerLate: '已迟到',
+      timerRun: '查看任务',
+      timerPending: '待触发', timerPaused: '已暂停', timerFiring: '正在提交', timerFired: '已建任务',
+      timerCancelled: '已取消', timerFailed: '失败',
+      timerWorker: '打开执行会话', timerDeliverySent: '已接管', timerDeliveryQueued: '待投递', timerDeliveryFailed: '投递失败',
+      intakeCohort: '合并来信',
+      deferredExpires: '答复截止', deferredTarget: '目标会话', deferredAnswer: '用户答复',
+      answerQueued: '答复待接管', answerSent: '答复已接管', answerFailed: '答复投递失败', answerDiscarded: '已丢弃答复投递',
       intakeInterrupt: '停止请求',
       intakeInterruptRequested: '已请求停止',
       intakeTriggers: '触发',
@@ -488,7 +508,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       dismissTicketFeedback: '关闭提示',
       droppedCardHint: '最近未受理',
       retriedNotice: '已重投 {count} 条，回到投递队列',
-      confirmDone: '已确认，继续执行',
+      confirmDone: '已记录确认',
       rejectDone: '已拒绝，任务转被卡住',
       acceptDone: '已验收通过',
       batchConfirmed: '已批量确认 {count} 条',
@@ -716,6 +736,20 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       intakeInjected: 'injected',
       intakePending: 'awaiting injection',
       intakeFailed: 'delivery failed',
+      intakeDiscarded: 'delivery discarded',
+      timersSection: 'Follow-ups',
+      timersEmpty: 'No follow-ups scheduled.',
+      timerPause: 'Pause',
+      timerResume: 'Resume',
+      timerCancel: 'Cancel reminder',
+      timerLate: 'Late',
+      timerRun: 'Open task',
+      timerPending: 'Scheduled', timerPaused: 'Paused', timerFiring: 'Submitting', timerFired: 'Task created',
+      timerCancelled: 'Cancelled', timerFailed: 'Failed',
+      timerWorker: 'Open worker session', timerDeliverySent: 'Admitted', timerDeliveryQueued: 'Pending delivery', timerDeliveryFailed: 'Delivery failed',
+      intakeCohort: 'Combined incoming messages',
+      deferredExpires: 'Reply deadline', deferredTarget: 'Destination session', deferredAnswer: 'User reply',
+      answerQueued: 'Reply pending delivery', answerSent: 'Reply delivered', answerFailed: 'Reply delivery failed', answerDiscarded: 'Reply delivery discarded',
       intakeInterrupt: 'Stop request',
       intakeInterruptRequested: 'Stop requested',
       intakeTriggers: 'triggers',
@@ -855,7 +889,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
       dismissTicketFeedback: 'Dismiss',
       droppedCardHint: 'Last dropped',
       retriedNotice: 'Requeued {count} row(s) to the delivery queue',
-      confirmDone: 'Confirmed, resuming',
+      confirmDone: 'Approval recorded',
       rejectDone: 'Rejected, ticket blocked',
       acceptDone: 'Accepted',
       batchConfirmed: 'Confirmed {count} ticket(s)',
@@ -1559,7 +1593,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                 h('span', { style: settingsHintStyle }, fill(t('messageAttempts'), row.attempts ?? 0)),
                 ticketLink(row.ticketId),
                 isFailed ? h('div', { style: Object.assign({}, flexRow, { marginLeft: 'auto' }) },
-                  actionButton('retry', row, 'retryOne'), actionButton('discard', row, 'discardOne')) : null),
+                  row.retryable !== false ? actionButton('retry', row, 'retryOne') : null, actionButton('discard', row, 'discardOne')) : null),
               !isFailed ? h('div', { style: settingsHintStyle }, retrySchedule(row)) : null,
               row.text ? h('p', { style: Object.assign({}, settingsHintStyle, { margin: '4px 0 0' }) }, row.text) : null,
               row.lastError ? h('p', { style: { margin: '4px 0 0', fontSize: '12px', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } },
@@ -1572,7 +1606,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             return h('details', { key: isFailed ? 'failed' : 'retrying', style: groupStyle },
               h('summary', { style: { cursor: 'pointer', fontWeight: 600 } }, t(isFailed ? 'healthDetailDead' : 'healthDetailRetry') + ' · ' + rows.length),
               isFailed && rows.length > 1 ? h('div', { style: Object.assign({}, flexRow, { marginTop: '6px' }) },
-                actionButton('retry', null, 'retryAll'), actionButton('discard', null, 'discardAll')) : null,
+                rows.some(row => row.retryable !== false) ? actionButton('retry', null, 'retryAll') : null, actionButton('discard', null, 'discardAll')) : null,
               h('ul', { style: listStyle }, rows.map(row => deliveryRow(row, isFailed))));
           }
           if (!hasAlerts && !history.length && !feedback) {
@@ -1701,10 +1735,15 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                     reply.lastError && reply.state !== 'sent' ? h('div', null, reply.lastError) : null)) : null) : null,
               detail?.result?.intake ? h('p', { key: 'intake', style: settingsHintStyle },
                 t('intakeDisposition') + ' · ' + t(({
-                  dropped: 'intakeDropped', injected: 'intakeInjected', pending: 'intakePending', failed: 'intakeFailed',
+                  dropped: 'intakeDropped', discarded: 'intakeDiscarded', injected: 'intakeInjected', pending: 'intakePending', failed: 'intakeFailed',
                   interrupt: 'intakeInterrupt', 'interrupt-requested': 'intakeInterruptRequested',
                 })[detail.result.intake.disposition] || 'intakePending'),
                 detail.result.intake.lastError ? h('span', null, ' · ' + detail.result.intake.lastError) : null) : null,
+              detail?.result?.intake?.cohort ? h('details', { key: 'cohort' },
+                h('summary', { style: settingsHintStyle }, t('intakeCohort') + ' · ' + detail.result.intake.cohort.mergedCount),
+                h('ul', null, detail.result.intake.cohort.messages.map(item => h('li', { key: item.triggerId },
+                  h('span', { style: settingsHintStyle }, [item.triggerId, ...item.ticketIds].join(' · ')),
+                  h('p', { style: { margin: '4px 0', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } }, item.message))))) : null,
               detail?.result?.replyUnlinked ? h('p', { key: 'unlinked', style: settingsHintStyle }, t('replyUnlinkedHint')) : null,
             ] : null));
         }
@@ -1751,7 +1790,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
 
         var boardSections = [
           ['hub-bot-overview-title', 'statusSection'], ['hub-bot-needs-title', 'needsCard'],
-          ['hub-bot-stream-title', 'ticketsSection'], ['hub-bot-intake-title', 'intakeSection'],
+          ['hub-bot-stream-title', 'ticketsSection'], ['hub-bot-timers-title', 'timersSection'], ['hub-bot-intake-title', 'intakeSection'],
           ['hub-bot-recent-title', 'recentSection'],
           ['hub-bot-owners-title', 'ownersSection'], ['hub-bot-settings', 'settingsDivider'],
         ];
@@ -1792,6 +1831,8 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
 
           var [ticketOperation, setTicketOperation] = React.useState(null);
           var [ticketFeedback, setTicketFeedback] = React.useState(null);
+          var [timerBusy, setTimerBusy] = React.useState(false);
+          var [timerError, setTimerError] = React.useState(null);
           var [ownerSessionError, setOwnerSessionError] = React.useState(null);
           var ticketInFlight = React.useRef(false);
           var fts = React.useState(''); var filterText = fts[0]; var setFilterText = fts[1];
@@ -1986,6 +2027,10 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             setTicketOperation(operation);
           }
 
+          function decisionId(ticket) {
+            return ticket.deferred?.status === 'pending' ? { requestId: ticket.deferred.requestId } : {};
+          }
+
           async function sendTicketResolution(request) {
             var result = unwrap(await scoped.remote.hubBotSettings.resolveTicket(request));
             if (result?.ticketId !== request.ticketId) throw new Error(t('ticketResultMissing'));
@@ -2020,7 +2065,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             startTicketOperation({ scope });
             var feedback = { ticket: tk.message || tk.id };
             try {
-              var result = await sendTicketResolution({ ticketId: tk.id, resolution, ...(message ? { message } : {}) });
+              var result = await sendTicketResolution({ ticketId: tk.id, resolution, ...decisionId(tk), ...(message ? { message } : {}) });
               if (resolution === 'answer') setAnswers(function (current) {
                 var next = { ...current };
                 delete next[tk.id];
@@ -2049,7 +2094,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             var failures = [];
             for (var ticket of selectedConfirmations) {
               try {
-                await sendTicketResolution({ ticketId: ticket.id, resolution: resolution });
+                await sendTicketResolution({ ticketId: ticket.id, resolution, ...decisionId(ticket) });
               } catch (error) {
                 failures.push({ id: ticket.id, ticket: ticket.message || ticket.id, error: error?.message || String(error) });
               }
@@ -2142,7 +2187,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             found.count++;
           });
           var needsCardSub = needs.length === 0 ? t('quiet') : needsStages.map(function (s) { return s.label + ' ' + s.count; }).join(' · ');
-          function confirmationVersion(ticket) { return ticket.pendingConfirm?.at ?? ticket.updatedAt; }
+          function confirmationVersion(ticket) { return ticket.deferred?.requestId ?? ticket.pendingConfirm?.at ?? ticket.updatedAt; }
           function isSelected(ticket) { return selected.has(ticket.id) && selected.get(ticket.id) === confirmationVersion(ticket); }
           var selectedConfirmations = confirmable.filter(isSelected);
           var selectedCount = selectedConfirmations.length;
@@ -2198,6 +2243,44 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
           function intakeDash(value) {
             return value === null || value === undefined || value === '' ? '—' : String(value);
           }
+          function renderTimers() {
+            if (!Array.isArray(overview.timers)) return null;
+            var timerActionsStyle = { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '6px 8px' };
+            async function act(timer, action) {
+              if (action === 'cancel' && !window.confirm(t('timerCancel') + ' — ' + timer.message + '?')) return;
+              setTimerBusy(true);
+              setTimerError(null);
+              try {
+                unwrap(await scoped.remote.hubBotSettings.timerAction({ id: timer.id, action }));
+                publishOverview(unwrap(await scoped.remote.hubBotSettings.overview()));
+              } catch (error) { setTimerError(error?.message ?? String(error)); }
+              finally { setTimerBusy(false); }
+            }
+            return h('section', { id: 'hub-bot-timers', style: sectionStyle, 'aria-labelledby': 'hub-bot-timers-title' },
+              h('h3', { id: 'hub-bot-timers-title', tabIndex: -1, className: 'hb-scroll-target', style: sectionTitleStyle }, t('timersSection')),
+              timerError ? h('p', { role: 'alert', style: settingsHintStyle }, timerError) : null,
+              overview.timers.length ? overview.timers.map(function (timer) {
+                var stoppable = timer.status === 'firing' || (timer.status === 'fired' && timer.delivery?.state === 'queued');
+                var actions = timer.status === 'pending' ? ['pause', 'cancel'] : timer.status === 'paused' ? ['resume', 'cancel'] : stoppable ? ['cancel'] : [];
+                var statusKey = ({ pending: 'timerPending', paused: 'timerPaused', firing: 'timerFiring', fired: 'timerFired', cancelled: 'timerCancelled', failed: 'timerFailed' })[timer.status];
+                var deliveryKey = ({ sent: 'timerDeliverySent', queued: 'timerDeliveryQueued', failed: 'timerDeliveryFailed' })[timer.delivery?.state];
+                var worker = timer.delivery?.workerSession;
+                var time = timer.fireAt ? new Date(timer.fireAt).toLocaleString() : '—';
+                return h('div', { key: timer.id, style: { margin: '8px 0' } },
+                  h('strong', null, timer.message),
+                  h('div', { style: settingsHintStyle }, [ownerNames.get(timer.ownerId) || timer.ownerId, time, statusKey ? t(statusKey) : timer.status, deliveryKey ? t(deliveryKey) : null, timer.late ? t('timerLate') : null].filter(Boolean).join(' · ')),
+                  timer.lastError?.message || timer.delivery?.lastError
+                    ? h('p', { role: 'alert', style: settingsHintStyle }, timer.lastError?.message ?? timer.delivery.lastError) : null,
+                  h('div', { style: timerActionsStyle }, actions.map(action => h('button', { key: action, type: 'button', style: settingsButtonStyle, disabled: timerBusy, onClick: () => void act(timer, action) },
+                    t(({ pause: 'timerPause', resume: 'timerResume', cancel: 'timerCancel' })[action]))),
+                    timer.delivery?.ticketId ? h('button', { type: 'button', style: settingsButtonStyle, onClick: () => openStream({ ticketId: timer.delivery.ticketId }) }, t('timerRun')) : null,
+                    worker?.sessionId && canOpenOwnerSession ? h('button', { type: 'button', style: settingsButtonStyle, onClick: async () => {
+                      try { await scoped.get('uiWorkspace').openSession(worker.sessionId); }
+                      catch (error) { setTimerError(error?.message ?? String(error)); }
+                    } }, t('timerWorker')) : null));
+              }) : h('p', { style: settingsHintStyle }, t('timersEmpty')));
+          }
+
           function renderIntake() {
             // 旧后端没有 intake 投影时整块不出现——不拿「没有数据」冒充「没有记录」。
             if (!overview.intake) return null;
@@ -2208,6 +2291,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
             }
             function disposition(entry) {
               // 处置口径由 src/panel.js 统一判定（disposition），客户端只翻译，不自己再猜一遍。
+              if (entry.disposition === 'discarded') return t('intakeDiscarded');
               if (entry.disposition === 'dropped') return t('intakeDropped') + (entry.dropped ? ': ' + String(entry.dropped).slice(0, 24) : '');
               if (entry.disposition === 'injected') return t('intakeInjected');
             if (entry.disposition === 'interrupt') return t('intakeInterrupt');
@@ -2512,7 +2596,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                   })()
                 : null,
               h('span', { style: { fontSize: '12px', opacity: 0.55, whiteSpace: 'nowrap' } }, relTime(t, tk.updatedAt))));
-            if (tk.pendingConfirm) rows.push(h('div', { key: 'pc', style: { marginTop: '6px', fontSize: '13px', color: TONES.amber.fg } }, t('pendingConfirmLabel') + tk.pendingConfirm.text));
+            if (tk.pendingConfirm && tk.stage === 'person/confirm') rows.push(h('div', { key: 'pc', style: { marginTop: '6px', fontSize: '13px', color: TONES.amber.fg } }, t('pendingConfirmLabel') + tk.pendingConfirm.text));
             // 确认语义透明化： 危险注入挂起 → 确认=原样投递；fork 提案（无 action）→ 确认=fork 副本续作。
             if (tk.pendingConfirm && tk.stage === 'person/confirm') {
               var pcAction = tk.pendingConfirm.action;
@@ -2543,6 +2627,21 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
               }
             }
             if (tk.question && tk.stage === 'person/answer') rows.push(h('div', { key: 'q', style: { marginTop: '6px', fontSize: '13px', color: TONES.amber.fg } }, t('questionLabel') + tk.question.text));
+            if (tk.deferred?.status === 'pending') {
+              var deadline = new Date(tk.deferred.expiresAt).toLocaleString();
+              var targetId = tk.deferred.target?.sessionId;
+              rows.push(h('p', { key: 'deferred-deadline', style: settingsHintStyle }, t('deferredExpires') + ' · ' + deadline,
+                targetId ? ' · ' + t('deferredTarget') + ' ' + targetId : null));
+            }
+            var answerDelivery = tk.deferred?.delivery;
+            var answerStatusKey = ({ queued: 'answerQueued', sent: 'answerSent', failed: 'answerFailed', discarded: 'answerDiscarded' })[answerDelivery?.state];
+            var decisionNote = answerDelivery?.reason || tk.deferred?.reason;
+            if (answerStatusKey || decisionNote) {
+              rows.push(h('p', { key: 'deferred-result', style: settingsHintStyle },
+                [answerStatusKey && t(answerStatusKey), decisionNote].filter(Boolean).join(' · ')));
+            }
+            if (tk.deferred?.answer) rows.push(h('details', { key: 'deferred-answer-text', style: settingsHintStyle },
+              h('summary', null, t('deferredAnswer')), h('p', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } }, tk.deferred.answer)));
             var report = tk.report ? h(TicketReport, { key: 'report', report: tk.report,
               copied: copiedId === 'rp:' + tk.id, copy: text => copyText(text, 'rp:' + tk.id),
             }) : null;
@@ -2904,6 +3003,7 @@ function createTypertRemoteInfo(spec,zod){return new RemoteInfo(spec,zod)}var Re
                         stagePill(stage, (list[0].stageText || stage) + ' · ' + list.length)),
                       h('div', { style: { marginTop: '8px' } }, rows));
                   })),
+            renderTimers(),
             renderIntake(),
             renderRecentMessages(),
             h('section', { style: sectionStyle, id: 'hub-bot-owners', 'aria-labelledby': 'hub-bot-owners-title' },

@@ -96,6 +96,7 @@ function detailRow(label, value) {
 function ticketDetails(t) {
   const box = el('div', { class: 'ticket-details' })
   if (t.authorization) box.append(detailRow('授权', t.authorization.actor + ' 经 ' + t.authorization.source + ' 于 ' + fmtTime(t.authorization.at)))
+  if (t.deferred?.answer) box.append(detailRow('用户答复', t.deferred.answer))
   if (t.trigger) box.append(detailRow('Trigger', shortId(t.trigger.id) + (t.trigger.kind ? ' (' + t.trigger.kind + ')' : '')))
   for (const a of t.assignments ?? []) box.append(detailRow('Assignment', a.state + ' · ' + fmtTime(a.startedAt) + (a.endedAt ? ' → ' + fmtTime(a.endedAt) : '') + (a.endedReason ? ' (' + a.endedReason + ')' : '')))
   if (t.report) {
@@ -118,7 +119,7 @@ function confirmActions(t) {
     const label = resolution === 'confirm' ? '确认' : '拒绝'
     // 破坏性动作需确认 (spec 面板原则)
     if (!window.confirm(label + '任务 ' + shortId(t.id) + '？\n' + (t.pendingConfirm?.text ?? ''))) return
-    await api('tickets/resolve', { method: 'POST', body: { ticketId: t.id, resolution } })
+    await api('tickets/resolve', { method: 'POST', body: { ticketId: t.id, resolution, requestId: t.deferred?.requestId } })
     await refresh()
   }
   wrap.append(
@@ -126,6 +127,15 @@ function confirmActions(t) {
     el('button', { class: 'btn danger', onclick: () => void act('reject').catch(showError) }, text('拒绝')),
   )
   return wrap
+}
+
+function answerAction(t) {
+  return el('button', { class: 'btn', type: 'button', onclick: () => void (async () => {
+    const message = window.prompt(t.question?.text ?? '回复')?.trim()
+    if (!message) return
+    await api('tickets/resolve', { method: 'POST', body: { ticketId: t.id, resolution: 'answer', message, requestId: t.deferred?.requestId } })
+    await refresh()
+  })().catch(showError) }, text('回复'))
 }
 
 function ticketRow(t, { actions } = {}) {
@@ -137,8 +147,18 @@ function ticketRow(t, { actions } = {}) {
   head.append(el('time', {}, text(fmtTime(t.updatedAt))))
   if (actions) head.append(actions)
   row.append(head)
-  if (t.pendingConfirm) row.append(el('div', { class: 'pending-confirm' }, text('待确认：' + t.pendingConfirm.text)))
-  if (t.question) row.append(el('div', { class: 'pending-confirm' }, text('等您回复：' + t.question.text)))
+  if (t.pendingConfirm && t.stage === 'person/confirm') row.append(el('div', { class: 'pending-confirm' }, text('待确认：' + t.pendingConfirm.text)))
+  if (t.question && t.stage === 'person/answer') row.append(el('div', { class: 'pending-confirm' }, text('等您回复：' + t.question.text)))
+  if (t.deferred?.status === 'pending') {
+    const target = t.deferred.target?.sessionId
+    row.append(el('p', { class: 'quiet small' }, text('截止时间 ' + fmtTime(t.deferred.expiresAt) + (target ? ' · 目标会话 ' + target : ''))))
+  }
+  const answerDelivery = t.deferred?.delivery
+  const answerStates = { queued: '答复待接管', sent: '答复已接管', failed: '答复投递失败', discarded: '已丢弃答复投递' }
+  if (answerStates[answerDelivery?.state] || t.deferred?.reason) {
+    const result = [answerStates[answerDelivery?.state], answerDelivery?.reason ?? t.deferred?.reason].filter(Boolean).join(' · ')
+    row.append(el('p', { class: 'quiet small' }, text(result)))
+  }
   row.append(el('details', {}, el('summary', {}, text('详情')), ticketDetails(t)))
   return row
 }
@@ -153,7 +173,8 @@ function renderBoard(overview) {
   needBox.replaceChildren()
   if (!needs.length) needBox.append(el('p', { class: 'quiet' }, text('没有 — 安静默认。')))
   for (const t of needs) {
-    needBox.append(ticketRow(t, { actions: t.stage === 'person/confirm' ? confirmActions(t) : undefined }))
+    needBox.append(ticketRow(t, { actions: t.stage === 'person/confirm' ? confirmActions(t)
+      : t.stage === 'person/answer' ? answerAction(t) : undefined }))
   }
 
   // Q2 什么状态: 按阶段分组, 组头计数 = 列表长度 (诚实状态)
@@ -200,6 +221,7 @@ function renderBoard(overview) {
   }
 
   // 投喂口径（只读观测面）：飞书入口与负责人路由各自生效的受理口径/去重/队列状态
+  renderTimers(overview.timers, owners)
   renderIntake(overview.intake)
 
   // 最近触发（观测面）：渠道消息与处置——直读 trigger 表，异步加载不阻塞三问
@@ -213,14 +235,73 @@ function renderBoard(overview) {
       el('th', {}, text('时间')), el('th', {}, text('渠道')), el('th', {}, text('内容')), el('th', {}, text('处置'))))
     for (const t of triggers) {
       const msg = String(t.message ?? '').replace(/\s+/g, ' ')
+      const message = el('td', { class: 'small', title: msg }, text(msg.length > 40 ? msg.slice(0, 40) + '…' : msg))
+      if (t.intakeCohort) message.append(renderCohort(t))
+      const ticket = tickets.find(ticket => ticket.trigger?.id === t.id)
+      const accepted = t.injectedAt || ticket?.lastDelivery?.state === 'sent'
       table.append(el('tr', {},
         el('td', { class: 'quiet small' }, text(fmtTime(t.at))),
         el('td', { class: 'quiet small' }, text(t.kind ?? '—')),
-        el('td', { class: 'small', title: msg }, text(msg.length > 40 ? msg.slice(0, 40) + '…' : msg)),
-        el('td', { class: 'quiet small' }, text(t.dropped ? '已丢弃' : (t.authorization ? '已注入' : '已记录')))))
+        message,
+        el('td', { class: 'quiet small' }, text(t.dropped ? '已丢弃' : accepted ? '已接管' : t.intakeDiscarded ? '已丢弃投递' : '已记录'))))
     }
     trigBox.append(table)
   }).catch(() => trigBox.replaceChildren(el('p', { class: 'quiet small' }, text('触发记录加载失败。'))))
+}
+
+function renderCohort(trigger) {
+  const content = el('div', { class: 'quiet small' })
+  const details = el('details', {}, el('summary', {}, text('合并来信 · ' + trigger.intakeCohort.mergedCount)), content)
+  details.addEventListener('toggle', async () => {
+    if (!details.open) return
+    content.replaceChildren(text('加载中…'))
+    try {
+      const detail = await api('triggers/detail?triggerId=' + encodeURIComponent(trigger.id))
+      const entries = detail.intake?.cohort?.messages ?? []
+      const list = el('ul', {}, ...entries.map(item => el('li', {}, text([item.triggerId, item.message, ...item.ticketIds].filter(Boolean).join(' · ')))))
+      content.replaceChildren(list)
+    } catch (error) {
+      content.replaceChildren(text(error.message))
+    }
+  })
+  return details
+}
+
+function renderTimers(timers, owners) {
+  const box = $('#timers')
+  const available = Array.isArray(timers)
+  $('#timers-title').hidden = !available
+  box.replaceChildren()
+  if (!available) return
+  if (!timers.length) box.append(el('p', { class: 'quiet' }, text('暂无提醒。')))
+  const states = { pending: '待触发', paused: '已暂停', firing: '正在提交', fired: '已建任务', cancelled: '已取消', failed: '失败' }
+  for (const timer of timers) {
+    const label = owners.find(owner => owner.id === timer.ownerId)?.workspace ?? timer.ownerId
+    const actions = timer.status === 'pending' ? [['pause', '暂停'], ['cancel', '取消提醒']]
+      : timer.status === 'paused' ? [['resume', '恢复'], ['cancel', '取消提醒']] : timer.status === 'firing' || (timer.status === 'fired' && timer.delivery?.state === 'queued') ? [['cancel', '取消提醒']] : []
+    const row = el('div', { class: 'ticket-row' }, el('strong', {}, text(timer.message)),
+      el('p', { class: 'quiet small' }, text([label, fmtTime(timer.fireAt), states[timer.status], timer.late ? '已迟到' : null].filter(Boolean).join(' · '))))
+    if (timer.delivery?.ticketId) row.append(el('p', { class: 'quiet small' }, text('任务 ' + timer.delivery.ticketId)))
+    const delivery = ({ queued: '待投递', sent: '已接管', failed: '投递失败' })[timer.delivery?.state]
+    if (delivery) row.append(el('p', { class: 'quiet small' }, text(delivery)))
+    if (timer.delivery?.workerSession?.sessionId) row.append(el('p', { class: 'quiet small' }, text('会话 ' + timer.delivery.workerSession.sessionId)))
+    const reason = timer.lastError?.message ?? timer.delivery?.lastError
+    if (reason) row.append(el('p', { role: 'alert', class: 'warn-text' }, text(reason)))
+    for (const [action, name] of actions) {
+      const button = el('button', { class: 'btn', type: 'button' }, text(name))
+      button.addEventListener('click', async () => {
+        if (action === 'cancel' && !window.confirm('取消提醒「' + timer.message + '」？')) return
+        button.disabled = true
+        try {
+          await api('timers/manage', { method: 'POST', body: { id: timer.id, action } })
+          await refresh()
+        } catch (error) { showError(error) }
+        finally { button.disabled = false }
+      })
+      row.append(button)
+    }
+    box.append(row)
+  }
 }
 
 /* ---------- 投喂口径（只读） ---------- */
@@ -228,7 +309,7 @@ function renderBoard(overview) {
 // 这一块没有任何输入框、没有保存按钮——只把事实念出来，缺什么就显示「—」，不猜、不补。
 const QUEUE_TEXT = { queued: '排队中', held: '暂缓', recorded: '待发送', sent: '已送达', failed: '失败' }
 // 处置口径由 src/panel.js 统一判定（disposition 字段），面板只负责翻译，不自己再猜一遍。
-const DISPOSITION_TEXT = { dropped: '已丢弃', injected: '已注入', pending: '待注入', interrupt: '停止请求', 'interrupt-requested': '已请求停止' }
+const DISPOSITION_TEXT = { dropped: '已丢弃', discarded: '已丢弃投递', injected: '已注入', pending: '待注入', interrupt: '停止请求', 'interrupt-requested': '已请求停止' }
 
 function dash(value) { return value === null || value === undefined || value === '' ? '—' : String(value) }
 

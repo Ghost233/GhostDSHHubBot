@@ -301,6 +301,27 @@ test('cancel accepts an actor/reason/kind for the 24h auto-cancel audit (#69)', 
   } finally { cleanup() }
 })
 
+test('a closed deferred request cannot reopen or replace the current ticket face', () => {
+  const { board, seed, cleanup } = fixture()
+  try {
+    const ticket = seed()
+    assert.throws(() => board.noteDeferred(ticket.id, { status: 'accepted' }), { code: 'no-deferred' })
+    const original = { requestId: 'dfr-original', type: 'confirm', target: { sessionId: 'session-original' } }
+    board.attachDeferred(ticket.id, original)
+    const closed = board.closeDeferred(ticket.id, { status: 'expired', outcome: { kind: 'timeout' } }).deferred
+    assert.deepEqual(board.attachDeferred(ticket.id, original), closed)
+    assert.throws(() => board.attachDeferred(ticket.id, { ...original, target: { sessionId: 'session-new' } }), { code: 'deferred-immutable' })
+    const next = board.attachDeferred(ticket.id, { ...original, requestId: 'dfr-next' })
+    assert.deepEqual(board.attachDeferred(ticket.id, original), closed)
+    assert.deepEqual(board.getDeferred(ticket.id), next)
+    assert.deepEqual(board.getTicket(ticket.id).deferredHistory, [closed])
+    board.noteDeferred(ticket.id, { status: 'accepted', outcome: { decision: 'approve' } })
+    assert.throws(() => board.noteDeferred(ticket.id, { status: 'pending' }), { code: 'deferred-status-invalid' })
+    assert.throws(() => board.closeDeferred(ticket.id, { status: 'expired' }), { code: 'deferred-status-invalid' })
+    assert.equal(board.getDeferred(ticket.id).status, 'accepted')
+  } finally { cleanup() }
+})
+
 test('bindWorkerSession can mark the mechanism (fork) while accruing the assignment (#69)', () => {
   const { board, seed, cleanup } = fixture()
   try {

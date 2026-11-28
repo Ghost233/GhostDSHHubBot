@@ -17,10 +17,11 @@
  */
 import { randomUUID } from 'node:crypto'
 import { TaskBoard, STAGE_TEXT, normalizeStage, translateTaskError, CONFIRM_TIMEOUT_MS } from './tasks.js'
-import { OutboxRunner, insertOutbox } from './outbox.js'
+import { OutboxRunner, insertOutbox, updateOutboxRow } from './outbox.js'
 import { feishuPrompt, UNSUPPORTED_MESSAGE_TYPE } from './inbox.js'
 import { truncateWords } from './discipline.js'
-import { buildDigestText, buildAutoSummary } from './reporting.js'
+import { buildDigestText, buildAutoSummary, factLine } from './reporting.js'
+import { isWithinCwd } from './paths.js'
 import { confirmTicketFork } from './fork.js'
 import { DANGEROUS_INJECT_ACTION, DEFAULT_DANGEROUS_PATTERNS, findDangerousPattern, dangerousConfirmText } from './security.js'
 
@@ -58,6 +59,7 @@ export class Router {
   // Owner queues protect execution slots. Trigger queues prevent duplicate tickets across owners.
   #queues = new Map()
   #currentStops = new Map()
+  #applyingPanelDecisions = new Map()
 
   constructor({ store, registry, sessions, tasks, runner, config, now, ids, onSystemProblem, placer }) {
     this.store = store
@@ -85,12 +87,14 @@ export class Router {
       store,
       now: () => Date.parse(this.now()),
       deliver: row => this.#deliverRow(row),
+      onFailure: (row, reason) => this.#settleDeliveryFailure(row, reason),
       onSystemProblem,
     })
   }
 
   #persistWork(write) {
     const db = this.store.db
+    if (db.isTransaction) return write()
     db.exec('BEGIN IMMEDIATE')
     try {
       const result = write()
@@ -100,6 +104,271 @@ export class Router {
       if (db.isTransaction) db.exec('ROLLBACK')
       throw error
     }
+  }
+
+  installDeferred(book) {
+    this.deferred = book
+    book.setHandler('fork', input => this.#fulfillDeferred(input.request))
+    book.setHandler(DANGEROUS_INJECT_ACTION, input => this.#fulfillDeferred(input.request))
+    book.setCloseHandler(request => this.#enqueueDeferredOutcome(request))
+  }
+
+  #settleDeliveryFailure(row, reason) {
+    if (row.kind === 'deferred-answer') {
+      const requestId = row.id.slice('out-answer-'.length)
+      if (this.deferred?.get(requestId)?.outcome?.decision === 'answer') this.deferred.recordAnswerDelivery(requestId, { state: 'failed', reason })
+      return true
+    }
+    if (!row.ticketId) return false
+    const ticket = this.tasks.getTicket(row.ticketId)
+    if (row.kind === 'approved-owner-inject') {
+      const requestId = row.requestId.slice('hub-bot-approved-'.length)
+      if (this.#currentDeferredWork(row.ticketId, requestId)) this.tasks.fail({ ticketId: ticket.id, reason })
+      return true
+    }
+    if (row.kind === 'background-recovery') {
+      if (ticket?.stage === 'working' && ticket.recoveryPending) {
+        const blocked = this.tasks.escalate({ ticketId: ticket.id, reason, by: 'system' })
+        this.#enqueueBackgroundReport(blocked)
+      }
+      return true
+    }
+    if (row.kind !== 'inject' || !ticket?.background || row.requestId !== ticket.requestId) return false
+    if (['idle', 'working'].includes(ticket.stage) && ticket.lastDelivery?.state !== 'sent') {
+      this.tasks.fail({ ticketId: ticket.id, reason })
+    }
+    return true
+  }
+
+  #requireCurrentApproval(requestId) {
+    const ticket = this.deferred.acceptedTicket(requestId)
+    const owner = ticket && this.registry.get(ticket.owner)
+    if (!owner || owner.recycled || !ticket.authorization) {
+      throw new RouterError('stale-deferred', 'This confirmation and its original authority must still be present.')
+    }
+    const target = ticket.deferred.target
+    if (target?.ownerId && target.sessionId && (owner.sessionId !== target.sessionId || this.sessions.isArchived?.(target.sessionId))) {
+      throw new RouterError('deferred-target-invalid', 'The original owner session is unavailable. Request a new confirmation for the current session.')
+    }
+    return { ticket, owner }
+  }
+
+  async #fulfillDeferred(request) {
+    const { ticket, owner } = this.#requireCurrentApproval(request.requestId)
+    const target = request.target?.sessionId
+    if (target && !request.target.ownerId) {
+      const worker = await this.sessions.workerInfo?.(target)
+      const current = this.#requireCurrentApproval(request.requestId)
+      if (!worker || this.registry.isOwnerSession(target) || this.sessions.isArchived?.(target)
+        || ['hub-bot-owner', 'hub-bot-router'].includes(worker.agentPreset) || !worker.cwd || !isWithinCwd(current.owner.cwd, worker.cwd)) {
+        throw new RouterError('deferred-target-invalid', 'The original execution session is unavailable. Request a new confirmation for a different target.')
+      }
+    }
+    if (request.action.type === 'fork') return this.#confirmPendingFork(owner, ticket, ticket.id, request.requestId)
+    if (ticket.background && request.action.entry === 'route') {
+      return this.#persistWork(() => {
+        this.tasks.confirm({ ticketId: ticket.id, result: { deferred: request.requestId }, by: 'user' })
+        const held = this.#workingCount(owner.id) > this.#slotsPerOwner()
+        if (held) this.tasks.demote(ticket.id)
+        this.runner.enqueue({
+          ticketId: ticket.id, triggerId: ticket.triggerId, kind: 'inject', to: 'owner:' + owner.id,
+          body: '[后台任务 ' + ticket.id + '] ' + request.action.message
+            + '\n\n原请求授权：' + ticket.authorization.actor + ' 经 ' + ticket.authorization.source + ' 于 ' + ticket.authorization.at
+            + '\n确认编号：' + request.requestId, requestId: ticket.requestId, held,
+        })
+        return { ticketId: ticket.id, stage: held ? 'queued' : 'working' }
+      })
+    }
+    return this.#confirmDangerousInject(owner, ticket, ticket.id, request.requestId)
+  }
+
+  askWorker({ ticketId, sessionId, question }) {
+    const ticket = this.tasks.getTicket(ticketId)
+    if (!this.#canAskWorker(ticket, sessionId)) {
+      throw new RouterError('worker-mismatch', 'Only the bound worker may ask a question for this active task')
+    }
+    return this.#persistWork(() => {
+      this.tasks.markDelivered(ticketId)
+      const result = this.openQuestion({ ticketId, question, workerSessionId: sessionId })
+      return { ticketId, stage: result.stage }
+    })
+  }
+
+  openQuestion({ ticketId, question, action, workerSessionId }) {
+    return this.#persistWork(() => {
+      const ticket = action ? this.tasks.askConfirm({ ticketId, question, action }) : this.tasks.ask({ ticketId, question })
+      if (!this.deferred || !ticket.authorization?.actor) return ticket
+      const origin = this.getTrigger(ticket.triggerId)?.source
+      const returnTo = origin?.kind === 'timer' ? origin.origin ?? origin : origin
+      const source = { ...returnTo, kind: returnTo?.kind ?? ticket.authorization.source, triggerId: returnTo?.triggerId ?? ticket.triggerId ?? null }
+      const independentLaunch = ticket.background && action?.entry === 'route'
+      const ownerSessionId = action && !action.sessionId && !independentLaunch ? this.registry.get(ticket.owner)?.sessionId : null
+      const request = this.deferred.request({
+        action: action ?? { type: 'ask-user' }, type: action ? 'confirm' : 'answer', ticketId, ownerId: ticket.owner, question,
+        requester: { actor: returnTo?.actor ?? ticket.authorization.actor }, source,
+        target: action?.sessionId ? { sessionId: action.sessionId } : action
+          ? { ownerId: ticket.owner, ...(ownerSessionId && { sessionId: ownerSessionId }) } : null,
+        receiver: workerSessionId ? { kind: 'worker', sessionId: workerSessionId } : { kind: 'owner', ownerId: ticket.owner },
+      })
+      if (source.kind === 'feishu' && source.chatId) {
+        const command = '/hub-answer ' + request.requestId
+        const commands = action ? '通过 ' + command + ' approve\n拒绝 ' + command + ' reject' : command + ' answer <回复>'
+        const details = ['截止 ' + request.expiresAt, request.target?.sessionId && '目标会话 ' + request.target.sessionId].filter(Boolean)
+        insertOutbox(this.store, {
+          id: 'out-question-' + request.requestId, ticketId, triggerId: source.triggerId, kind: 'reply', state: 'recorded',
+          to: 'feishu:chat:' + source.chatId, requestId: 'hub-bot-question-' + request.requestId,
+          body: [question, ...details, commands].join('\n'),
+        }, () => Date.parse(this.now()))
+      }
+      return this.tasks.getTicket(ticketId)
+    })
+  }
+
+  #isOriginalFeishuSender(request, actor, chatId) {
+    return request.source.kind === 'feishu' && request.source.chatId === chatId && request.requester.actor === actor
+  }
+
+  async resolveDeferred({ requestId, ticketId, decision, text, channel, actor, chatId, receivedAt }) {
+    const receipt = channel === 'panel' ? this.now() : receivedAt
+    const request = this.deferred?.get(requestId)
+    if (!request || (ticketId !== undefined && ticketId !== request.ticketId)) {
+      throw new RouterError('unknown-deferred', 'The decision does not identify this request.')
+    }
+    if (channel !== 'panel' && !(channel === 'feishu' && this.#isOriginalFeishuSender(request, actor, chatId))) {
+      throw new RouterError('deferred-actor-mismatch', 'The original sender must answer in the original Feishu chat, or use the authenticated panel.')
+    }
+    if (channel === 'panel' && this.#isTimelyDecision(request, decision, text, receipt, Date.parse(receipt))) {
+      const row = insertOutbox(this.store, {
+        kind: 'deferred-decision', state: 'queued', to: 'owner:' + request.ownerId,
+        requestId: 'hub-bot-panel-decision-' + this.ids.uuid(),
+        panelDecision: { requestId, ticketId: request.ticketId, decision, text: text ?? null, receivedAt: receipt },
+      }, () => Date.parse(receipt))
+      return this.#applyPanelDecision(row)
+    }
+    return this.#applyDeferredDecision(request, { decision, text, receivedAt: receipt })
+  }
+
+  #applyDeferredDecision(request, { decision, text, receivedAt }) {
+    return this.#serialized('owner:' + request.ownerId, async () => {
+      if (this.store.closed) throw new Error('Hub Bot stopped while processing this decision.')
+      const { requestId } = request
+      const ticket = this.tasks.getTicket(request.ticketId)
+      if (!ticket?.authorization || ticket.deferred?.requestId !== requestId) {
+        throw new RouterError('stale-deferred', 'This request is no longer the active decision for its task.')
+      }
+      const workerUnavailable = decision === 'answer' && this.deferred.get(requestId)?.status === 'pending' && request.receiver.kind === 'worker'
+        && !await this.#canReceiveWorkerAnswer(ticket, request.receiver.sessionId)
+      if (this.store.closed) throw new Error('Hub Bot stopped while processing this decision.')
+      const result = await this.deferred.resolve({ requestId, decision, text, actor: { actor: request.requester.actor }, workerUnavailable, receivedAt })
+      return { ticketId: ticket.id, requestId, stage: this.tasks.getTicket(ticket.id).stage, outcome: result.status, duplicate: result.duplicate }
+    })
+  }
+
+  #applyPanelDecision(row) {
+    const active = this.#applyingPanelDecisions.get(row.id)
+    if (active) return active
+    const recorded = reason => {
+      if (this.store.closed) return
+      const current = this.#outboxRow(row.id)
+      if (current?.state === 'queued') updateOutboxRow(this.store, { ...current, state: 'recorded', recordedAt: this.now(),
+        nextRetryAt: null, ...(reason && { skipReason: reason }) })
+    }
+    const running = (async () => {
+      try {
+        const input = row.panelDecision
+        const request = this.deferred?.get(input.requestId)
+        if (!request || request.ticketId !== input.ticketId) throw new RouterError('unknown-deferred', 'This decision has no matching request.')
+        const result = await this.#applyDeferredDecision(request, input)
+        recorded()
+        return result
+      } catch (error) {
+        if (['TaskError', 'RouterError', 'DeferredError'].includes(error?.name)) recorded(error.code)
+        throw error
+      }
+    })().finally(() => this.#applyingPanelDecisions.delete(row.id))
+    this.#applyingPanelDecisions.set(row.id, running)
+    return running
+  }
+
+  #enqueueDeferredOutcome(request) {
+    if (request.status === 'answered' && request.outcome.decision === 'answer') {
+      this.runner.enqueue({
+        id: 'out-answer-' + request.requestId, kind: 'deferred-answer', ticketId: request.ticketId, triggerId: request.source.triggerId,
+        to: 'owner:' + request.ownerId, requestId: 'hub-bot-answer-' + request.requestId,
+        body: '[您的答复 ' + request.ticketId + '] ' + request.outcome.text,
+      })
+    } else if (request.status === 'expired') {
+      const feishu = request.source.kind === 'feishu' && request.source.chatId
+      insertOutbox(this.store, {
+        id: 'out-expiry-' + request.requestId, kind: 'reply', ticketId: request.ticketId, triggerId: request.source.triggerId,
+        to: feishu ? 'feishu:chat:' + request.source.chatId : 'dsh:session:chief',
+        state: feishu ? 'recorded' : 'queued', requestId: 'hub-bot-expiry-' + request.requestId,
+        body: '请求 ' + request.requestId + ' 已过期。',
+      }, () => Date.parse(this.now()))
+    }
+  }
+
+  async #canReceiveWorkerAnswer(ticket, sessionId) {
+    if (!this.#isBoundWorker(ticket, sessionId)) return false
+    if (!this.sessions.workerInfo) return true
+    const worker = await this.sessions.workerInfo(sessionId)
+    const live = this.tasks.getTicket(ticket.id)
+    const owner = live && this.registry.get(live.owner)
+    return Boolean(owner && !owner.recycled && this.#isBoundWorker(live, sessionId) && worker?.cwd
+      && !['hub-bot-owner', 'hub-bot-router'].includes(worker.agentPreset) && isWithinCwd(owner.cwd, worker.cwd))
+  }
+
+  #currentDeferredWork(ticketId, requestId) {
+    const ticket = this.tasks.getTicket(ticketId)
+    if (!requestId || ticket?.stage !== 'working' || ticket.deferred?.requestId !== requestId || !ticket.authorization) return undefined
+    const revision = ticket.deferred.waitRevision
+    if (typeof revision === 'number' && ticket.transitions?.length !== revision + 1) return undefined
+    return ticket
+  }
+
+  async #deliverDeferredAnswer(row) {
+    const requestId = row.id.slice('out-answer-'.length)
+    const request = this.deferred?.get(requestId)
+    const current = () => request && this.#currentDeferredWork(request.ticketId, requestId)
+    const inactive = { recorded: true, skipped: 'deferred-no-longer-active' }
+    const ticket = current()
+    const deliveryState = request?.outcome?.delivery?.state
+    if (deliveryState === 'sent') return
+    if (deliveryState === 'failed') return inactive
+    const skipped = () => {
+      if (request?.outcome?.decision === 'answer') this.deferred.recordAnswerDelivery(requestId, {
+        state: 'failed', reason: 'The task moved on before the answer could be delivered.',
+      })
+      return inactive
+    }
+    if (!ticket) return skipped()
+    const permanent = reason => Object.assign(new Error(reason), { permanent: true })
+    const text = () => (current()?.recoveryPending ? RECOVERY_NOTE + '\n\n' : '') + row.body
+    if (request.receiver.kind === 'worker') {
+      const sessionId = request.receiver.sessionId
+      const available = await this.#canReceiveWorkerAnswer(ticket, sessionId)
+      if (!current()) return skipped()
+      const unavailable = 'The original execution session is no longer available.'
+      if (!available) throw permanent(unavailable)
+      try {
+        await this.sessions.prompt({ sessionId, requestId: row.requestId, text: text() })
+      } catch (error) {
+        if (isMissingSession(error) || error?.code === 'session/not-found') throw permanent(unavailable)
+        throw error
+      }
+    } else {
+      const owner = this.registry.get(request.ownerId)
+      if (!owner || owner.recycled) throw permanent('The original owner is no longer available.')
+      const ensured = await (owner.role === 'chief' ? this.#ensureChiefSession() : this.#ensureSession(owner))
+      const sessionId = this.registry.get(owner.id)?.sessionId ?? ensured.sessionId
+      const delivered = await this.#promptOwner(owner.id, { sessionId }, ticket.id, row.requestId, text(), current)
+      if (!delivered) return skipped()
+    }
+    if (this.store.closed) return
+    this.#persistWork(() => {
+      this.deferred.recordAnswerDelivery(requestId, { state: 'sent' })
+      if (current()?.recoveryPending) this.tasks.noteRecoveryCarried(ticket.id)
+    })
   }
 
   #insertTrigger(row) {
@@ -132,18 +401,21 @@ export class Router {
     const previous = this.getTrigger(id)
     const pending = this.#outboxRow(outboxId)
     const receipt = { triggerId: id, requestId, deduped: Boolean(previous), admitted: false, queued: false }
-    if (previous && (pending || previous.injectedAt !== null || previous.dropped || !previous.authorization || incoming.dropped)) {
+    if (previous && (pending || previous.intakeDiscarded || previous.intakeCohort || previous.injectedAt !== null || previous.dropped || !previous.authorization || incoming.dropped)) {
       return { ...receipt, dropped: previous.dropped ?? null, outboxId: pending?.id ?? null }
     }
 
-    const stop = !previous && !incoming.dropped && ['停', '停止'].includes(incoming.message)
+    const command = !previous && !incoming.dropped && this.deferred
+      ? /^[/]hub-answer +([a-z0-9-]+) +(approve|reject|answer)(?: +([\s\S]+))?$/.exec(incoming.message) : null,
+      stop = !previous && !incoming.dropped && ['停', '停止'].includes(incoming.message)
     const sessionId = stop ? this.registry.get('chief')?.sessionId ?? null : null
     const skipStop = stop && (!sessionId ? 'no-current-session' : this.#currentStops.has(sessionId) ? 'interrupt-in-flight' : null)
     const trigger = {
       ...(previous ?? incoming),
       ownerId: 'chief',
       injectedAt: null,
-      policy: previous?.policy ?? { ...incoming.policy, mode: incoming.dropped ? 'drop' : stop ? 'interrupt' : 'queue' },
+      policy: previous?.policy ?? { ...incoming.policy, mode: incoming.dropped ? 'drop' : stop ? 'interrupt' : command ? 'decision' : 'queue' },
+      ...(command && { decision: { requestId: command[1], decision: command[2], text: command[3] ?? '' } }),
     }
     this.#persistWork(() => {
       if (previous) this.#updateTrigger(trigger)
@@ -160,7 +432,7 @@ export class Router {
         }, () => Date.parse(trigger.at))
       } else if (!trigger.dropped) {
         this.runner.enqueue({
-          id: outboxId, ticketId: null, triggerId: id, kind: stop ? 'stop' : 'inbox', to: 'owner:chief',
+          id: outboxId, ticketId: null, triggerId: id, kind: stop ? 'stop' : command ? 'deferred-decision' : 'inbox', to: 'owner:chief',
           body: trigger.message, sessionId, requestId,
         })
       }
@@ -199,15 +471,28 @@ export class Router {
       if (!this.store.closed) this.#updateTrigger({ ...trigger, interruptAt: this.now() })
       return
     }
-    if (trigger.injectedAt) return
+    const cohort = Array.isArray(row.mergedRows) ? row.mergedRows : [row]
+    const sources = cohort.map(item => this.getTrigger(item.triggerId))
+    if (sources.some(entry => !entry?.authorization || entry.dropped || entry.kind !== 'feishu' || entry.source?.chatId !== trigger.source?.chatId)) {
+      throw Object.assign(new Error('The original intake cohort is invalid'), { permanent: true })
+    }
+    if (sources.every(entry => entry.injectedAt)) return
     const ensured = await this.#ensureChiefSession()
     const model = this.config.chief?.model
     if (model) {
       try { await this.sessions.selectModel?.({ sessionId: ensured.sessionId, ...model }) }
       catch { /* Keep the configured deployment model if selection is unavailable. */ }
     }
-    await this.#promptOwner('chief', ensured, null, row.requestId, feishuPrompt(trigger))
-    if (!this.store.closed) this.#updateTrigger({ ...this.getTrigger(trigger.id), injectedAt: this.now() })
+    const text = sources.map(feishuPrompt).join('\n\n')
+    await this.#promptOwner('chief', ensured, null, row.requestId, text)
+    if (this.store.closed) return
+    this.#persistWork(() => {
+      const at = this.now()
+      for (const { id } of sources) {
+        const latest = this.getTrigger(id)
+        if (latest && !latest.injectedAt) this.#updateTrigger({ ...latest, injectedAt: at })
+      }
+    })
   }
 
   /** One Ticket row by id (stage normalized), or undefined. */
@@ -221,12 +506,13 @@ export class Router {
    * (spec「错误场景」: 待确认路由 24 小时未确认自动取消，回复"已取消").
    */
   async tick() {
-    await this.runner.tick()
+    await this.runner.tick({ kind: 'deferred-decision' })
+    await this.runner.tick({ excludeKind: 'deferred-decision' })
     await this.#sweepConfirmTimeouts()
     // #72 执行槽： a slot freed since the last pulse promotes the oldest queued ticket (FIFO); the second
     // runner pass delivers the released injection in the same pulse （提升即投递）.
     await this.#promoteQueued()
-    await this.runner.tick()
+    await this.runner.tick({ excludeKind: 'deferred-decision' })
   }
 
   /**
@@ -235,9 +521,47 @@ export class Router {
    * stored-then-delivered by the runner like every outward message （先存后做）; a ticket cancelled once leaves
    * person/confirm, so the notice fires exactly once.
    */
+  #isTimelyDecision(request, decision, text, at, nowMs) {
+    if (request.status !== 'pending') return false
+    const received = Date.parse(at)
+    if (!(received <= nowMs && received >= Date.parse(request.openedAt) && received < Date.parse(request.expiresAt))) return false
+    const ticket = this.tasks.getTicket(request.ticketId)
+    if (!ticket?.authorization || ticket.deferred?.requestId !== request.requestId) return false
+    if (request.type === 'answer') return ticket.stage === 'person/answer' && (decision === 'cancel'
+      || (decision === 'answer' && typeof text === 'string' && Boolean(text.trim())))
+    return ticket.stage === 'person/confirm' && ['approve', 'reject', 'cancel'].includes(decision)
+  }
+
+  #receivedDecisions() {
+    const ids = new Set()
+    const nowMs = Date.parse(this.now())
+    const rows = this.store.db.prepare(`
+      SELECT value FROM outbox
+      WHERE json_extract(value, '$.kind') = 'deferred-decision' AND json_extract(value, '$.state') = 'queued'
+    `).all()
+    for (const { value } of rows) {
+      const row = JSON.parse(String(value))
+      if (row.panelDecision) {
+        const { requestId, ticketId, decision, text, receivedAt } = row.panelDecision
+        const request = this.deferred.get(requestId)
+        if (request?.ticketId === ticketId && this.#isTimelyDecision(request, decision, text, receivedAt, nowMs)) ids.add(requestId)
+        continue
+      }
+      const trigger = this.getTrigger(row.triggerId)
+      const choice = trigger?.decision
+      if (!choice || !trigger.authorization || trigger.dropped) continue
+      const request = this.deferred.get(choice.requestId)
+      if (!request || !this.#isOriginalFeishuSender(request, trigger.authorization.actor, trigger.source?.chatId)) continue
+      if (this.#isTimelyDecision(request, choice.decision, choice.text, trigger.at, nowMs)) ids.add(request.requestId)
+    }
+    return ids
+  }
+
   async #sweepConfirmTimeouts() {
+    this.deferred?.sweep({ skipRequestIds: this.#receivedDecisions() })
     const nowMs = Date.parse(this.now())
     for (const ticket of this.queryTasks({ stage: 'person/confirm' })) {
+      if (ticket.deferred) continue
       const at = ticket.pendingConfirm?.at
       if (!at) continue
       if (nowMs - Date.parse(at) <= CONFIRM_TIMEOUT_MS) continue
@@ -255,10 +579,11 @@ export class Router {
    * ticket's stored authorization （票面权威） like every owner-bound injection. A fork failure throws and
    * leaves the ticket at person/confirm — the user may retry, reject or cancel.
    */
-  async #confirmPendingFork(owner, ticket, ticketId) {
+  async #confirmPendingFork(owner, ticket, ticketId, approvalId) {
+    const checkConfirmation = approvalId ? () => this.#requireCurrentApproval(approvalId) : undefined
     let result
     try {
-      result = await confirmTicketFork({ tasks: this.tasks, sessions: this.sessions, ticketId })
+      result = await confirmTicketFork({ tasks: this.tasks, sessions: this.sessions, ticketId, checkConfirmation })
     } catch (error) {
       throw translateTaskError(error, (code, message) => new RouterError(code, message))
     }
@@ -273,7 +598,7 @@ export class Router {
       + '任务已绑到新会话并回到进行中；请用 inject_session（带 ticketId）把续作指令注入新会话继续任务。原会话保留可查，勿再注入。'
       + '\n\n授权：' + auth.actor + ' 经 ' + auth.source + ' 于 ' + auth.at + '；任务 ' + ticketId
     this.runner.enqueue({ ticketId, kind: 'inject', to: 'session:' + ensured.sessionId, sessionId: ensured.sessionId, body: text, requestId: 'hub-bot-route-' + this.ids.uuid() })
-    await this.runner.tick()
+    await this.runner.tick({ excludeKind: 'deferred-decision' })
     return { ownerId: owner.id, sessionId: ensured.sessionId, ticketId, requestId: ticket.requestId, createdSession: ensured.created, rebuilt: false, deduped: false, confirmed: true, fork: { fromSessionId: result.fromSessionId, sessionId: result.sessionId }, stage: 'working' }
   }
 
@@ -284,7 +609,7 @@ export class Router {
    * session. The confirm transition lands first; the injection then persists through the outbox like
    * every other (先存后做, retryable).
    */
-  async #confirmDangerousInject(owner, ticket, ticketId) {
+  async #confirmDangerousInject(owner, ticket, ticketId, approvalId) {
     const action = ticket.pendingConfirm?.action
     if (!action || action.type !== DANGEROUS_INJECT_ACTION) {
       throw new RouterError('no-pending-inject', 'route_to_owner: ticket ' + ticketId + ' has no held dangerous injection to confirm')
@@ -299,69 +624,73 @@ export class Router {
       // L2 发起、被挂起的执行会话注入: 确认后按票面存储的完整文本原样直投 (文本构建时已携授权记录)。
       // 不经 outbox 的理由: runner 的 inject 行恒投 owner 会话 (#deliverRow 先 ensureSession), 而这里的目标是票面
       // 存储的执行会话; 执行会话归 L2 管理、失败由 L2 感知, 一次性放行不需要路由注入的重建/重投语义。
-      // 顺序说明: prompt 先于 confirm —— confirm 转移合法实际不抛, 窄窗重复风险已在案 (审查 P2 接受)。
-      const requestId = 'hub-bot-owner-' + this.ids.uuid()
+      // The stored approval prevents replay if the host accepted the prompt before returning a result.
+      const requestId = approvalId ? 'hub-bot-approved-' + approvalId : 'hub-bot-owner-' + this.ids.uuid()
       await this.sessions.prompt({ requestId, sessionId: action.sessionId, mode: 'queue', content: [{ type: 'text', text: action.text }] })
+      if (approvalId) this.#requireCurrentApproval(approvalId)
       try { this.tasks.confirm({ ticketId, result: { injected: { entry: action.entry, sessionId: action.sessionId, requestId } }, by: 'user' }) } catch (error) { throw translateTaskError(error, (code, message) => new RouterError(code, message)) }
       return { ownerId: owner.id, sessionId: action.sessionId, ticketId, requestId, createdSession: false, rebuilt: false, deduped: false, confirmed: true, stage: 'working' }
     }
-    const ensured = await this.#ensureSession(owner)
+    const fixedSessionId = approvalId ? ticket.deferred.target?.sessionId : undefined
+    const ensured = fixedSessionId ? { sessionId: fixedSessionId, created: false }
+      : await (owner.role === 'chief' ? this.#ensureChiefSession() : this.#ensureSession(owner))
+    if (approvalId) this.#requireCurrentApproval(approvalId)
+    const sessionId = fixedSessionId ?? this.registry.get(owner.id)?.sessionId ?? ensured.sessionId
     const label = action.entry === 'follow-up' ? '[hub-bot 追问 ' + ticketId + '] ' : '[hub-bot 路由 ' + ticketId + '] '
     const text = label + action.message + '\n\n授权：' + auth.actor + ' 经 ' + auth.source + ' 于 ' + auth.at + '；任务 ' + ticketId
       + '\n\n（本条消息命中危险命令黑名单，已经用户确认放行）'
-    const requestId = 'hub-bot-route-' + this.ids.uuid()
-    try { this.tasks.confirm({ ticketId, result: { injected: { entry: action.entry, requestId } }, by: 'user' }) } catch (error) { throw translateTaskError(error, (code, message) => new RouterError(code, message)) }
-    this.runner.enqueue({ ticketId, kind: 'inject', to: 'session:' + ensured.sessionId, sessionId: ensured.sessionId, body: text, requestId })
-    await this.runner.tick()
-    return { ownerId: owner.id, sessionId: ensured.sessionId, ticketId, requestId, createdSession: ensured.created, rebuilt: false, deduped: false, confirmed: true, stage: 'working' }
+    const requestId = approvalId ? 'hub-bot-approved-' + approvalId : 'hub-bot-route-' + this.ids.uuid()
+    this.#persistWork(() => {
+      try { this.tasks.confirm({ ticketId, result: { injected: { entry: action.entry, requestId } }, by: 'user' }) } catch (error) { throw translateTaskError(error, (code, message) => new RouterError(code, message)) }
+      this.runner.enqueue({ ticketId, triggerId: ticket.triggerId,
+        kind: approvalId ? 'approved-owner-inject' : 'inject', to: 'session:' + sessionId, sessionId, body: text, requestId })
+    })
+    if (!approvalId) await this.runner.tick({ excludeKind: 'deferred-decision' })
+    return { ownerId: owner.id, sessionId, ticketId, requestId, createdSession: ensured.created, rebuilt: false, deduped: false, confirmed: true, stage: 'working' }
   }
 
-  /** Restart recovery: end running assignments "host restarted" and arm the recovery note (spec: 重启恢复）. */
-  /**
-   * Restart recovery (spec「重启恢复」 + #72 AC1 自动恢复）: assignments running at the crash end "host
-   * restarted", then every working ticket gets a FRESH recovery injection automatically — 最旧优先， through
-   * the execution-slot gate: the per-owner overflow demotes to queued and its injection is stored HELD
-   * (#promoteQueued admits it when a slot frees). The recovery note itself is prepended at delivery time
-   * (carried exactly once). Idle/queued tickets already hold their stored rows — the runner redelivers them.
-   */
+  /** Persists restart recovery in arrival order, using the same owner slots as new work. */
   async markRestart() {
-    this.tasks.markRestart()
-    const pending = this.store.db.prepare('SELECT value FROM ticket').all()
-      .map(raw => JSON.parse(String(raw.value)))
-      .filter(ticket => ticket.recoveryPending === true && normalizeStage(ticket.stage) === 'working')
-      .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt))) // 最旧优先
-    if (pending.length === 0) return { resumed: 0, queued: 0 }
-    let resumed = 0
-    let queued = 0
-    const perOwner = new Map()
-    for (const ticket of pending) {
-      const owner = this.registry.get(ticket.owner)
-      if (!owner || owner.recycled) continue // 负责人已回收：无处可恢复，票面保持原样
-      const existing = this.listOutbox().find(row => row.ticketId === ticket.id && row.kind === 'inject'
-        && (row.state === 'queued' || row.state === 'held') && row.body.startsWith('[hub-bot 恢复 ' + ticket.id + ']'))
-      if (existing) continue // 幂等：恢复注入已存，不重复补投
-      const count = perOwner.get(ticket.owner) ?? 0
-      const atCapacity = count >= this.#slotsPerOwner() // 执行槽闸门：槽满则 queued 等位
-      perOwner.set(ticket.owner, count + 1)
-      if (atCapacity) {
-        try { this.tasks.demote(ticket.id) } catch { continue } // 期间被别的路径改态 — 交给那条路径
-        queued++
-      } else {
-        resumed++
+    const result = this.#persistWork(() => {
+      this.tasks.markRestart()
+      const pending = this.store.db.prepare('SELECT value FROM ticket ORDER BY rowid').all()
+        .map(raw => JSON.parse(String(raw.value)))
+        .filter(ticket => ticket.recoveryPending === true && normalizeStage(ticket.stage) === 'working')
+        .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)))
+      const queuedRecoveries = new Set(this.listOutbox()
+        .filter(row => ['queued', 'held'].includes(row.state) && (['background-recovery', 'deferred-answer', 'approved-owner-inject'].includes(row.kind)
+          || (row.kind === 'inject' && row.body.startsWith('[hub-bot 恢复 ' + row.ticketId + ']'))))
+        .map(row => row.ticketId))
+      const perOwner = new Map()
+      let resumed = 0
+      let queued = 0
+      for (const ticket of pending) {
+        const owner = this.registry.get(ticket.owner)
+        if (!owner || owner.recycled) continue
+        const count = perOwner.get(ticket.owner) ?? 0
+        perOwner.set(ticket.owner, count + 1)
+        if (queuedRecoveries.has(ticket.id) || (ticket.background && ticket.lastDelivery?.state !== 'sent')) continue
+        const held = count >= this.#slotsPerOwner()
+        if (held) {
+          this.tasks.demote(ticket.id)
+          queued++
+        } else {
+          resumed++
+        }
+        const trigger = ticket.triggerId ? this.getTrigger(ticket.triggerId) : undefined
+        const auth = ticket.authorization
+        const original = ticket.routedMessage || trigger?.message || '（原始指令见会话历史）'
+        const body = '[hub-bot 恢复 ' + ticket.id + '] 宿主重启，任务自动恢复（最旧优先）。原始任务：' + original
+          + (auth ? '\n\n授权：' + auth.actor + ' 经 ' + auth.source + ' 于 ' + auth.at + '；任务 ' + ticket.id : '')
+        this.runner.enqueue({
+          ticketId: ticket.id, triggerId: ticket.triggerId, kind: ticket.background ? 'background-recovery' : 'inject',
+          to: 'owner:' + ticket.owner, body, requestId: 'hub-bot-resume-' + this.ids.uuid(), held,
+        })
       }
-      const ensured = await this.#ensureSession(owner)
-      const trigger = ticket.triggerId ? this.getTrigger(ticket.triggerId) : null
-      const auth = ticket.authorization ?? { actor: 'user', source: 'dsh', at: ticket.createdAt }
-      const original = ticket.routedMessage || trigger?.message || '（原始指令见会话历史）'
-      const text = '[hub-bot 恢复 ' + ticket.id + '] 宿主重启，任务自动恢复（最旧优先）。原始任务：' + original
-        + '\n\n授权：' + auth.actor + ' 经 ' + auth.source + ' 于 ' + auth.at + '；任务 ' + ticket.id
-      this.runner.enqueue({
-        ticketId: ticket.id, kind: 'inject', to: 'session:' + ensured.sessionId, sessionId: ensured.sessionId,
-        body: text, requestId: 'hub-bot-resume-' + this.ids.uuid(), held: atCapacity,
-      })
-    }
-    await this.runner.tick()
-    return { resumed, queued }
+      return { resumed, queued }
+    })
+    if (result.resumed || result.queued) await this.runner.tick({ excludeKind: 'deferred-decision' })
+    return result
   }
 
   /** The chief's own Session (L1 统一出口): digests and replies are admitted here. */
@@ -426,7 +755,7 @@ export class Router {
   #holdDangerous(ticketId, message, entry, extra = {}) {
     const pattern = findDangerousPattern(message, this.#dangerousPatterns())
     if (!pattern) return false
-    this.tasks.askConfirm({
+    this.openQuestion({
       ticketId,
       question: dangerousConfirmText(pattern, message),
       action: { type: DANGEROUS_INJECT_ACTION, entry, message, ...extra },
@@ -435,38 +764,67 @@ export class Router {
   }
 
   async routeToOwner({ ownerId, message, triggerRef, ticketId, resolution, authorization }) {
+    return this.#routeMessage({ ownerId, message, triggerRef, ticketId, resolution, authorization })
+  }
+
+  /** Authorized source adapters assign work without waking a management session. */
+  async routeBackground({ ownerId, message, triggerRef, authorization, source }) {
+    if (!['github', 'timer'].includes(source?.kind) || typeof triggerRef !== 'string' || !triggerRef.trim()
+      || typeof authorization?.actor !== 'string' || !authorization.actor.trim()
+      || (authorization.source !== source.kind && !this.#hasOriginalTimerAuthorization(source, authorization))
+      || (source.kind === 'timer' && (typeof source.timerId !== 'string' || !source.timerId))) {
+      throw new RouterError('invalid-background-source', 'background work requires an authorized source and a stable trigger identity')
+    }
+    return this.#routeMessage({ ownerId, message, triggerRef, authorization, source })
+  }
+
+  #hasOriginalTimerAuthorization(source, authorization) {
+    const origin = source.origin
+    if (source.kind !== 'timer' || origin?.kind !== 'feishu' || authorization.source !== 'feishu'
+      || typeof origin.triggerId !== 'string' || !origin.triggerId) return false
+    const trigger = this.getTrigger(origin.triggerId)
+    return trigger?.kind === 'feishu' && !trigger.dropped && trigger.source?.chatId === origin.chatId
+      && trigger.source?.openId === origin.actor && origin.actor === authorization.actor
+      && JSON.stringify(trigger.authorization) === JSON.stringify(authorization)
+  }
+
+  #routeMessage({ ownerId, message, triggerRef, ticketId, resolution, authorization, source }) {
     if (typeof message !== 'string' || !message.trim()) throw new RouterError('message-required', 'route_to_owner: message must be a non-empty string')
     const route = () => this.#serialized('owner:' + ownerId, () =>
-      this.#routeToOwnerLocked({ ownerId, message: message.trim(), triggerRef, ticketId, resolution, authorization }))
+      this.#routeToOwnerLocked({ ownerId, message: message.trim(), triggerRef, ticketId, resolution, authorization, source }))
     return ticketId === undefined && triggerRef !== undefined
       ? this.#serialized('trigger:' + triggerRef, route)
       : route()
   }
 
   /** routeToOwner's body, run under the per-owner chain (see routeToOwner). */
-  async #routeToOwnerLocked({ ownerId, message, triggerRef, ticketId, resolution, authorization }) {
+  async #routeToOwnerLocked({ ownerId, message, triggerRef, ticketId, resolution, authorization, source }) {
     const owner = this.registry.get(ownerId)
     if (!owner) throw new RouterError('unknown-owner', 'route_to_owner: unknown owner "' + ownerId + '" — call list_owners first')
     // chief 不是路由目标——但仅约束「新建任务」；带 ticketId 的 resolution 裁决（面板 confirm/reject）
     // 是票面状态机推进，不给 chief 会话发消息，chief 票（如黑名单挂起的注入）必须能由此裁决。
-    if (owner.role === 'chief' && ticketId === undefined) throw new RouterError('cannot-route-to-chief', 'route_to_owner: the chief is the router, not a route target')
+    if (owner.role === 'chief' && ticketId === undefined && !source) throw new RouterError('cannot-route-to-chief', 'route_to_owner: the chief is the router, not a route target')
     // #70: a recycled scratch owner's directory is gone (物理上无法恢复) — follow-ups to its finished task start
     // a NEW task instead (spec「已结束任务的跟进」例外); never route into a recycled row.
     if (owner.recycled) throw new RouterError('owner-recycled', 'route_to_owner: owner ' + ownerId + ' 已回收（临时目录已删）——请新建任务，不要复活旧负责人')
     if (ticketId !== undefined) return this.#followUp({ owner, message, ticketId, resolution, authorization })
     if (resolution !== undefined) throw new RouterError('resolution-needs-ticket', 'route_to_owner: resolution requires ticketId')
+    if (source && owner.transient) throw new RouterError('background-owner-transient', 'background work requires a persistent owner')
     const existing = triggerRef === undefined ? undefined : this.getTrigger(triggerRef)
     if (existing) {
       const ticket = this.#ticketByTrigger(triggerRef)
       if (ticket || !['feishu', 'route'].includes(existing.kind)) {
-        const sessionId = ticket ? ticket.targetSession ?? this.registry.get(ticket.owner)?.sessionId : owner.sessionId
+        const sessionId = ticket?.background ? ticket.workerSession?.sessionId
+          : ticket ? ticket.targetSession ?? this.registry.get(ticket.owner)?.sessionId : owner.sessionId
         return {
           ownerId: ticket?.owner ?? ownerId, ...(sessionId && { sessionId }),
           ...(ticket && { ticketId: ticket.id }), requestId: ticket?.requestId ?? null,
+          ...(ticket?.workerSession && { workerSession: ticket.workerSession }),
+          ...(ticket?.background && { admitted: ticket.lastDelivery?.state === 'sent' }),
           createdSession: false, rebuilt: false, deduped: true, stage: ticket ? normalizeStage(ticket.stage) : null,
         }
       }
-      if (existing.dropped || !existing.authorization || existing.policy?.mode === 'interrupt'
+      if (existing.dropped || !existing.authorization || ['interrupt', 'decision'].includes(existing.policy?.mode)
         || String(existing.source?.messageId ?? '').startsWith('om_selftest-')) {
         throw new RouterError('invalid-route-trigger', 'route_to_owner: this event is not eligible for dispatch')
       }
@@ -478,10 +836,11 @@ export class Router {
     const auth = existing?.authorization ?? authorization ?? { actor: 'user', source: 'dsh', at }
     const addressing = auth.addressing ?? 'direct'
     const instruction = existing?.kind === 'route' ? existing.message : message
+    const background = source && { kind: source.kind, ...(source.timerId && { timerId: source.timerId }) }
     const trigger = existing ?? {
-      id: triggerRef ?? 'trg-' + this.ids.uuid(), kind: 'route', ownerId, message: instruction, authorization: auth, at,
-      source: { kind: 'route', addressing },
-      policy: { addressing, mode: 'queue', allowed: true, reason: null },
+      id: triggerRef ?? 'trg-' + this.ids.uuid(), kind: source?.kind ?? 'route', ownerId, message: instruction, authorization: auth, at,
+      source: source ?? { kind: 'route', addressing },
+      policy: { addressing, mode: source?.kind === 'github' ? 'independent' : source ? 'reuse' : 'queue', allowed: true, reason: null },
     }
     const requestId = 'hub-bot-route-' + this.ids.uuid()
     const freshTicketId = 'tsk-' + this.ids.uuid()
@@ -491,23 +850,27 @@ export class Router {
       if (!existing) this.#insertTrigger(trigger)
       this.#insertTicket({
         id: freshTicketId, triggerId: trigger.id, owner: ownerId, stage: atCapacity ? 'queued' : 'idle', mechanism: 'inject',
-        targetSession: owner.sessionId, requestId, authorization: auth, createdAt: at, updatedAt: at,
+        targetSession: background ? null : owner.sessionId, requestId, authorization: auth, createdAt: at, updatedAt: at,
+        ...(background && { background }),
         ...(existing?.kind === 'feishu' && { routedMessage: instruction }),
       })
       if (this.#holdDangerous(freshTicketId, instruction, 'route')) return true
       const text = '[hub-bot 路由 ' + freshTicketId + '] ' + instruction + '\n\n授权：' + auth.actor + ' 经 ' + auth.source + ' 于 ' + auth.at + '；任务 ' + freshTicketId
       this.runner.enqueue({
         ticketId: freshTicketId, triggerId: trigger.id, kind: 'inject',
-        to: owner.sessionId ? 'session:' + owner.sessionId : 'owner:' + ownerId,
-        sessionId: owner.sessionId, body: text, requestId, held: atCapacity,
+        to: background || !owner.sessionId ? 'owner:' + ownerId : 'session:' + owner.sessionId,
+        sessionId: background ? null : owner.sessionId, body: text, requestId, held: atCapacity,
       })
       return false
     })
-    if (!awaitingConfirmation) await this.runner.tick()
+    if (!awaitingConfirmation) await this.runner.tick({ excludeKind: 'deferred-decision' })
     const stored = this.tasks.getTicket(freshTicketId)
-    const sessionId = stored.targetSession ?? this.registry.get(ownerId)?.sessionId ?? null
+    const sessionId = background ? stored.workerSession?.sessionId : stored.targetSession ?? this.registry.get(ownerId)?.sessionId
     return {
-      ownerId, ...(sessionId !== null && { sessionId }), ticketId: freshTicketId, requestId, createdSession: !owner.sessionId && sessionId !== null,
+      ownerId, ...(sessionId && { sessionId }), ticketId: freshTicketId, requestId,
+      createdSession: background ? stored.lastDelivery?.created === true : !owner.sessionId && Boolean(sessionId),
+      ...(stored.workerSession && { workerSession: stored.workerSession }),
+      ...(background && { admitted: stored.lastDelivery?.state === 'sent' }),
       rebuilt: stored.lastDelivery?.rebuilt ?? false, deduped: false, stage: stored.stage,
     }
   }
@@ -579,6 +942,9 @@ export class Router {
     // 票面权威： a follow-up cannot re-bind the trigger or the authorization record.
     if (authorization !== undefined) {
       throw new RouterError('authorization-immutable', 'route_to_owner: a follow-up cannot re-bind authorization — the ticket record is authoritative')
+    }
+    if (ticket.deferred && ['person/answer', 'person/confirm'].includes(ticket.stage)) {
+      throw new RouterError('exact-request-required', 'Reply through the original deferred request ID.')
     }
     if (resolution !== undefined) {
       if (resolution === 'accept') {
@@ -664,7 +1030,7 @@ export class Router {
     const requestId = 'hub-bot-route-' + this.ids.uuid()
     const ensured = await this.#ensureSession(owner)
     this.runner.enqueue({ ticketId, kind: 'inject', to: 'session:' + ensured.sessionId, sessionId: ensured.sessionId, body: text, requestId })
-    await this.runner.tick()
+    await this.runner.tick({ excludeKind: 'deferred-decision' })
     const stored = this.tasks.getTicket(ticketId)
     return { ownerId: owner.id, sessionId: stored.targetSession, ticketId, requestId, createdSession: ensured.created, rebuilt: stored.lastDelivery?.rebuilt ?? false, deduped: false, resumed, stage: stored.stage }
   }
@@ -705,9 +1071,40 @@ export class Router {
    */
   async #deliverRow(row) {
     if (row.kind === 'inbox' || row.kind === 'stop') return this.#deliverIntake(row)
+    if (row.kind === 'background-report') return this.#deliverBackgroundReport(row)
+    if (row.kind === 'deferred-answer') return this.#deliverDeferredAnswer(row)
+    if (row.kind === 'approved-owner-inject') return this.#deliverApprovedOwner(row)
+    if (row.kind === 'deferred-decision') {
+      if (row.panelDecision) {
+        try {
+          await this.#applyPanelDecision(row)
+          return { recorded: true }
+        } catch (error) {
+          if (!['TaskError', 'RouterError', 'DeferredError'].includes(error?.name)) throw error
+          return { recorded: true, skipped: error.code }
+        }
+      }
+      const trigger = this.getTrigger(row.triggerId)
+      if (!trigger?.authorization || !trigger.decision) return { recorded: true, skipped: 'invalid-decision' }
+      let message
+      try {
+        const result = await this.resolveDeferred({ ...trigger.decision, actor: trigger.authorization.actor,
+          channel: 'feishu', chatId: trigger.source.chatId, receivedAt: trigger.at })
+        message = '已记录答复 ' + result.requestId + ' · ' + result.stage
+      } catch (error) {
+        if (!['DeferredError', 'RouterError', 'TaskError'].includes(error?.name)) throw error
+        message = '答复未受理：' + error.message
+      }
+      const id = 'out-decision-reply-' + trigger.id
+      if (!this.store.closed && !this.#outboxRow(id)) insertOutbox(this.store, {
+        id, triggerId: trigger.id, kind: 'reply', state: 'recorded', to: 'feishu:chat:' + trigger.source.chatId,
+        requestId: 'hub-bot-decision-reply-' + trigger.id, body: message,
+      }, () => Date.parse(this.now()))
+      return { recorded: true }
+    }
     if (row.kind === 'digest') return this.#deliverDigest(row)
     if (row.kind === 'reply') return this.#deliverReply(row)
-    if (row.kind !== 'inject') return
+    if (row.kind !== 'inject' && row.kind !== 'background-recovery') return
     const ticket = this.tasks.getTicket(row.ticketId)
     const permanent = (message) => { const error = new Error(message); error.permanent = true; return error }
     if (!ticket) throw permanent('outbox ' + row.id + ': ticket ' + row.ticketId + ' is gone')
@@ -723,6 +1120,9 @@ export class Router {
     }
     const owner = this.registry.get(ticket.owner)
     if (!owner) throw permanent('ticket ' + ticket.id + ': owner ' + ticket.owner + ' is gone from the registry')
+    if (ticket.background && (row.kind === 'background-recovery' || row.requestId === ticket.requestId)) {
+      return this.#serialized('background-admission:' + owner.id, () => this.#deliverBackground(row, owner))
+    }
     const ensured = await this.#ensureSession(owner)
     // S01： #ensureSession 是异步的（可能真的新建了一个 Session）。等它回来时票可能已经结案 —— 以库里
     // 当前的票面为准再判一次，结案就安静跳过：不注入、不抛错、不改票面。
@@ -747,14 +1147,217 @@ export class Router {
     })
   }
 
+  async #deliverApprovedOwner(row) {
+    const requestId = row.requestId.slice('hub-bot-approved-'.length)
+    const current = () => this.#currentDeferredWork(row.ticketId, requestId)
+    const ticket = current()
+    if (!ticket) return { recorded: true, skipped: 'deferred-no-longer-active' }
+    const target = this.registry.get(ticket.owner)
+    const unavailable = () => {
+      const reason = 'The original owner session is unavailable. Request a new confirmation for the current session.'
+      return Object.assign(new Error(reason), { permanent: true })
+    }
+    if (!target || target.sessionId !== row.sessionId || target.recycled || this.sessions.isArchived?.(row.sessionId)) throw unavailable()
+    const text = ticket.recoveryPending ? RECOVERY_NOTE + '\n\n' + row.body : row.body
+    try {
+      await this.sessions.prompt({ sessionId: row.sessionId, requestId: row.requestId, text })
+    } catch (error) {
+      if (isMissingSession(error) || error?.code === 'session/not-found') throw unavailable()
+      throw error
+    }
+    if (this.store.closed || !current()) return
+    this.tasks.noteRecoveryCarried(ticket.id)
+    this.#mergeTicket(ticket.id, { targetSession: row.sessionId, lastDelivery: { state: 'sent', at: this.now(), rebuilt: false } })
+  }
+
+  #timerWorker(ticket) {
+    if (ticket.background.kind !== 'timer') return undefined
+    const prior = this.store.db.prepare(`
+      SELECT value FROM ticket
+      WHERE id != ? AND json_extract(value, '$.owner') = ?
+        AND json_extract(value, '$.background.timerId') = ?
+        AND json_extract(value, '$.workerSession.sessionId') IS NOT NULL
+      ORDER BY rowid DESC LIMIT 1
+    `).get(ticket.id, ticket.owner, ticket.background.timerId)
+    return prior && JSON.parse(String(prior.value)).workerSession
+  }
+
+  async #bindBackgroundWorker(ticket, owner, existing, recovering) {
+    let sessionId = existing?.sessionId
+    if (!sessionId) {
+      const proposed = ticket.background.proposedSessionId ?? 'session-' + this.ids.uuid()
+      this.#mergeTicket(ticket.id, { background: { ...ticket.background, proposedSessionId: proposed } })
+      const result = await this.sessions.create({ cwd: owner.cwd, sessionId: proposed })
+      sessionId = result.sessionId ?? result.session?.id
+      if (!sessionId || ['hub-bot-owner', 'hub-bot-router'].includes(result.agentPreset)) {
+        throw new RouterError('background-preset-invalid', 'The host must provide a normal execution session for background work')
+      }
+    }
+    if (this.registry.isOwnerSession(sessionId)) {
+      throw new RouterError('background-worker-is-owner', 'A management session cannot receive background work')
+    }
+    const latest = this.#backgroundDeliveryTicket(ticket.id, recovering)
+    if (!latest || latest.workerSession?.sessionId !== ticket.workerSession?.sessionId) return null
+    const alreadyRunning = latest.assignments?.some(assignment => assignment.sessionId === sessionId && assignment.state === 'running')
+    if (latest.workerSession?.sessionId !== sessionId || (latest.recoveryPending && !alreadyRunning)) {
+      this.tasks.bindWorkerSession(ticket.id, { sessionId, cwd: owner.cwd })
+    }
+    return sessionId
+  }
+
+  #timerMayDeliver(ticket) {
+    return ticket.background.kind !== 'timer' || !this.timerCanDeliver
+      || this.timerCanDeliver(ticket.background.timerId, ticket.triggerId)
+  }
+
+  #skipTimerDelivery(ticket) {
+    const current = this.tasks.getTicket(ticket.id)
+    if (current && !this.#isTerminalTicket(current) && !current.lastDelivery) {
+      if (['idle', 'queued'].includes(current.stage)) this.tasks.cancel(current.id, { by: 'system', reason: '提醒已取消，未唤醒执行会话' })
+      else if (current.stage === 'working') this.tasks.fail({ ticketId: current.id, reason: '提醒已取消，未唤醒执行会话' })
+    }
+    return { recorded: true, skipped: 'timer-ineligible' }
+  }
+
+  #backgroundDeliveryTicket(ticketId, recovering) {
+    const ticket = this.tasks.getTicket(ticketId)
+    if (!ticket?.authorization || !['idle', 'working'].includes(ticket.stage)) return undefined
+    if (recovering && (ticket.stage !== 'working' || !ticket.recoveryPending)) return undefined
+    return ticket
+  }
+
+  async #deliverBackground(row, owner) {
+    const recovering = row.kind === 'background-recovery'
+    const currentTicket = () => this.#backgroundDeliveryTicket(row.ticketId, recovering)
+    const inactive = { recorded: true, skipped: 'background-no-longer-active' }
+    let ticket = currentTicket()
+    if (!ticket) return inactive
+    if (!recovering && ticket.lastDelivery?.state === 'sent') return
+    if (!recovering && !this.#timerMayDeliver(ticket)) return this.#skipTimerDelivery(ticket)
+    if (ticket.stage === 'idle' && this.#workingCount(owner.id) >= this.#slotsPerOwner()) {
+      return { postponeMs: 1000 }
+    }
+    const timer = ticket.background.kind === 'timer'
+    let worker = ticket.workerSession ?? (recovering ? undefined : this.#timerWorker(ticket))
+    if (worker && this.sessions.isArchived?.(worker.sessionId)) {
+      if (recovering || !timer) throw Object.assign(new Error('原后台执行会话已归档'), { permanent: true })
+      const { proposedSessionId, ...background } = ticket.background
+      ticket = { ...ticket, background }
+      worker = undefined
+    }
+    if (recovering && !worker) throw Object.assign(new Error('原后台执行会话已失效'), { permanent: true })
+    const alreadyRunning = recovering && await this.sessions.isRunning?.(worker.sessionId)
+    const live = currentTicket()
+    if (!live || live.workerSession?.sessionId !== ticket.workerSession?.sessionId) return inactive
+    if (alreadyRunning) return { postponeMs: 1000 }
+    let sessionId = await this.#bindBackgroundWorker(ticket, owner, worker, recovering)
+    const bound = currentTicket()
+    if (!sessionId || !bound || bound.workerSession?.sessionId !== sessionId) return inactive
+    if (!recovering && !this.#timerMayDeliver(bound)) return this.#skipTimerDelivery(bound)
+    const source = this.getTrigger(ticket.triggerId)?.source
+    const timing = timer ? '[跟进提醒] ' + source?.fireAt + (source?.late === true ? ' · 已迟到' : '') + '\n' : ''
+    const recovery = bound.recoveryPending ? RECOVERY_NOTE + '\n\n' : ''
+    const text = recovery + timing + row.body + '\n完成后调用 report_background，传入 ticketId=' + ticket.id + ' 及结果摘要或失败原因。需要用户输入时调用 ask_user，传入同一个 ticketId。'
+    let rebuilt = false
+    try {
+      await this.sessions.prompt({ sessionId, requestId: row.requestId, text })
+    } catch (error) {
+      if (!isMissingSession(error) && error?.code !== 'session/not-found') throw error
+      const latest = currentTicket()
+      if (!latest) return inactive
+      if (recovering || !timer) throw Object.assign(error, { permanent: true })
+      if (!recovering && !this.#timerMayDeliver(latest)) return this.#skipTimerDelivery(latest)
+      const { proposedSessionId, ...background } = latest.background
+      sessionId = await this.#bindBackgroundWorker({ ...latest, background }, owner, undefined, recovering)
+      const rebound = currentTicket()
+      if (!sessionId || !rebound || rebound.workerSession?.sessionId !== sessionId) return inactive
+      if (!recovering && !this.#timerMayDeliver(rebound)) return this.#skipTimerDelivery(rebound)
+      await this.sessions.prompt({ sessionId, requestId: row.requestId, text })
+      rebuilt = true
+    }
+    const latest = this.tasks.getTicket(ticket.id)
+    if (!latest) return
+    if (!this.#isTerminalTicket(latest)) {
+      this.tasks.markDelivered(ticket.id)
+      if (latest.recoveryPending) this.tasks.noteRecoveryCarried(ticket.id)
+    }
+    if (!recovering) this.#mergeTicket(ticket.id, {
+      lastDelivery: { state: 'sent', created: !worker, rebuilt, at: this.now() },
+    })
+  }
+
+  #isBoundWorker(ticket, sessionId) {
+    return Boolean(sessionId && ticket?.authorization && ticket.workerSession?.sessionId === sessionId
+      && !this.registry.isOwnerSession(sessionId) && !this.sessions.isArchived?.(sessionId))
+  }
+
+  #canAskWorker(ticket, sessionId) {
+    return this.#isBoundWorker(ticket, sessionId)
+      && (ticket.stage === 'working' || (ticket.background && ticket.stage === 'idle'))
+  }
+
+  #workerHasActiveTask(sessionId, check) {
+    if (!sessionId || this.store.closed) return false
+    const rows = this.store.db.prepare(
+      "SELECT value FROM ticket WHERE json_extract(value, '$.workerSession.sessionId') = ?",
+    ).all(sessionId)
+    return rows.some(row => check(JSON.parse(String(row.value)), sessionId))
+  }
+
+  isManagedWorker(sessionId) {
+    return this.#workerHasActiveTask(sessionId, (ticket, id) => this.#canAskWorker(ticket, id))
+  }
+
+  #canReportBackground(ticket, sessionId) {
+    return Boolean(ticket?.background && this.#canAskWorker(ticket, sessionId))
+  }
+
+  isBackgroundWorker(sessionId) {
+    return this.#workerHasActiveTask(sessionId, (ticket, id) => this.#canReportBackground(ticket, id))
+  }
+
+  async reportBackground({ ticketId, sessionId, summary, failure, evidence }) {
+    const ticket = this.tasks.getTicket(ticketId)
+    if (!this.#canReportBackground(ticket, sessionId)) {
+      throw new RouterError('background-worker-mismatch', 'Only the bound worker may report for this active task')
+    }
+    if ((summary === undefined) === (failure === undefined)) {
+      throw new RouterError('background-report-invalid', 'Provide exactly one of summary and failure')
+    }
+    return this.#persistWork(() => {
+      this.tasks.markDelivered(ticketId)
+      const saved = failure === undefined ? this.tasks.report({ ticketId, summary, evidence }) : this.tasks.fail({ ticketId, reason: failure })
+      this.#enqueueBackgroundReport(saved)
+      return { ticketId, stage: saved.stage }
+    })
+  }
+
+  #enqueueBackgroundReport(ticket) {
+    this.runner.enqueue({
+      kind: 'background-report', ticketId: ticket.id, triggerId: ticket.triggerId, to: 'owner:' + ticket.owner,
+      body: '[hub-bot 后台结果] ' + factLine(ticket), requestId: 'hub-bot-background-result-' + ticket.id + '-' + this.ids.uuid(),
+    })
+  }
+
+  async #deliverBackgroundReport(row) {
+    const ticket = this.tasks.getTicket(row.ticketId)
+    const owner = ticket && this.registry.get(ticket.owner)
+    if (!owner || owner.recycled) return { recorded: true, skipped: 'owner-unavailable' }
+    const ensured = await (owner.role === 'chief' ? this.#ensureChiefSession() : this.#ensureSession(owner))
+    const sessionId = this.registry.get(owner.id)?.sessionId ?? ensured.sessionId
+    await this.#promptOwner(owner.id, { sessionId }, null, row.requestId, row.body)
+  }
+
   /** Admit a prompt, retrying a missing binding only while the originating ticket is active. */
-  async #promptOwner(ownerId, ensured, ticketId, requestId, text) {
+  async #promptOwner(ownerId, ensured, ticketId, requestId, text, isCurrent) {
     const sessionId = ensured.sessionId
     const ticketClosed = () => {
+      if (isCurrent && !isCurrent()) return true
       if (ticketId === null) return false
       const latest = this.tasks.getTicket(ticketId)
       return !latest || this.#isTerminalTicket(latest)
     }
+    if (ticketClosed()) return null
     try {
       await this.sessions.prompt({ sessionId, requestId, text })
       return { sessionId, rebuilt: false }
@@ -880,7 +1483,7 @@ export class Router {
       ticketId: null, kind: 'reply', to: target, body, requestId: 'hub-bot-reply-' + this.ids.uuid(),
       ...(triggerRef !== undefined && { triggerId: triggerRef }),
     })
-    await this.runner.tick()
+    await this.runner.tick({ excludeKind: 'deferred-decision' })
     return { outboxId: row.id, state: this.#outboxRow(row.id).state, truncated }
   }
 

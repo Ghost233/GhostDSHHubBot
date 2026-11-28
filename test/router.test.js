@@ -13,6 +13,8 @@ import { join } from 'node:path'
 import { Store } from '../src/store.js'
 import { OwnerRegistry } from '../src/registry.js'
 import { Router, RouterError, RECOVERY_NOTE } from '../src/router.js'
+import { DeferredRegistry } from '../src/deferred.js'
+import { discardOutboxRows } from '../src/outbox.js'
 
 /** A registry+router with a scriptable fake Sessions port and a deterministic clock. */
 function fixture({ failSessions = [], config } = {}) {
@@ -852,4 +854,485 @@ test('overlapping stop requests are recorded without interrupting the next turn'
     store.close()
     rmSync(directory, { recursive: true, force: true })
   }
+})
+
+test('background GitHub work stays independent and respects its stable owner’s slots', async () => {
+  const { router, registry, calls, cleanup } = fixture({ config: { concurrency: { slotsPerOwner: 2 } } })
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Fixture project', cwd: '/repos/project' })
+    registry.bindSession(owner.id, 'owner-before')
+    await router.routeToOwner({ ownerId: owner.id, message: 'regular owner work' })
+    const authorization = { actor: 'fixture-user', source: 'github', at: '2026-11-15T00:00:00.000Z' }
+    const event = number => ({
+      ownerId: owner.id, triggerRef: 'github:fixture/project:issue:' + number, authorization,
+      source: { kind: 'github', repo: 'fixture/project', issueNumber: number }, message: 'fixture issue ' + number,
+    })
+    const first = await router.routeBackground(event(1))
+    const second = await router.routeBackground(event(2))
+    const duplicate = await router.routeBackground(event(1))
+    assert.equal(first.stage, 'working')
+    assert.equal(second.stage, 'queued')
+    assert.equal(duplicate.ticketId, first.ticketId)
+    const worker = router.getTicket(first.ticketId).workerSession.sessionId
+    assert.notEqual(worker, 'owner-before')
+    assert.equal(calls.create.length, 1)
+    assert.equal(calls.create[0].agentPreset, undefined)
+    assert.equal(router.getTrigger(event(1).triggerRef).policy.mode, 'independent')
+    assert.deepEqual(router.getTicket(first.ticketId).authorization, authorization)
+    await assert.rejects(router.reportBackground({ ticketId: first.ticketId, sessionId: 'owner-before', summary: 'wrong caller' }), { code: 'background-worker-mismatch' })
+    registry.bindSession(owner.id, 'owner-after')
+    await router.reportBackground({ ticketId: first.ticketId, sessionId: worker, summary: 'fixture finished' })
+    await router.tick()
+    assert.equal(router.getTicket(first.ticketId).stage, 'person/review')
+    const secondWorker = router.getTicket(second.ticketId).workerSession.sessionId
+    assert.notEqual(secondWorker, worker)
+    assert.equal(registry.get(owner.id).sessionId, 'owner-after')
+    assert.ok(calls.prompt.some(prompt => prompt.sessionId === 'owner-after' && prompt.text.includes('fixture finished')))
+  } finally { cleanup() }
+})
+
+test('restart resumes interrupted background work in its original execution sessions', async () => {
+  const { router, registry, store, calls, advance, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Recovery fixture', cwd: '/repos/fixture' })
+    registry.bindSession(owner.id, 'owner-recovery-fixture')
+    const receipts = []
+    for (const kind of ['github', 'timer']) {
+      const authorization = { actor: 'fixture-user', source: kind, at: router.now() }
+      const source = kind === 'timer' ? { kind, timerId: 'restart-fixture', fireAt: router.now() } : { kind, repo: 'fixture/repo', issueNumber: 1 }
+      receipts.push(await router.routeBackground({ ownerId: owner.id, message: kind + ' fixture work',
+        triggerRef: kind + ':restart-fixture:1', authorization, source }))
+    }
+    const original = receipts.map(receipt => router.getTicket(receipt.ticketId))
+    let busy = true
+    router.sessions.isRunning = async sessionId => busy && sessionId === original[1].workerSession.sessionId
+    const restarted = new Router({ store, registry, sessions: router.sessions, now: router.now })
+    assert.deepEqual(await restarted.markRestart(), { resumed: 2, queued: 0 })
+    assert.equal(calls.prompt.filter(prompt => prompt.text.startsWith(RECOVERY_NOTE)).length, 1)
+    assert.equal(restarted.getTicket(original[1].id).recoveryPending, true)
+    busy = false
+    advance(1000)
+    await restarted.tick()
+    assert.equal(calls.create.length, 2)
+    const recovery = calls.prompt.filter(prompt => prompt.text.startsWith(RECOVERY_NOTE))
+    assert.deepEqual(recovery.map(prompt => prompt.sessionId), original.map(ticket => ticket.workerSession.sessionId))
+    for (const [index, old] of original.entries()) {
+      const current = restarted.getTicket(old.id)
+      assert.equal(current.triggerId, old.triggerId)
+      assert.deepEqual(current.authorization, old.authorization)
+      assert.deepEqual(current.lastDelivery, old.lastDelivery)
+      assert.equal(current.recoveryPending, undefined)
+      assert.equal(current.assignments.at(-2).endReason, 'host restarted')
+      assert.equal(current.assignments.at(-1).state, 'running')
+      assert.ok(recovery[index].text.includes(old.id))
+    }
+  } finally { cleanup() }
+})
+
+test('separate occurrences reuse the same follow-up worker without reusing the owner', async () => {
+  const { router, registry, calls, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Fixture project', cwd: '/repos/project' })
+    registry.bindSession(owner.id, 'fixture-owner')
+    const authorization = { actor: 'fixture-user', source: 'timer', at: '2026-11-15T00:00:00.000Z' }
+    const fire = n => router.routeBackground({
+      ownerId: owner.id, triggerRef: 'timer:fixture-timer:' + n, authorization, message: 'fixture follow-up',
+      source: { kind: 'timer', timerId: 'fixture-timer', occurrenceId: String(n) },
+    })
+    const first = await fire(1)
+    const second = await fire(2)
+    const ticket1 = router.getTicket(first.ticketId)
+    const ticket2 = router.getTicket(second.ticketId)
+    assert.notEqual(ticket1.id, ticket2.id)
+    assert.equal(ticket1.workerSession.sessionId, ticket2.workerSession.sessionId)
+    assert.notEqual(ticket1.workerSession.sessionId, 'fixture-owner')
+    assert.equal(calls.create.length, 1)
+    assert.equal(calls.prompt.length, 2)
+    assert.notEqual(calls.prompt[0].requestId, calls.prompt[1].requestId)
+  } finally { cleanup() }
+})
+
+test('an exhausted approval cannot restart the original work at a changed target', async () => {
+  const { router, registry, store, calls, advance, cleanup } = fixture({ config: { security: { dangerousPatterns: ['needs-approval'] } } })
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Approval failure', cwd: '/repos/fixture' })
+    registry.bindSession(owner.id, 'approval-before-failure')
+    const install = target => target.installDeferred(new DeferredRegistry({ store, tasks: target.tasks, now: target.now,
+      owners: { currentBinding: id => registry.get(id), isOwnerSession: id => registry.isOwnerSession(id) } }))
+    install(router)
+    const { ticketId } = await router.routeToOwner({ ownerId: owner.id, message: 'needs-approval' })
+    const { requestId } = router.getTicket(ticketId).deferred
+    await router.resolveDeferred({ ticketId, requestId, decision: 'approve', channel: 'panel' })
+    const originalPrompt = router.sessions.prompt
+    router.sessions.prompt = async () => { throw Error('fixture rejected approval prompt') }
+    for (const waitMs of [0, 2000, 4000]) {
+      advance(waitMs)
+      await router.tick()
+    }
+    assert.equal(router.listOutbox().find(row => row.requestId === 'hub-bot-approved-' + requestId).state, 'failed')
+    registry.bindSession(owner.id, 'approval-after-failure')
+    router.sessions.prompt = originalPrompt
+    const restarted = new Router({ store, registry, sessions: router.sessions, now: router.now })
+    install(restarted)
+    await restarted.markRestart()
+    assert.equal(calls.prompt.length, 0)
+    assert.equal(restarted.getTicket(ticketId).stage, 'failed')
+  } finally { cleanup() }
+})
+
+test('a timely authenticated panel answer survives a restart during the original worker check', async () => {
+  const { router, registry, store, calls, advance, cleanup } = fixture()
+  let reopened
+  const release = Promise.withResolvers()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Panel restart', cwd: '/repos/fixture' })
+    const install = (target, database) => target.installDeferred(new DeferredRegistry({ store: database, tasks: target.tasks, now: target.now,
+      owners: { currentBinding: id => target.registry.get(id), isOwnerSession: id => target.registry.isOwnerSession(id) }, ttlMs: 1000 }))
+    install(router, store)
+    const { ticketId } = await router.routeToOwner({ ownerId: owner.id, message: 'fixture work' })
+    const worker = 'panel-restart-worker'
+    router.tasks.bindWorkerSession(ticketId, { sessionId: worker, cwd: owner.cwd })
+    router.askWorker({ ticketId, sessionId: worker, question: 'Which fixture?' })
+    const { requestId } = router.getTicket(ticketId).deferred
+    const entered = Promise.withResolvers()
+    router.sessions.workerInfo = async () => { entered.resolve(); return release.promise }
+    advance(900)
+    const receiptAt = router.now()
+    const answer = router.resolveDeferred({ ticketId, requestId, decision: 'answer', text: 'durable panel reply', channel: 'panel' }).catch(error => error)
+    await entered.promise
+    store.close()
+    advance(200)
+    reopened = new Store(store.stateDir)
+    const restarted = new Router({ store: reopened, registry: new OwnerRegistry(reopened, { scratchRoot: join(reopened.stateDir, 'scratch') }), now: router.now,
+      sessions: { ...router.sessions, workerInfo: async () => ({ cwd: owner.cwd }) } })
+    install(restarted, reopened)
+    await restarted.markRestart()
+    await restarted.tick()
+    release.resolve({ cwd: owner.cwd })
+    await answer
+    const decided = restarted.deferred.get(requestId)
+    assert.equal(decided.status, 'answered')
+    assert.equal(decided.receivedAt, receiptAt)
+    assert.equal(decided.outcome.text, 'durable panel reply')
+    assert.equal(decided.outcome.delivery.state, 'sent')
+    assert.deepEqual(calls.prompt.filter(prompt => prompt.requestId === 'hub-bot-answer-' + requestId).map(prompt => prompt.sessionId), [worker])
+  } finally { release.resolve(); reopened?.close(); cleanup() }
+})
+
+test('a pending panel answer keeps the receipt time during host lookup and sweeping', async () => {
+  const { router, registry, store, calls, advance, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Panel deadline', cwd: '/repos/fixture' })
+    router.installDeferred(new DeferredRegistry({ store, tasks: router.tasks, now: router.now, ttlMs: 1000,
+      owners: { currentBinding: id => registry.get(id), isOwnerSession: id => registry.isOwnerSession(id) } }))
+    const { ticketId } = await router.routeToOwner({ ownerId: owner.id, message: 'fixture work' })
+    const sessionId = 'panel-deadline-worker'
+    router.tasks.bindWorkerSession(ticketId, { sessionId, cwd: owner.cwd })
+    router.askWorker({ ticketId, sessionId, question: 'Choose a value?' })
+    const { requestId } = router.getTicket(ticketId).deferred
+    const entered = Promise.withResolvers()
+    const lookup = Promise.withResolvers()
+    router.sessions.workerInfo = async () => { entered.resolve(); return lookup.promise }
+    advance(900)
+    const received = router.now()
+    const answer = router.resolveDeferred({ ticketId, requestId, decision: 'answer', text: 'Fixture value', channel: 'panel' })
+    await entered.promise
+    advance(200)
+    const pulse = router.tick()
+    await new Promise(resolve => setImmediate(resolve))
+    lookup.resolve({ cwd: owner.cwd })
+    await Promise.all([answer, pulse])
+    await router.tick()
+    assert.equal(router.deferred.get(requestId).receivedAt, received)
+    assert.equal(calls.prompt.find(prompt => prompt.requestId === 'hub-bot-answer-' + requestId).sessionId, sessionId)
+  } finally { cleanup() }
+})
+
+test('an archived timer worker blocks recovery of the old occurrence and a new occurrence may create a worker', async () => {
+  const { router, registry, store, calls, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Archived worker fixture', cwd: '/repos/fixture' })
+    registry.bindSession(owner.id, 'timer-recovery-owner')
+    const fire = (target, ordinal) => target.routeBackground({
+      ownerId: owner.id, triggerRef: 'timer:archive-fixture:' + ordinal, message: 'fixture timer occurrence',
+      source: { kind: 'timer', timerId: 'archive-fixture', occurrenceId: String(ordinal), fireAt: router.now() },
+      authorization: { actor: 'fixture', source: 'timer', at: router.now() },
+    })
+    const first = await fire(router, 1)
+    const originalWorker = router.getTicket(first.ticketId).workerSession.sessionId
+    router.sessions.isArchived = sessionId => sessionId === originalWorker
+    const restarted = new Router({ store, registry, sessions: router.sessions, now: router.now })
+    await restarted.markRestart()
+    await restarted.tick()
+    const old = restarted.getTicket(first.ticketId)
+    assert.equal(old.stage, 'blocked')
+    assert.equal(old.workerSession.sessionId, originalWorker)
+    assert.equal(old.lastDelivery.state, 'sent')
+    assert.equal(calls.create.length, 1)
+    assert.ok(calls.prompt.some(prompt => prompt.sessionId === 'timer-recovery-owner' && prompt.text.includes('原后台执行会话已归档')))
+    const second = await fire(restarted, 2)
+    assert.notEqual(second.workerSession.sessionId, originalWorker)
+    assert.equal(calls.create.length, 2)
+  } finally { cleanup() }
+})
+
+test('an exhausted initial reminder appears failed without claiming delivery', async () => {
+  const { router, registry, store, advance, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Failed reminder fixture', cwd: '/repos/fixture' })
+    let instant = Date.parse(router.now())
+    const { TimerService } = await import('../src/timers.js')
+    const timers = new TimerService({ store, now: () => instant, getOwner: id => registry.get(id),
+      getTicket: id => router.getTicket(id), routeBackground: request => router.routeBackground(request) })
+    router.timerCanDeliver = (id, ref) => timers.canDeliver(id, ref)
+    const timer = timers.create({ ownerId: owner.id, createdBy: 'fixture-creator',
+      fireAt: new Date(instant + 1000).toISOString(), message: 'fixture timer failing transport' })
+    router.sessions.prompt = async () => { throw Error('fixture host unavailable') }
+    instant += 1000
+    advance(1000)
+    await timers.tick()
+    assert.equal(timers.get(timer.id).delivery.state, 'queued')
+    for (const waitMs of [2000, 4000]) {
+      advance(waitMs)
+      instant += waitMs
+      await router.tick()
+    }
+    const failed = timers.get(timer.id).delivery
+    assert.equal(failed.state, 'failed')
+    assert.equal(failed.lastError, 'fixture host unavailable')
+    assert.equal(timers.cancel(timer.id).alreadyFailed, true)
+    assert.equal(router.getTicket(failed.ticketId).failed.reason, 'fixture host unavailable')
+  } finally { cleanup() }
+})
+
+test('a dangerous follow-up stays addressed to the owner session shown when approval was requested', async () => {
+  const { router, registry, store, calls, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Fixed owner target', cwd: '/repos/fixture' })
+    registry.bindSession(owner.id, 'fixed-original-owner')
+    router.installDeferred(new DeferredRegistry({ store, tasks: router.tasks, now: router.now,
+      owners: { currentBinding: id => registry.get(id), isOwnerSession: id => registry.isOwnerSession(id) } }))
+    const { ticketId } = await router.routeToOwner({ ownerId: owner.id, message: 'fixture original work' })
+    const action = { type: 'dangerous-inject', entry: 'follow-up', message: 'fixture additional work' }
+    const { requestId } = router.openQuestion({ ticketId, question: 'Approving the original owner session?', action }).deferred
+    registry.bindSession(owner.id, 'different-owner-session')
+    await assert.rejects(router.resolveDeferred({ ticketId, requestId, decision: 'approve', channel: 'panel' }), /original owner session/)
+    await router.tick()
+    assert.equal(calls.prompt.length, 1)
+    assert.deepEqual(router.deferred.get(requestId).target, { ownerId: owner.id, sessionId: 'fixed-original-owner' })
+
+    const { ticketId: queuedTicket } = await router.routeToOwner({ ownerId: owner.id, message: 'fixture new work' })
+    const queuedApproval = router.openQuestion({ ticketId: queuedTicket, question: 'Approve this destination?', action }).deferred.requestId
+    const accepted = await router.resolveDeferred({ ticketId: queuedTicket, requestId: queuedApproval, decision: 'approve', channel: 'panel' })
+    assert.equal(accepted.outcome, 'answered')
+    registry.bindSession(owner.id, 'different-owner-after-approval')
+    await router.tick()
+    assert.equal(router.getTicket(queuedTicket).stage, 'failed')
+    assert.equal(calls.prompt.some(prompt => prompt.requestId === 'hub-bot-approved-' + queuedApproval), false)
+    const background = await router.routeBackground({
+      ownerId: owner.id, triggerRef: 'github:fixed-owner-fixture:1', message: 'fixture background work',
+      authorization: { actor: 'fixture', source: 'github', at: router.now() },
+      source: { kind: 'github', repo: 'fixture/repo', issueNumber: 1 },
+    })
+    const backgroundApproval = router.openQuestion({ ticketId: background.ticketId, question: 'Approve this follow-up?', action }).deferred
+    assert.equal(backgroundApproval.target.sessionId, 'different-owner-after-approval')
+    registry.bindSession(owner.id, 'different-owner-after-background')
+    await assert.rejects(router.resolveDeferred({ requestId: backgroundApproval.requestId, decision: 'approve', channel: 'panel' }), /original owner session/)
+  } finally { cleanup() }
+})
+
+test('a managed worker can ask directly and an already archived worker cannot accept a reply', async () => {
+  const { router, registry, store, calls, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Managed worker', cwd: '/repos/fixture' })
+    const worker = 'managed-worker'
+    let archived = false
+    router.sessions.isArchived = sessionId => sessionId === worker && archived
+    router.sessions.workerInfo = async sessionId => sessionId === worker ? { cwd: owner.cwd } : undefined
+    router.installDeferred(new DeferredRegistry({ store, tasks: router.tasks, now: router.now,
+      owners: { currentBinding: id => registry.get(id), isOwnerSession: id => registry.isOwnerSession(id) } }))
+    for (const archiveAt of ['never', 'before-answer', 'after-answer']) {
+      archived = false
+      const { ticketId } = await router.routeToOwner({ ownerId: owner.id, message: 'fixture work' })
+      router.tasks.bindWorkerSession(ticketId, { sessionId: worker, cwd: owner.cwd })
+      assert.throws(() => router.askWorker({ ticketId, sessionId: 'different-worker', question: 'Which input?' }), /bound worker/)
+      assert.equal(router.askWorker({ ticketId, sessionId: worker, question: 'Which input?' }).stage, 'person/answer')
+      const { requestId } = router.getTicket(ticketId).deferred
+      const answer = { ticketId, requestId, decision: 'answer', text: 'Fixture input.', channel: 'panel' }
+      archived = archiveAt === 'before-answer'
+      if (archived) {
+        await assert.rejects(router.resolveDeferred(answer), { code: 'receiver-stale' })
+      } else {
+        assert.equal((await router.resolveDeferred(answer)).outcome, 'answered')
+        archived = archiveAt === 'after-answer'
+        await router.tick()
+        assert.equal(router.deferred.get(requestId).outcome.delivery.state, archived ? 'failed' : 'sent')
+      }
+      const delivered = calls.prompt.find(prompt => prompt.requestId === 'hub-bot-answer-' + requestId)
+      assert.equal(delivered?.sessionId, archived ? undefined : worker)
+      assert.equal(router.getTicket(ticketId).stage, archived ? 'blocked' : 'working')
+    }
+  } finally { cleanup() }
+})
+
+test('a replaced confirmation cannot dispatch or bind work using the earlier approval', async () => {
+  for (const actionType of ['dangerous-inject', 'fork']) {
+    const { router, registry, store, calls, cleanup } = fixture()
+    try {
+      const owner = registry.create({ kind: 'repo', workspace: 'Fixture approval', cwd: '/repos/fixture' })
+      registry.bindSession(owner.id, 'approval-owner')
+      router.installDeferred(new DeferredRegistry({ store, tasks: router.tasks, now: router.now,
+        owners: { currentBinding: id => registry.get(id), isOwnerSession: id => registry.isOwnerSession(id) } }))
+      const { ticketId } = await router.routeToOwner({ ownerId: owner.id, message: 'prepare fixture' })
+      const sessionId = 'original-worker'
+      const worker = { sessionId, cwd: '/repos/fixture' }
+      let entered, release
+      const reachedHost = new Promise(resolve => { entered = resolve })
+      const gate = new Promise(resolve => { release = resolve })
+      router.sessions.workerInfo = async () => {
+        if (actionType === 'dangerous-inject') {
+          entered()
+          await gate
+        }
+        return worker
+      }
+      let requestedFork
+      router.sessions.fork = async args => {
+        requestedFork = args
+        entered()
+        await gate
+        return { sessionId: 'fixture-fork' }
+      }
+      const action = actionType === 'fork'
+        ? { type: actionType, sessionId, cwd: worker.cwd, atSeq: 17, reason: 'fixture fork' }
+        : { type: actionType, entry: 'owner-inject', sessionId, text: 'approved fixture' }
+      const waiting = router.openQuestion({ ticketId, question: 'Approve the first request?', action })
+      const approval = router.resolveDeferred({ ticketId, requestId: waiting.deferred.requestId, decision: 'approve', channel: 'panel' })
+      const rejected = assert.rejects(approval, { code: 'fulfillment-failed' })
+      await Promise.race([reachedHost, approval])
+      try {
+        router.tasks.rejectConfirm({ ticketId, reason: 'The earlier wait was superseded' })
+        router.tasks.resume(ticketId)
+        router.tasks.askConfirm({ ticketId, question: 'Approve the later request?', action })
+      } finally { release() }
+      await rejected
+      assert.equal(router.getTicket(ticketId).stage, 'person/confirm')
+      assert.equal(router.getTicket(ticketId).workerSession, undefined)
+      assert.equal(calls.prompt.some(prompt => prompt.sessionId === sessionId), false)
+      if (actionType === 'fork') assert.deepEqual(requestedFork, { sessionId, atSeq: 17 })
+    } finally { cleanup() }
+  }
+})
+
+test('a timely Feishu answer arriving before dequeue expiry goes to the current owner exactly once', async () => {
+  const { router, registry, store, calls, advance, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Fixture owner', cwd: '/repos/fixture' })
+    registry.bindSession(owner.id, 'owner-before-answer')
+    router.installDeferred(new DeferredRegistry({
+      store, tasks: router.tasks, now: router.now, ttlMs: 1000,
+      owners: { currentBinding: id => registry.get(id), isOwnerSession: id => registry.isOwnerSession(id) },
+    }))
+    function receive(messageId, message) {
+      return router.acceptFeishuTrigger({
+        id: 'feishu-' + messageId, kind: 'feishu', message, at: router.now(),
+        source: { kind: 'feishu', chatId: 'fixture-origin-chat', messageId, openId: 'fixture-original-user', addressing: 'direct' },
+        authorization: { actor: 'fixture-original-user', source: 'feishu', at: router.now() },
+      })
+    }
+    const original = await receive('question-origin', 'boot fixture')
+    const { ticketId } = await router.routeToOwner({ ownerId: owner.id, triggerRef: original.triggerId, message: 'fixture request' })
+    const waiting = router.openQuestion({ ticketId, question: 'Which fixture file?' })
+    const { requestId } = waiting.deferred
+    assert.equal(waiting.stage, 'person/answer')
+    const responseIntent = router.listOutbox().find(row => row.requestId === 'hub-bot-question-' + requestId)
+    assert.equal(responseIntent.to, 'feishu:chat:fixture-origin-chat')
+    assert.equal(responseIntent.triggerId, original.triggerId)
+    await assert.rejects(router.resolveDeferred({ requestId, decision: 'answer', text: 'untrusted', channel: 'feishu',
+      chatId: 'different-chat', actor: 'fixture-original-user' }), { code: 'deferred-actor-mismatch' })
+    await receive('plain-text', 'answer ordinary chat')
+    await router.tick()
+    assert.equal(router.getTicket(ticketId).stage, 'person/answer')
+    registry.bindSession(owner.id, 'owner-after-answer')
+    advance(900)
+    const response = '/hub-answer ' + requestId + ' answer Use the checked fixture.'
+    await receive('answer-receipt', response)
+    advance(1100)
+    await router.tick()
+    await receive('answer-receipt', response)
+    await router.tick()
+    const delivered = calls.prompt.filter(prompt => prompt.requestId === 'hub-bot-answer-' + requestId)
+    assert.equal(delivered.length, 1)
+    assert.equal(delivered[0].sessionId, 'owner-after-answer')
+    assert.match(delivered[0].text, /Use the checked fixture/)
+    assert.equal(router.getTicket(ticketId).stage, 'working')
+  } finally { cleanup() }
+})
+
+test('a structured answer commits with its intent and a discarded attempt stays discarded', async () => {
+  const { router, registry, store, calls, advance, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Fixture answer discard', cwd: '/repos/fixture' })
+    registry.bindSession(owner.id, 'answer-fixture-owner')
+    const install = target => target.installDeferred(new DeferredRegistry({ store, tasks: target.tasks, now: target.now,
+      owners: { currentBinding: id => registry.get(id), isOwnerSession: id => registry.isOwnerSession(id) } }))
+    install(router)
+    const { ticketId } = await router.routeToOwner({ ownerId: owner.id, message: 'fixture work' })
+    const { requestId } = router.openQuestion({ ticketId, question: 'Which fixture?' }).deferred
+    const answer = { requestId, ticketId, decision: 'answer', text: 'The checked fixture.', channel: 'panel' }
+    store.db.exec(`CREATE TEMP TRIGGER fail_answer_outbox BEFORE INSERT ON outbox
+      WHEN NEW.id LIKE 'out-answer-%' BEGIN SELECT RAISE(ABORT, 'fixture outbox write failed'); END`)
+    await assert.rejects(router.resolveDeferred(answer), /fixture outbox write failed/)
+    assert.equal(router.getTicket(ticketId).stage, 'person/answer')
+    assert.equal(router.getTicket(ticketId).deferred.status, 'pending')
+    store.db.exec('DROP TRIGGER fail_answer_outbox')
+    await router.resolveDeferred(answer)
+    const id = 'out-answer-' + requestId
+    const originalPrompt = router.sessions.prompt
+    router.sessions.prompt = async () => { throw Error('fixture session refused the answer') }
+    for (const waitMs of [0, 2000, 4000]) {
+      advance(waitMs)
+      await router.tick()
+    }
+    assert.equal(router.listOutbox().find(row => row.id === id).state, 'failed')
+    assert.equal(discardOutboxRows(store, [id]), 1)
+    router.sessions.prompt = originalPrompt
+    const restarted = new Router({ store, registry, sessions: router.sessions, now: router.now })
+    install(restarted)
+    await restarted.markRestart()
+    await restarted.tick()
+    assert.equal(restarted.listOutbox().some(row => row.id === id), false)
+    assert.equal(calls.prompt.length, 1)
+    assert.equal(restarted.getTicket(ticketId).stage, 'blocked')
+    assert.equal(restarted.deferred.get(requestId).outcome.delivery.state, 'failed')
+  } finally { cleanup() }
+})
+
+test('a background question resumes its bound worker instead of the current owner', async () => {
+  const { router, registry, store, calls, cleanup } = fixture()
+  try {
+    const owner = registry.create({ kind: 'repo', workspace: 'Fixture worker', cwd: '/repos/fixture' })
+    registry.bindSession(owner.id, 'owner-worker-before')
+    router.installDeferred(new DeferredRegistry({ store, tasks: router.tasks, now: router.now,
+      owners: { currentBinding: id => registry.get(id), isOwnerSession: id => registry.isOwnerSession(id) } }))
+    const work = await router.routeBackground({
+      ownerId: owner.id, triggerRef: 'timer:fixture-question:1', message: 'fixture timer',
+      authorization: { actor: 'fixture-creator', source: 'timer', at: router.now() },
+      source: { kind: 'timer', timerId: 'fixture-question', fireAt: router.now() },
+    })
+    const { ticketId } = work
+    const sessionId = router.getTicket(ticketId).workerSession.sessionId
+    router.askWorker({ ticketId, sessionId, question: 'Choose fixture input.' })
+    const { requestId } = router.getTicket(ticketId).deferred
+    registry.bindSession(owner.id, 'owner-worker-after')
+    const answer = { requestId, ticketId, decision: 'answer', text: 'Use this fixture.', channel: 'panel' }
+    const done = await router.resolveDeferred(answer)
+    assert.equal(done.outcome, 'answered')
+    assert.equal((await router.resolveDeferred(answer)).duplicate, true)
+    await router.tick()
+    const delivered = calls.prompt.filter(prompt => prompt.requestId === 'hub-bot-answer-' + requestId)
+    assert.equal(delivered.length, 1)
+    assert.equal(delivered[0].sessionId, sessionId)
+    assert.equal(router.getTicket(ticketId).stage, 'working')
+  } finally { cleanup() }
 })

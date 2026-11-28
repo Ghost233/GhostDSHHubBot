@@ -300,6 +300,7 @@ export function buildOutboxHealth(store) {
   const delivery = row => ({
     id: row.id, ticketId: row.ticketId ?? null, to: row.to, state: row.state, attempts: row.attempts ?? 0,
     nextRetryAt: row.nextRetryAt ?? null, lastError: row.lastError ?? null, text: String(row.body ?? row.text ?? '').slice(0, 120),
+    ...(row.retryable === false && { retryable: false }),
   })
   return {
     queued: count('queued'), held: count('held'), recorded: count('recorded'), failed: count('failed'), sent: count('sent'),
@@ -389,9 +390,17 @@ export function readMessageDetail(store, triggerId) {
   return {
     id: triggerId, message: storedMessage(trigger), at: trigger.at ?? null,
     dropped: trigger.dropped ?? null, replyUnlinked: unlinked,
-    intake: trigger.policy || delivery ? {
+    intake: trigger.policy || delivery || trigger.intakeCohort ? {
       disposition: delivery?.state === 'failed' ? 'failed' : intakeDisposition(trigger, ticket),
       queueState: delivery?.state ?? null, lastError: delivery?.lastError ?? null,
+      ...(trigger.intakeCohort && { cohort: {
+        ...trigger.intakeCohort,
+        messages: trigger.intakeCohort.triggerIds.map(id => {
+          const linked = store.db.prepare('SELECT value FROM trigger WHERE id = ?').get(id)
+          return { triggerId: id, message: linked ? storedMessage(JSON.parse(String(linked.value))) : null,
+            ticketIds: store.db.prepare("SELECT id FROM ticket WHERE json_extract(value, '$.triggerId') = ?").all(id).map(ticket => ticket.id) }
+        }),
+      } }),
     } : null,
     reply: row ? { ...projectReply(row), sentAt: row.sentAt ?? null } : null,
   }
@@ -447,6 +456,7 @@ function intakeDisposition(trigger, ticket) {
   if (trigger.policy?.mode === 'interrupt') return trigger.interruptAt ? 'interrupt-requested' : 'interrupt'
   if (trigger.injectedAt != null) return 'injected'
   if (ticket?.lastDelivery?.state === 'sent') return 'injected'
+  if (trigger.intakeDiscarded === true) return 'discarded'
   return 'pending'
 }
 
@@ -539,7 +549,15 @@ export function buildOverview({ store, registry, health, now, listDir }) {
   }))
   const ownerById = new Map(owners.map(o => [o.id, o]))
   const ticketRows = readAll('ticket')
+  const outboxRows = readAll('outbox')
+  const answersById = new Map(outboxRows.filter(row => row.kind === 'deferred-answer').map(row => [row.id, row]))
   const tickets = ticketRows.map(t => {
+    let answerDelivery = t.deferred?.outcome?.delivery ?? null
+    if (answerDelivery?.state === 'queued') {
+      const row = answersById.get('out-answer-' + t.deferred.requestId)
+      if (!row) answerDelivery = { state: 'discarded' }
+      else if (row.state === 'failed') answerDelivery = { state: 'failed', reason: row.lastError ?? null }
+    }
     const trigger = t.triggerId ? triggers.get(t.triggerId) : undefined
     const owner = ownerById.get(t.owner)
     const row = {
@@ -556,8 +574,16 @@ export function buildOverview({ store, registry, health, now, listDir }) {
       authorization: t.authorization ?? null,
       trigger: trigger ? { id: trigger.id, kind: trigger.kind ?? null, at: trigger.at ?? null, sourceRef: trigger.sourceRef ?? null } : null,
       assignments: t.assignments ?? [],
+      workerSession: t.workerSession ?? null,
+      lastDelivery: t.lastDelivery ? { state: t.lastDelivery.state ?? null } : null,
+      background: t.background ? { kind: t.background.kind, timerId: t.background.timerId ?? null } : null,
       question: t.question ?? null,
       pendingConfirm: t.pendingConfirm ?? null,
+      deferred: t.deferred ? { requestId: t.deferred.requestId, type: t.deferred.type,
+        status: t.deferred.status, expiresAt: t.deferred.expiresAt,
+        target: t.deferred.target ?? null,
+        answer: t.deferred.outcome?.decision === 'answer' ? t.deferred.outcome.text ?? null : null,
+        delivery: answerDelivery, reason: t.deferred.outcome?.reason ?? t.failed?.reason ?? null } : null,
       report: t.report ?? null,
       dirListing: null,
     }
@@ -599,7 +625,7 @@ export function buildOverview({ store, registry, health, now, listDir }) {
     .map(({ id, dropped, reply }) => ({ id, dropped, reply }))
   const unprocessedTriggers = projected.filter(row => row.unprocessed).length
   // S06: 投喂面口径只读投影 — 完全由上面已读出的 trigger/ticket/outbox 行推导，不读设置、不写任何东西。
-  const intake = intakeProjection({ triggers: triggerRows, tickets: ticketRows, outbox: readAll('outbox'), generatedAt })
+  const intake = intakeProjection({ triggers: triggerRows, tickets: ticketRows, outbox: outboxRows, generatedAt })
   return {
     generatedAt,
     owners,
