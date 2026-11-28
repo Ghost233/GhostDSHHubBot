@@ -6,10 +6,13 @@
  * create_session / fork_session / report / escalate. fork_session only PROPOSES the fork — the ticket goes
  * person/confirm and the actual fork runs code-driven on the user's confirm (src/fork.js, #69).
  * Two disciplines are enforced in code, not left to the prompt:
- *   - identity: the calling session's cwd (workingDirectory service over exec.agent) must match a registered
- *     owner's cwd — owner tools refuse to run anywhere else;
+ *   - identity: the calling agent's Session id (exec.agent.id — dsh-agent keeps agent.id === session.id) must be the
+ *     CURRENT binding of a registered L2 owner row, and that row's cwd must equal the session's cwd — a worker, a
+ *     rebuilt-away orphan, or another owner's Session cannot act as an owner (issue #34);
  *   - 越界拒执: create_session/inject_session/read_session targets must live inside the owner's cwd subtree;
  *     anything outside is refused with a pointer at escalate().
+ *   - L3 目标: a Session that IS an owner instance (current binding, displaced history, or a recycled owner's) is
+ *     never a valid execution target — read_session/inject_session/fork_session refuse it by name.
  *
  * Worker sessions are created WITHOUT agentPreset, so they run the deployment's default preset — the user's
  * own configuration, never rewritten by the plugin (spec #65).
@@ -26,7 +29,7 @@ import { DANGEROUS_INJECT_ACTION, DEFAULT_DANGEROUS_PATTERNS, findDangerousPatte
 
 export const name = 'hub-bot-owner-tools'
 // See router-tools.js: sessionController/sessionPersistence are load-bearing for cross-realm service
-// resolution. workingDirectory is the identity channel (session cwd ↔ owner registry row).
+// resolution. workingDirectory is the cwd half of the identity check (the Session id half comes from exec.agent).
 export const inject = ['tools', 'systemPrompt', 'sessionController', 'sessionPersistence', 'workingDirectory']
 
 /** The installed hub, or a model-readable failure when the root plugin is absent from the composition. */
@@ -41,17 +44,39 @@ function norm(cwd) {
 }
 
 /**
- * Resolves the calling owner from the tool-execution's agent: the session cwd must equal a registered owner's
- * cwd. Tools act on behalf of that owner and only inside its subtree.
+ * Resolves the calling owner from the tool-execution's agent. Identity is the Session id — dsh-agent keeps
+ * agent.id === session.id — and that id must be the CURRENT binding of a registered L2 owner row. The cwd is a
+ * second, non-authoritative guard (a row whose directory moved is a refusal, not a new identity).
+ *
+ * Why not cwd alone: a rebuild leaves the old owner Session alive in the same directory, and worker Sessions live in
+ * that directory too — a cwd match cannot tell them apart (issue #34). A worker Session, a binding displaced by a
+ * rebuild, or another owner's Session is refused with a message naming the Session.
  */
 async function callerOwner(ctx, api, exec) {
   if (!exec?.agent) throw new Error('hub-bot owner tools: no agent context — refusing to act')
+  const sessionId = typeof exec.agent.id === 'string' ? exec.agent.id : ''
+  if (!sessionId) {
+    throw new Error('hub-bot owner tools: the agent context carries no Session id — refusing to act (only a bound owner Session may use these tools)')
+  }
+  const owner = api.registry.findByCurrentSession(sessionId)
+  if (!owner || owner.role !== 'owner') {
+    throw new Error('hub-bot owner tools: session ' + sessionId + ' is not the current binding of a registered owner — worker Sessions, displaced/历史 bindings and other owners\' Sessions must not use these tools; refusing to act')
+  }
   const cwd = norm(await ctx.workingDirectory.ensure(exec.agent, exec.signal))
-  const owner = api.registry.list().find(o => o.role === 'owner' && norm(o.cwd) === cwd)
-  if (!owner) {
-    throw new Error('hub-bot owner tools: session cwd ' + cwd + ' is not a registered owner root — refusing to act')
+  if (norm(owner.cwd) !== cwd) {
+    throw new Error('hub-bot owner tools: session ' + sessionId + ' is bound to owner ' + owner.id + ' (cwd ' + owner.cwd + ') but reports cwd ' + cwd + ' — refusing to act')
   }
   return owner
+}
+
+/**
+ * Guard: an owner instance is never an L3 execution target. A current binding, an id displaced by a rebuild, and a
+ * recycled owner's Session all count: injecting into one talks to another owner, or to the orphan a rebuild left
+ * alive. read/inject/fork refuse such a target by name — never a silent no-op.
+ */
+function mustNotBeOwnerSession(api, sessionId, tool) {
+  if (!api.registry.isOwnerSession(sessionId)) return
+  throw new Error(tool + ': session ' + sessionId + ' is an owner session (负责人实例), not an L3 execution session — read/inject/fork refuse it; if you need a decision from that owner, call escalate with the reason')
 }
 
 /** The session's recorded cwd, looked up in the controller inventory; undefined when unknown. */
@@ -83,7 +108,12 @@ function unwrapTaskError(error) {
   return translateTaskError(error, (code, message) => new Error(code + ': ' + message))
 }
 
-/** Compacts one transcript page into model-readable lines: role | text, tool calls by name. */
+/**
+ * Compacts one transcript page into model-readable lines: role | text, tool calls by name. Each line carries the
+ * REAL event seq of the record it came from (prefixed `#<seq>`) when the page provides one — that number is the
+ * inclusive fork boundary the model can pass as `atSeq`, so it must come from the event, never from a line index
+ * (issue #34). Records without a seq are shown without one rather than with an invented number.
+ */
 function compactTranscript(page, max) {
   const out = []
   for (const record of page?.records ?? []) {
@@ -91,14 +121,27 @@ function compactTranscript(page, max) {
     const type = event?.type
     const message = event?.data?.message
     if (!type || !message) continue
+    const seq = Number.isSafeInteger(event.seq) && event.seq >= 0 ? event.seq : undefined
+    const prefix = seq === undefined ? '' : '#' + seq + ' '
     if (type === 'user/message' || type === 'assistant/message' || type === 'system/message') {
       for (const part of message.content ?? []) {
-        if (part?.type === 'text' && part.text) out.push(message.role + ': ' + part.text.slice(0, 400))
-        if (part.type === 'tool-call') out.push(message.role + ' [tool] ' + (part.name ?? '?') + ' ' + JSON.stringify(part.arguments ?? {}).slice(0, 160))
+        if (part?.type === 'text' && part.text) out.push(prefix + message.role + ': ' + part.text.slice(0, 400))
+        if (part.type === 'tool-call') out.push(prefix + message.role + ' [tool] ' + (part.name ?? '?') + ' ' + JSON.stringify(part.arguments ?? {}).slice(0, 160))
       }
     }
   }
   return out.slice(-max)
+}
+
+/** The real event seqs of one page, oldest first — the fork boundaries the model may choose from. */
+function transcriptSeqs(page) {
+  const out = []
+  for (const record of page?.records ?? []) {
+    const event = record.event ?? record
+    const seq = event?.seq
+    if (Number.isSafeInteger(seq) && seq >= 0 && !out.includes(seq)) out.push(seq)
+  }
+  return out.sort((a, b) => a - b)
 }
 
 export function apply(ctx) {
@@ -134,44 +177,56 @@ export function apply(ctx) {
           if (cwd !== undefined && isWithinCwd(norm(owner.cwd), cwd)) items.push({ sessionId: hit.sessionId, cwd, snippet: hit.snippet })
           if (items.length >= limit) break
         }
-        return { sessions: items }
+        // Same classification as the list path: an owner instance is tagged, never offered as an L3 candidate.
+        return { sessions: items.map(s => ({ ...s, role: api.registry.isOwnerSession(s.sessionId) ? 'owner' : 'session' })) }
       }
       const listed = await ctx.sessionController.list({}, signal)
-      // Tag registry-bound owner sessions so the L2 does not mistake another L2 (preset-only delegates) for a
-      // worker session. Note: a session ORPHANED by an owner rebuild keeps its owner preset but leaves the
-      // registry, so it cannot be tagged — that residual is documented in the README.
-      const ownerSessionIds = new Set(api.registry.list().map(o => o.sessionId).filter(Boolean))
+      // Tag EVERY owner instance, not just current bindings: a Session displaced by an owner rebuild (or left behind
+      // by a recycle) keeps its owner preset but is no longer the row's sessionId — isOwnerSession() also matches
+      // previousSessionIds, so such an orphan is still never mistaken for an L3 worker (issue #34).
       const sessions = (listed.items ?? [])
         .filter(s => s.cwd !== undefined && isWithinCwd(norm(owner.cwd), norm(s.cwd)))
         .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
         .slice(0, limit)
-        .map(s => ({ sessionId: s.sessionId, cwd: norm(s.cwd), running: Boolean(s.running), role: ownerSessionIds.has(s.sessionId) ? 'owner' : 'session' }))
+        .map(s => ({ sessionId: s.sessionId, cwd: norm(s.cwd), running: Boolean(s.running), role: api.registry.isOwnerSession(s.sessionId) ? 'owner' : 'session' }))
       return { sessions }
     },
   })
 
   ctx.tools.register({
     name: 'read_session',
-    description: '读取一个会话的近期记录（压缩成 role: 文本 行），用于观察执行会话的进展与结果。',
+    description: '读取一个会话的近期记录（压缩成 role: 文本 行，行首 #序号 是真实事件序号），用于观察执行会话的进展与结果。返回的 seqs 是本页真实事件序号，可原样作为 fork_session 的 atSeq 切点（含边界）——不要自己猜序号。',
     parameters: {
       type: 'object',
       properties: {
-        sessionId: { type: 'string', description: '目标会话 id（必须在责任边界内）' },
+        sessionId: { type: 'string', description: '目标会话 id（必须在责任边界内，且不是负责人会话）' },
         maxMessages: { type: 'number', description: '可选：最多回多少行压缩记录，缺省 30' },
       },
       required: ['sessionId'],
       additionalProperties: false,
     },
     output: {
-      schema: { type: 'object', properties: { lines: { type: 'array' } }, required: ['lines'], additionalProperties: false },
-      render: (_args, value) => [{ type: 'text', text: value.lines.length === 0 ? '（无记录）' : value.lines.join('\n') }],
+      schema: {
+        type: 'object',
+        properties: {
+          lines: { type: 'array', items: { type: 'string' } },
+          seqs: { type: 'array', items: { type: 'number' } },
+        },
+        required: ['lines', 'seqs'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => [{ type: 'text', text: (value.seqs.length === 0
+        ? '（本页没有可核验的事件序号，fork_session 请省略 atSeq 走最近完成回合边界）'
+        : '（本页真实事件序号：' + value.seqs.join(', ') + ' —— 可作为 fork_session 的 atSeq 切点，含边界）')
+        + '\n' + (value.lines.length === 0 ? '（无记录）' : value.lines.join('\n')) }],
     },
     execute: async (args, exec) => {
       const owner = await callerOwner(ctx, api, exec)
       const signal = exec?.signal ?? AbortSignal.timeout(30000)
+      mustNotBeOwnerSession(api, args.sessionId, 'read_session')
       await mustBeInside(ctx, owner, args.sessionId, signal)
       const page = await ctx.sessionController.page({ address: { kind: 'session', sessionId: args.sessionId }, maxMessages: 200 }, signal)
-      return { lines: compactTranscript(page, args.maxMessages ?? 30) }
+      return { lines: compactTranscript(page, args.maxMessages ?? 30), seqs: transcriptSeqs(page) }
     },
   })
 
@@ -230,6 +285,7 @@ export function apply(ctx) {
       if (typeof args.text !== 'string' || !args.text.trim()) throw new Error('inject_session: text must be a non-empty string')
       const owner = await callerOwner(ctx, api, exec)
       const signal = exec?.signal ?? AbortSignal.timeout(60000)
+      mustNotBeOwnerSession(api, args.sessionId, 'inject_session')
       await mustBeInside(ctx, owner, args.sessionId, signal)
       let text
       if (args.ticketId !== undefined) {
@@ -322,10 +378,10 @@ export function apply(ctx) {
     parameters: {
       type: 'object',
       properties: {
-        sessionId: { type: 'string', description: '要 fork 的执行会话 id（必须在责任边界内）' },
+        sessionId: { type: 'string', description: '要 fork 的执行会话 id（必须在责任边界内，且不是负责人会话）' },
         ticketId: { type: 'string', description: '续作的任务票 id' },
         reason: { type: 'string', description: 'fork 原因与预期结果（一两句，将原样呈给用户）' },
-        atSeq: { type: 'number', description: '可选：从该事件序号（含）处切 fork（丢掉污染的尾巴）；缺省取最近完成回合边界' },
+        atSeq: { type: 'number', description: '可选：从该事件序号（含）处切 fork（丢掉污染的尾巴）；序号用 read_session 返回的 seqs（真实事件序号），不要自己猜；缺省取最近完成回合边界' },
       },
       required: ['sessionId', 'ticketId', 'reason'],
       additionalProperties: false,
@@ -337,6 +393,7 @@ export function apply(ctx) {
     execute: async (args, exec) => {
       const owner = await callerOwner(ctx, api, exec)
       const signal = exec?.signal ?? AbortSignal.timeout(30000)
+      mustNotBeOwnerSession(api, args.sessionId, 'fork_session')
       const cwd = await mustBeInside(ctx, owner, args.sessionId, signal)
       mustOwnTicket(api, owner, args.ticketId)
       try {
